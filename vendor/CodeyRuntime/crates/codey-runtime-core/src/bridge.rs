@@ -304,17 +304,82 @@ type ConnectedCdpSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
-    let (socket, _) = tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(websocket_url))
-        .await
-        .with_context(|| {
-            format!(
-                "timed out connecting CDP websocket after {}s",
-                CDP_CONNECT_TIMEOUT.as_secs()
-            )
-        })?
-        .context("failed to connect CDP websocket")?;
+    let candidates = cdp_websocket_connect_candidates(websocket_url);
+    // 候选共享原来的连接总预算，避免回退把单轮代价翻倍后吃掉启动注入窗口。
+    let attempt_timeout = cdp_connect_attempt_timeout(candidates.len());
+    let mut last_error = None;
+    for candidate in &candidates {
+        match tokio::time::timeout(attempt_timeout, connect_async(candidate.as_str())).await {
+            Ok(Ok((socket, _))) => return Ok(socket),
+            Ok(Err(error)) => {
+                last_error =
+                    Some(anyhow::Error::new(error).context("failed to connect CDP websocket"));
+            }
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!(
+                    "timed out connecting CDP websocket after {}s",
+                    CDP_CONNECT_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
 
-    Ok(socket)
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("CDP websocket address is empty")))
+}
+
+fn cdp_connect_attempt_timeout(candidate_count: usize) -> Duration {
+    CDP_CONNECT_TIMEOUT / candidate_count.max(1) as u32
+}
+
+/// Chromium 的 `/json` 会把请求用的 Host 原样写进 `webSocketDebuggerUrl`，而
+/// Codey 枚举 CDP 时优先使用 `localhost`（Chromium 150+ 拒绝 IP 字面量 Host），
+/// 于是拿到的地址通常是 `ws://localhost:<port>/devtools/page/<id>`。
+/// `connect_async` 对一个主机名只按解析顺序逐个尝试、每个地址没有独立超时：若
+/// 排在前面的是被安全软件静默丢弃的回环 IPv6，它会一直挂到预算耗尽而轮不到
+/// `127.0.0.1`，表现就是 HTTP 列表可达但 WebSocket 连不上（HTTP 侧已显式枚举
+/// 三个回环地址，因此不受影响）。这里把回环别名展开成显式候选，先用回环 IPv4
+/// 直连，再退回原始主机名。
+fn cdp_websocket_connect_candidates(websocket_url: &str) -> Vec<String> {
+    let trimmed = websocket_url.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return vec![trimmed.to_string()];
+    };
+    let (authority, path) = match rest.find(['/', '?', '#']) {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = split_authority_host_port(authority);
+    let mut candidates = Vec::with_capacity(2);
+    if is_loopback_alias(host) {
+        let port = port.map_or(String::new(), |port| format!(":{port}"));
+        candidates.push(format!("{scheme}://127.0.0.1{port}{path}"));
+    }
+    candidates.push(trimmed.to_string());
+    candidates.dedup();
+    candidates
+}
+
+fn is_loopback_alias(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "[::1]" || host == "::1"
+}
+
+fn split_authority_host_port(authority: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return match rest.split_once(']') {
+            Some((host, tail)) => (
+                &authority[..host.len() + 2],
+                tail.strip_prefix(':').filter(|port| !port.is_empty()),
+            ),
+            None => (authority, None),
+        };
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() => (host, Some(port)),
+        _ => (authority, None),
+    }
 }
 
 struct BridgeCall {
@@ -755,6 +820,49 @@ fn next_message_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_websocket_aliases_expand_to_ipv4_first() {
+        assert_eq!(
+            cdp_websocket_connect_candidates("ws://localhost:9229/devtools/page/ABC"),
+            [
+                "ws://127.0.0.1:9229/devtools/page/ABC",
+                "ws://localhost:9229/devtools/page/ABC",
+            ]
+        );
+        assert_eq!(
+            cdp_websocket_connect_candidates("ws://[::1]:9229/devtools/page/ABC"),
+            [
+                "ws://127.0.0.1:9229/devtools/page/ABC",
+                "ws://[::1]:9229/devtools/page/ABC",
+            ]
+        );
+        assert_eq!(
+            cdp_websocket_connect_candidates("ws://localhost/devtools/page/ABC"),
+            [
+                "ws://127.0.0.1/devtools/page/ABC",
+                "ws://localhost/devtools/page/ABC",
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_websocket_hosts_stay_single_candidate() {
+        for url in [
+            "ws://127.0.0.1:9229/devtools/page/ABC",
+            "wss://codex.example/devtools/page/ABC",
+        ] {
+            let candidates = cdp_websocket_connect_candidates(url);
+            assert_eq!(candidates, [url], "{url} must be tried as written");
+        }
+    }
+
+    #[test]
+    fn websocket_connect_candidates_share_one_connect_budget() {
+        assert_eq!(cdp_connect_attempt_timeout(0), CDP_CONNECT_TIMEOUT);
+        assert_eq!(cdp_connect_attempt_timeout(1), CDP_CONNECT_TIMEOUT);
+        assert_eq!(cdp_connect_attempt_timeout(2), CDP_CONNECT_TIMEOUT / 2);
+    }
 
     fn bridge_call(request_id: &str, path: &str) -> ParsedBridgeDispatch {
         ParsedBridgeDispatch::Call(BridgeCall {
