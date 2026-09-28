@@ -2,6 +2,7 @@
 pub mod lifecycle;
 mod logs;
 mod provider;
+pub(crate) mod transport;
 
 #[allow(unused_imports)]
 pub(crate) use provider::{PluginRouteSpec, RouteChange, set_route_handler};
@@ -167,7 +168,11 @@ pub fn initialize(root: PathBuf) -> Result<(), String> {
         };
     }
     let mut manager = Manager::open(root)?;
-    manager.load_enabled()?;
+    if let Err(error) = manager.load_enabled() {
+        manager.stopping = true;
+        manager.update_fast_path();
+        return Err(error);
+    }
     manager.update_fast_path();
     MANAGER
         .set(Mutex::new(manager))
@@ -289,11 +294,19 @@ fn disable_plugin(id: &str) -> Result<PluginList, String> {
     manager.errors.remove(id);
     manager.log_event(id, "disabled");
     manager.update_fast_path();
-    let result = manager.list();
+    // 线路释放完成前禁止重新启用，防止旧操作删除新实例刚登记的线路。
+    manager.loading.insert(id.to_owned());
+    let mut reservation = LoadingReservation {
+        id: id.to_owned(),
+        armed: true,
+    };
     drop(manager);
     drop(old); // In-flight Arc references finish before destroy runs.
-    provider::release_route(id)?;
-    Ok(result)
+    let released = provider::release_route(id);
+    let mut guard = self::manager()?;
+    reservation.release(&mut guard);
+    released?;
+    Ok(guard.list())
 }
 
 fn enable_plugin(id: &str) -> Result<PluginList, String> {
@@ -317,10 +330,10 @@ fn reserve_enable(id: &str) -> Result<EnableStart, String> {
     if !guard.state.plugins.contains_key(id) {
         return Err("插件未安装".into());
     }
+    guard.reject_if_loading(id)?;
     if guard.live.contains_key(id) {
         return Ok(EnableStart::AlreadyLive(guard));
     }
-    guard.reject_if_loading(id)?;
     let reserved_id = id.to_owned();
     guard.loading.insert(reserved_id.clone());
     // 这次尝试取代上一次失败留下的错误，避免启用过程中仍显示旧故障。
@@ -410,19 +423,23 @@ fn finish_enable(id: &str, mut reservation: LoadingReservation) -> Result<Plugin
         drop(native);
         return Err(error);
     }
-    // 与提交启用状态同一把锁内解除占位，避免析构清掉下一次启用。
-    reservation.release(&mut guard);
-    let list = commit_enabled(guard, id, true)?;
+    // 保留占位直到线路登记结束，避免旧配置被发布到新一代实例。
+    commit_enabled(guard, id, true)?;
     if let Some(spec) = route
         && let Err(error) = publish_enabled_route(id, spec, true)
     {
+        if let Ok(mut guard) = manager() {
+            reservation.release(&mut guard);
+        }
         let _ = disable_plugin(id);
         if let Ok(mut guard) = manager() {
             guard.note_enable_failure(id, &error);
         }
         return Err(error);
     }
-    Ok(list)
+    let mut guard = manager()?;
+    reservation.release(&mut guard);
+    Ok(guard.list())
 }
 
 fn publish_enabled_route(
@@ -432,11 +449,12 @@ fn publish_enabled_route(
 ) -> Result<(), String> {
     let route_id = provider::publish_route(id, spec, create_if_missing)?;
     let mut guard = manager()?;
-    if !guard
-        .state
-        .plugins
-        .get(id)
-        .is_some_and(|record| record.enabled)
+    if guard.stopping
+        || !guard
+            .state
+            .plugins
+            .get(id)
+            .is_some_and(|record| record.enabled)
     {
         drop(guard);
         provider::release_route(id)?;
@@ -511,6 +529,9 @@ pub fn uninstall(id: &str, remove_data: bool) -> Result<PluginList, String> {
 }
 
 pub fn invoke(id: &str, method: &str, params: Value) -> Result<Value, String> {
+    if codey_plugin_sdk::transport::is_reserved(method) {
+        return Err("该方法只允许宿主请求传输调用".into());
+    }
     if codey_plugin_sdk::lifecycle::HOST_METHODS.contains(&method) {
         return Err("该方法由宿主在请求生命周期中调用，不能通过管理接口调用".into());
     }
@@ -998,11 +1019,14 @@ impl Manager {
             .is_none_or(|record| record.route_profile_id.is_none());
         self.publish_prepared(&prepared, native)
             .map_err(|(_, error)| error)?;
+        // 启动恢复也必须先发布实例，再让线路热更新捕获这一代实例。
+        self.update_fast_path();
         if let Some(spec) = route {
             let route_id = match provider::publish_route(id, spec, create_if_missing) {
                 Ok(route_id) => route_id,
                 Err(error) => {
                     let removed = self.live.remove(id);
+                    self.update_fast_path();
                     drop(removed);
                     return Err(error);
                 }
@@ -1013,8 +1037,9 @@ impl Manager {
                     record.route_profile_id = Some(route_id);
                 }
                 if let Err(error) = self.commit(state) {
-                    let _ = provider::release_route(id);
                     let removed = self.live.remove(id);
+                    self.update_fast_path();
+                    let _ = provider::release_route(id);
                     drop(removed);
                     return Err(error);
                 }
@@ -1150,6 +1175,20 @@ impl Manager {
     }
 
     fn update_fast_path(&self) {
+        transport::publish(
+            self.live
+                .iter()
+                .filter(|_| !self.stopping)
+                .filter(|(_, active)| {
+                    active
+                        .manifest
+                        .capabilities
+                        .iter()
+                        .any(|c| c == codey_plugin_sdk::transport::CAPABILITY)
+                })
+                .map(|(id, active)| (id.clone(), active.lifecycle.clone()))
+                .collect(),
+        );
         lifecycle::publish(
             self.live
                 .values()

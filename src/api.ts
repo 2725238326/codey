@@ -38,6 +38,7 @@ export const CODEY_API_COMMANDS = [
   "test_prompt_optimization",
   "fetch_prompt_optimization_models",
   "check_for_updates",
+  "get_device_machine_no",
   "download_update",
   "install_downloaded_update",
   "update_install_report",

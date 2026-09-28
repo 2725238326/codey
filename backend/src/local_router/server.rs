@@ -804,6 +804,14 @@ impl RouterSnapshot {
                 // Each stored account reads its own credential document, so
                 // several official routes never share one login.
                 official_auth: official_route_auth(profile),
+                plugin_transport: profile.plugin_owner_id.as_ref().and_then(|id| {
+                    profile
+                        .plugin_route_spec
+                        .as_ref()?
+                        .transport
+                        .as_ref()
+                        .map(|options| plugin_transport::Target::new(id.clone(), options.clone()))
+                }),
                 supports_websockets: protocol == UpstreamProtocol::OpenAiResponses
                     && config.route_supports_websockets_this_launch(profile),
                 supports_remote_compaction: config
@@ -1134,6 +1142,7 @@ pub(crate) struct RouteTarget {
     pub(crate) protocol: UpstreamProtocol,
     pub(crate) official_account: bool,
     pub(crate) official_auth: Option<OfficialRouteAuth>,
+    pub(crate) plugin_transport: Option<plugin_transport::Target>,
     pub(crate) supports_websockets: bool,
     pub(crate) supports_remote_compaction: bool,
     pub(crate) models: HashSet<String>,
@@ -1200,6 +1209,10 @@ impl RouteTarget {
     fn context_config_fingerprint(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update([u8::from(self.official_account)]);
+        if let Some(plugin) = &self.plugin_transport {
+            update_length_prefixed_digest(&mut digest, plugin.plugin_id.as_bytes());
+            update_length_prefixed_digest(&mut digest, plugin.options.account_email.as_bytes());
+        }
         // 每个官方账号使用独立的连接池身份，避免不同账号的登录态互相影响。
         if let Some(auth) = &self.official_auth {
             update_length_prefixed_digest(&mut digest, auth.account_id.as_bytes());

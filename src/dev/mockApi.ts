@@ -1471,6 +1471,9 @@ if (import.meta.env.DEV) {
           backupPath: null,
         };
       }
+      if (command === "get_device_machine_no") {
+        return "m_preview_codey_device_001";
+      }
       if (command === "check_for_updates") {
         return {
           currentVersion: "0.1.0",

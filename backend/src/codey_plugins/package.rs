@@ -124,11 +124,33 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             codey_plugin_sdk::lifecycle::CAPABILITY,
             codey_plugin_sdk::lifecycle::AUTH_CAPABILITY,
             codey_plugin_sdk::provider::CAPABILITY,
+            codey_plugin_sdk::transport::CAPABILITY,
+            codey_plugin_sdk::transport::ACCOUNT_CAPABILITY,
         ]
         .contains(&s.as_str())
             || !capabilities.insert(s)
     }) {
         return Err("插件声明了尚未支持的扩展能力".into());
+    }
+    let transport = manifest
+        .capabilities
+        .iter()
+        .any(|c| c == codey_plugin_sdk::transport::CAPABILITY);
+    let account = manifest
+        .capabilities
+        .iter()
+        .any(|c| c == codey_plugin_sdk::transport::ACCOUNT_CAPABILITY);
+    if (transport
+        && !manifest
+            .capabilities
+            .iter()
+            .any(|c| c == codey_plugin_sdk::provider::CAPABILITY))
+        || account != transport
+    {
+        return Err(
+            "插件传输须同时声明 provider.route.v1、provider.transport.v1 和 provider.account.v1"
+                .into(),
+        );
     }
     if manifest
         .header_names
@@ -290,6 +312,10 @@ mod tests {
             assert!(serde_json::from_value::<Manifest>(value).is_err());
         }
         for fields in [
+            serde_json::json!({"capabilities":["provider.transport.v1"]}),
+            serde_json::json!({"capabilities":["provider.account.v1"]}),
+            serde_json::json!({"capabilities":["provider.route.v1","provider.transport.v1"]}),
+            serde_json::json!({"capabilities":["provider.route.v1","provider.account.v1"]}),
             serde_json::json!({"capabilities":["request.beforeSend"]}),
             serde_json::json!({"capabilities":["request.lifecycle.v1","request.beforeSend"]}),
             serde_json::json!({"headerNames":["x-test"]}),
@@ -316,6 +342,7 @@ mod tests {
             serde_json::json!({"capabilities":["request.lifecycle.v1"],"headerNames":["x-test"]}),
             serde_json::json!({"capabilities":["request.lifecycle.v1"]}),
             serde_json::json!({"capabilities":["provider.route.v1"]}),
+            serde_json::json!({"capabilities":["provider.route.v1","provider.transport.v1","provider.account.v1"]}),
             serde_json::json!({"capabilities":["appserver.call.v1"]}),
             serde_json::json!({"capabilities":["request.lifecycle.v1","request.lifecycle.auth"],"responseHeaderNames":["content-type","x-test"],"lifecycleFailurePolicy":"continue","lifecycleMaxWaitMs":600000}),
         ] {

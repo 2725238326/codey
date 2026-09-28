@@ -603,6 +603,60 @@ impl OfficialAccountStore {
         )
     }
 
+    /// 插件由用户填写邮箱绑定；不存在或同邮箱对应多个账号时拒绝猜测。
+    pub(crate) fn by_email(&self, email: &str) -> Result<OfficialAccountRecord> {
+        let email = email.trim();
+        if email.is_empty() {
+            anyhow::bail!("插件未配置账号邮箱");
+        }
+        let mut matching = self.list()?.into_iter().filter(|record| {
+            record
+                .email
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case(email))
+        });
+        let record = matching
+            .next()
+            .ok_or_else(|| anyhow!("插件配置的邮箱未匹配到已保存账号"))?;
+        if matching.next().is_some() {
+            anyhow::bail!("插件配置的邮箱匹配到多个账号，请先清理重复账号或使用唯一邮箱");
+        }
+        if record.invalid_reason.is_some() {
+            anyhow::bail!("插件绑定账号的登录态已失效，请重新登录");
+        }
+        Ok(record)
+    }
+
+    /// 刷新后重新读取绑定，避免移除、重复导入或重新登录期间交付旧凭据。
+    pub(crate) fn plugin_credentials(
+        &self,
+        email: &str,
+        expected: &OfficialAccountRecord,
+    ) -> Result<codey_plugin_sdk::transport::Credentials> {
+        let record = self.by_email(email)?;
+        if record.id != expected.id || record.account_id != expected.account_id {
+            anyhow::bail!("插件绑定账号的身份已变化，请检查账号配置后重试");
+        }
+        if !record.has_live_access_token() {
+            anyhow::bail!(
+                "绑定账号的访问令牌已过期、即将过期或无法确认有效期，请在 Codex 中更新登录态或重新登录后重试"
+            );
+        }
+        let access_token = record.auth["tokens"]["access_token"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("绑定账号缺少访问令牌"))?
+            .to_owned();
+        let upstream_account_id = record
+            .account_id
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("绑定账号缺少 ChatGPT 账号标识"))?;
+        Ok(codey_plugin_sdk::transport::Credentials {
+            access_token,
+            upstream_account_id,
+        })
+    }
+
     pub fn default_account_id(&self) -> Result<Option<String>> {
         let bytes = match fs::read(self.default_path()) {
             Ok(bytes) => bytes,
@@ -1796,8 +1850,111 @@ fn record_from_token_response(payload: &Value) -> Result<OfficialAccountRecord> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_email_binding_is_unique_and_never_uses_default() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path());
+        let first = OfficialAccountRecord::from_auth(
+            chatgpt_auth("a", "User@Example.com", "2026-09-28T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&first).unwrap();
+        store.set_default_account_id(Some(&first.id)).unwrap();
+        assert_eq!(store.by_email("  USER@example.COM ").unwrap().id, first.id);
+        assert!(store.by_email("missing@example.com").is_err());
+        assert!(store.by_email("").is_err());
+        let duplicate = OfficialAccountRecord::from_auth(
+            chatgpt_auth("b", "user@example.com", "2026-09-28T00:00:00Z"),
+            2,
+        )
+        .unwrap();
+        store.upsert(&duplicate).unwrap();
+        assert!(
+            store
+                .by_email("user@example.com")
+                .unwrap_err()
+                .to_string()
+                .contains("多个")
+        );
+        store.remove(&duplicate.id).unwrap();
+        let mut invalid = first.clone();
+        invalid.mark_invalid("expired");
+        store.upsert(&invalid).unwrap();
+        assert!(
+            store
+                .by_email("user@example.com")
+                .unwrap_err()
+                .to_string()
+                .contains("失效")
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn plugin_credentials_recheck_identity_uniqueness_and_token_expiry() {
+        let directory = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let mut original = OfficialAccountRecord::from_auth(
+            chatgpt_auth("a", "user@example.com", "2026-09-28T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        original.auth["tokens"]["access_token"] =
+            json!(unsigned_jwt(json!({"exp": unix_timestamp()+3600})));
+        store.upsert(&original).unwrap();
+        store.set_default_account_id(Some(&original.id)).unwrap();
+        let credentials = store
+            .plugin_credentials(" USER@EXAMPLE.COM ", &original)
+            .unwrap();
+        assert_eq!(credentials.upstream_account_id, "a");
+        for token in [
+            unsigned_jwt(json!({"exp": unix_timestamp().saturating_sub(1)})),
+            unsigned_jwt(json!({"exp": unix_timestamp()+1})),
+            "opaque-private-token".into(),
+        ] {
+            let mut expired = original.clone();
+            expired.auth["tokens"]["access_token"] = json!(token);
+            store.upsert(&expired).unwrap();
+            let error = store
+                .plugin_credentials("user@example.com", &original)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("有效期"));
+            assert!(!error.contains(&token));
+        }
+        store.upsert(&original).unwrap();
+        let mut duplicate = original.clone();
+        duplicate.id = "duplicate".into();
+        duplicate.account_id = Some("b".into());
+        store.upsert(&duplicate).unwrap();
+        assert!(
+            store
+                .plugin_credentials("user@example.com", &original)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("多个")
+        );
+        store.remove(&original.id).unwrap();
+        assert!(
+            store
+                .plugin_credentials("user@example.com", &original)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("身份")
+        );
+        store.remove(&duplicate.id).unwrap();
+        assert!(
+            store
+                .plugin_credentials("user@example.com", &original)
+                .is_err()
+        );
+    }
 
     #[test]
     fn credential_commits_preserve_route_edits_and_do_not_recreate_removed_accounts() {

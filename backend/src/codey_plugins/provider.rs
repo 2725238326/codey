@@ -29,6 +29,8 @@ pub struct PluginRouteSpec {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub short_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<codey_plugin_sdk::transport::TransportOptions>,
 }
 
 #[allow(dead_code)]
@@ -65,7 +67,26 @@ pub(crate) fn describe_if_declared(
     let value = native
         .invoke(METHOD_DESCRIBE, json!({}))
         .map_err(|error| format!("插件线路描述失败：{error}"))?;
-    parse_route_descriptor(value).map(Some)
+    let spec = parse_route_descriptor(value)?;
+    if spec.transport.is_some()
+        && ![
+            codey_plugin_sdk::transport::CAPABILITY,
+            codey_plugin_sdk::transport::ACCOUNT_CAPABILITY,
+        ]
+        .iter()
+        .all(|needed| manifest.capabilities.iter().any(|cap| cap == needed))
+    {
+        return Err("自定义传输必须声明传输与账号授权能力".into());
+    }
+    if manifest
+        .capabilities
+        .iter()
+        .any(|cap| cap == codey_plugin_sdk::transport::CAPABILITY)
+        && spec.transport.is_none()
+    {
+        return Err("自定义传输缺少 transport 描述".into());
+    }
+    Ok(Some(spec))
 }
 
 pub(crate) fn publish_route(
@@ -104,7 +125,7 @@ fn handler() -> Option<RouteHandler> {
 }
 
 pub(crate) fn parse_route_descriptor(value: Value) -> Result<PluginRouteSpec, String> {
-    let descriptor: RouteDescriptor =
+    let mut descriptor: RouteDescriptor =
         serde_json::from_value(value).map_err(|error| format!("插件线路描述格式无效：{error}"))?;
     let name = descriptor.name.trim();
     if name.is_empty() || name.chars().count() > MAX_NAME_CHARS {
@@ -158,6 +179,30 @@ pub(crate) fn parse_route_descriptor(value: Value) -> Result<PluginRouteSpec, St
         }
         headers.insert(name, value);
     }
+    if let Some(transport) = &mut descriptor.transport {
+        transport.account_email = transport.account_email.trim().to_ascii_lowercase();
+        if transport.account_email.len() > 254
+            || !transport.account_email.contains('@')
+            || transport
+                .account_email
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err("请在插件配置中填写有效的账号邮箱".into());
+        }
+        if descriptor.upstream_protocol != "openaiResponses" || !headers.is_empty() {
+            return Err("插件传输须返回标准 Responses，且不能声明线路请求头".into());
+        }
+        for (model, caps) in &transport.models {
+            if !models.contains(model)
+                || !(1024..=2_000_000).contains(&caps.context_window)
+                || caps.auto_compact_token_limit == 0
+                || caps.auto_compact_token_limit > caps.context_window
+            {
+                return Err("插件模型上下文声明无效".into());
+            }
+        }
+    }
     Ok(PluginRouteSpec {
         name: name.to_string(),
         base_url: descriptor.base_url,
@@ -165,6 +210,7 @@ pub(crate) fn parse_route_descriptor(value: Value) -> Result<PluginRouteSpec, St
         models,
         headers,
         short_name: String::new(),
+        transport: descriptor.transport,
     })
 }
 

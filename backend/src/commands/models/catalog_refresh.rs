@@ -27,6 +27,7 @@ fn refresh_model_catalog_or_fallback_at(
     let image_detail_original_models = config.runtime_image_detail_original_model_aliases();
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
     let runtime_model_contexts = config.runtime_model_contexts();
+    let runtime_plugin_model_contexts = config.runtime_plugin_model_contexts();
     let refresh = try_refresh_model_catalog(config, home);
     let reused_cached_catalog = refresh.is_err();
     let result = model_catalog_fallback(
@@ -38,6 +39,12 @@ fn refresh_model_catalog_or_fallback_at(
     match result {
         Ok(fallback) => {
             let available = model_catalog::is_available(home);
+            if !runtime_plugin_model_contexts.is_empty() && !available {
+                return Err(rollback_model_catalog_snapshot(
+                    snapshot,
+                    "插件模型需要可用的运行时模型目录，请恢复目录后重试".to_string(),
+                ));
+            }
             if !runtime_model_contexts.is_empty() && !available {
                 return Err(rollback_model_catalog_snapshot(
                     snapshot,
@@ -51,6 +58,7 @@ fn refresh_model_catalog_or_fallback_at(
                 && let Err(error) = model_catalog::apply_catalog_overrides(
                     home,
                     model_catalog::CatalogOverrides {
+                        plugin_contexts: &runtime_plugin_model_contexts,
                         contexts: &runtime_model_contexts,
                         reasoning_efforts: &runtime_model_reasoning_efforts,
                     },
@@ -293,6 +301,7 @@ fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> an
             image_detail_original_models: Some(&image_detail_original_models),
         },
         model_catalog::CatalogOverrides {
+            plugin_contexts: &config.runtime_plugin_model_contexts(),
             contexts: &config.runtime_model_contexts(),
             reasoning_efforts: &config.runtime_model_reasoning_efforts(),
         },

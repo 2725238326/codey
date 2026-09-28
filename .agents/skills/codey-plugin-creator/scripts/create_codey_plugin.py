@@ -46,7 +46,7 @@ def main() -> int:
     parser.add_argument("--display-name")
     parser.add_argument("--version", default="0.1.0")
     parser.add_argument("--sdk-path", default="../../../crates/codey-plugin-sdk")
-    parser.add_argument("--capability", action="append", choices=["request.lifecycle.v1", "request.lifecycle.auth", "provider.route.v1", "appserver.call.v1"], default=[])
+    parser.add_argument("--capability", action="append", choices=["request.lifecycle.v1", "request.lifecycle.auth", "provider.route.v1", "provider.transport.v1", "provider.account.v1", "appserver.call.v1"], default=[])
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -62,6 +62,12 @@ def main() -> int:
     auth = "request.lifecycle.auth" in args.capability
     if auth and not lifecycle:
         parser.error("request.lifecycle.auth requires request.lifecycle.v1")
+    if len(set(args.capability)) != len(args.capability):
+        parser.error("capabilities must not be repeated")
+    transport = "provider.transport.v1" in args.capability
+    account = "provider.account.v1" in args.capability
+    if (transport and "provider.route.v1" not in args.capability) or account != transport:
+        parser.error("provider transport requires provider.route.v1, provider.transport.v1, and provider.account.v1")
 
     lifecycle_methods = """
             "request.beforeSend" | "request.afterHeaders" => Ok(json!({"action": "continue"})),
@@ -75,6 +81,29 @@ def main() -> int:
                 "models": ["example-model"]
             })),
 """ if "provider.route.v1" in args.capability else ""
+    if transport:
+        provider_method = """
+            "provider.describe" => Ok(json!({
+                "name": "Example",
+                "baseUrl": "https://example.invalid/v1",
+                "upstreamProtocol": "openaiResponses",
+                "models": ["example-model"],
+                "headers": [],
+                "transport": {"accountEmail": self.account_email, "models": {}, "imageGeneration": false, "imageEdit": false}
+            })),
+            // 实现有界分块、后台传输及取消后，再替换此明确失败的占位。
+            "provider.request.start" => Err("upstream_unavailable".into()),
+            "provider.request.write" | "provider.request.read" => Err("request_not_found".into()),
+            "provider.request.cancel" | "provider.request.stop" => Ok(json!({})),
+"""
+    account_field = "    account_email: String," if transport else ""
+    account_init = """
+        let account_email = config["accountEmail"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+        if account_email.len() > 254 || !account_email.contains('@') || account_email.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("请填写需要绑定的账号邮箱".into());
+        }
+""" if transport else ""
+    init_fields = "context, account_email" if transport else "context"
 
     cargo = textwrap.dedent(f"""\
         [package]
@@ -93,6 +122,7 @@ def main() -> int:
 
         struct {''.join(part.title() for part in crate.split('_'))} {{
             context: PluginContext,
+{account_field}
         }}
 
         impl Plugin for {''.join(part.title() for part in crate.split('_'))} {{
@@ -100,8 +130,9 @@ def main() -> int:
                 if !config.is_object() {{
                     return Err("config must be a JSON object".into());
                 }}
+{account_init}
                 context.log("plugin_created")?;
-                Ok(Self {{ context }})
+                Ok(Self {{ {init_fields} }})
             }}
 
             fn invoke(&mut self, method: &str, params: Value) -> Result<Value, String> {{
@@ -116,6 +147,8 @@ def main() -> int:
         codey_plugin_sdk::export_plugin!({''.join(part.title() for part in crate.split('_'))});
     """)
     config = '{\n  "_comments": {\n    "enabled": "Example configuration field; replace with plugin-specific settings."\n  },\n  "enabled": true\n}\n'
+    if transport:
+        config = '{\n  "_comments": {"accountEmail": "必填：唯一匹配 Codey 已保存账号的邮箱，不回退默认账号。"},\n  "accountEmail": ""\n}\n'
     readme = textwrap.dedent(f"""\
         # {display}
 
@@ -125,6 +158,8 @@ def main() -> int:
 
         This plugin is trusted native code and runs with the host process permissions.
     """)
+    if transport:
+        readme += "\nThis scaffold rejects transport requests until implemented. Follow crates/codey-plugin-sdk/PROVIDER_TRANSPORT.md for bounded I/O, cancellation, credential handling, and runtime cleanup.\n"
 
     try:
         write(root / "Cargo.toml", cargo, args.force)
@@ -136,7 +171,8 @@ def main() -> int:
 
     print(root)
     print(f"cargo build --manifest-path {root / 'Cargo.toml'}")
-    print(f"python3 scripts/package-plugin.py --library <target-library> --config {root / 'config.json'} --output /tmp/{crate}.codey-plugin --id {identifier} --name {display!r} --version {args.version}")
+    capability_flags = ''.join(f' --capability {capability}' for capability in args.capability)
+    print(f"python3 scripts/package-plugin.py --library <target-library> --config {root / 'config.json'} --output /tmp/{crate}.codey-plugin --id {identifier} --name {display!r} --version {args.version}{capability_flags}")
     return 0
 
 

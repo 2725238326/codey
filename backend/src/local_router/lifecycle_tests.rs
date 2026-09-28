@@ -504,6 +504,7 @@ async fn plugin_retry_keeps_the_body_when_plugins_are_disabled_during_upload() {
             &mut || {},
             &mut attempt,
             Duration::from_secs(5),
+            None,
         )
         .await
         .unwrap()

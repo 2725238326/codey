@@ -468,7 +468,10 @@ impl RouterServer {
                 self.proxy_responses(request, stream, ResponsesRequestKind::Create)
                     .await?;
             }
-            ("POST", "/v1/images/generations") | ("POST", "/images/generations") => {
+            ("POST", "/v1/images/generations")
+            | ("POST", "/images/generations")
+            | ("POST", "/v1/images/edits")
+            | ("POST", "/images/edits") => {
                 self.proxy_image_generation(request, stream).await?;
             }
             ("POST", "/v1/responses/compact")
@@ -565,6 +568,7 @@ impl RouterServer {
         mut stream: TcpStream,
     ) -> Result<()> {
         let probe = self.begin_basic_request_log(&request, "images_generations");
+        let editing = request.path.ends_with("/images/edits");
         let _log_guard = RouteRequestLogGuard::new(probe.clone());
         let mark_error = |status, code: &str| {
             if let Some(probe) = &probe {
@@ -688,7 +692,7 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        let upstream_url = match image_generation_endpoint(upstream_base_url) {
+        let mut upstream_url = match image_generation_endpoint(upstream_base_url) {
             Ok(url) => url,
             Err(error) => {
                 mark_error(502, "route_configuration_error");
@@ -706,6 +710,9 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        if editing {
+            upstream_url = format!("{}/edits", upstream_url.trim_end_matches("/generations"));
+        }
         let headers = match self
             .prepare_upstream_request_headers(&request, &route)
             .await
@@ -761,8 +768,17 @@ impl RouterServer {
         } else {
             UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT
         };
-        let response = match send_for_response_headers(
-            upstream_client.post(&upstream_url).headers(headers),
+        let operation = if editing {
+            codey_plugin_sdk::transport::Operation::ImageEdit
+        } else {
+            codey_plugin_sdk::transport::Operation::ImageGeneration
+        };
+        let response = match send_route_response_headers(
+            route.plugin_transport.as_ref(),
+            operation,
+            &upstream_client,
+            &upstream_url,
+            &headers,
             request_body,
             response_header_timeout,
             || {},
@@ -869,6 +885,8 @@ impl RouterServer {
                 | "/responses"
                 | "/v1/images/generations"
                 | "/images/generations"
+                | "/v1/images/edits"
+                | "/images/edits"
                 | "/v1/responses/compact"
                 | "/responses/compact"
                 | "/v1/v1/responses/compact"
@@ -913,6 +931,11 @@ impl RouterServer {
         // 原样发到上游。Codey 内部请求 ID 只写入下游响应和本地日志，不随上游
         // 请求外发，避免向上游暴露代理痕迹。
         apply_upstream_headers(&mut headers, prepared_headers);
+        if let Some(target) = &route.plugin_transport {
+            return plugin_transport::account_headers(target)
+                .await
+                .map_err(|message| (401, "plugin_account_unavailable", message));
+        }
         if route.official_account {
             let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
                 Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
@@ -2230,7 +2253,7 @@ impl RouterServer {
             downstream, &mut lifecycle, &upstream_client, upstream_url,
             &mut headers, encoded, &mut || {
                 retain_compact_request_budget(&mut admission, retained_after_upload);
-            }, &mut attempt, response_header_timeout,
+            }, &mut attempt, response_header_timeout, resolved.route.plugin_transport.as_ref(),
         ).await?;
         let Some(response) = Self::finish_upstream_http_send(
             downstream,
@@ -2324,7 +2347,7 @@ impl RouterServer {
                     downstream, &mut lifecycle, &upstream_client, upstream_url,
                     &mut headers, encoded.into(), &mut || {
                         retain_compact_request_budget(&mut admission, retry_retained);
-                    }, &mut attempt, response_header_timeout,
+                    }, &mut attempt, response_header_timeout, resolved.route.plugin_transport.as_ref(),
                 ).await?;
                 let Some(retried) = Self::finish_upstream_http_send(
                     downstream,

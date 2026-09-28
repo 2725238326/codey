@@ -273,6 +273,7 @@ pub(super) async fn send_lifecycle_http<D, F>(
     on_uploaded: &mut F,
     attempt: &mut u32,
     timeout: Duration,
+    plugin: Option<&plugin_transport::Target>,
 ) -> Result<
     std::result::Result<
         std::result::Result<reqwest::Response, reqwest::Error>,
@@ -320,8 +321,12 @@ where
         let keep_uploaded_body = lifecycle.is_active();
         let result = await_upstream(
             downstream,
-            send_for_response_headers(
-                client.post(url).headers(headers.clone()),
+            send_route_response_headers(
+                plugin,
+                codey_plugin_sdk::transport::Operation::Responses,
+                client,
+                url,
+                headers,
                 payload,
                 timeout,
                 &mut || {
@@ -368,6 +373,39 @@ where
                 }
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_route_response_headers(
+    plugin: Option<&plugin_transport::Target>,
+    operation: codey_plugin_sdk::transport::Operation,
+    client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    limit: Duration,
+    mut on_uploaded: impl FnMut() + Send,
+) -> std::result::Result<
+    std::result::Result<reqwest::Response, reqwest::Error>,
+    tokio::time::error::Elapsed,
+> {
+    if let Some(target) = plugin {
+        let result = tokio::time::timeout(
+            response_header_timeout(body.len(), limit),
+            plugin_transport::send(target, operation, headers, body),
+        )
+        .await;
+        on_uploaded();
+        result.map(Ok)
+    } else {
+        send_for_response_headers(
+            client.post(url).headers(headers.clone()),
+            body,
+            limit,
+            on_uploaded,
+        )
+        .await
     }
 }
 

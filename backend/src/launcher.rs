@@ -704,6 +704,8 @@ async fn prepare_startup_model_catalog(
     let runtime_image_detail_original_models = config.runtime_image_detail_original_model_aliases();
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
     let runtime_model_contexts = config.runtime_model_contexts();
+    let runtime_plugin_model_contexts = config.runtime_plugin_model_contexts();
+    let plugin_context = !runtime_plugin_model_contexts.is_empty();
     let custom_context = !runtime_model_contexts.is_empty();
     let refresh_official_provider =
         config.official_account_available_this_launch && use_builtin_official_catalog;
@@ -757,6 +759,7 @@ async fn prepare_startup_model_catalog(
                     image_detail_original_models: Some(&runtime_image_detail_original_models),
                 },
                 model_catalog::CatalogOverrides {
+                    plugin_contexts: &runtime_plugin_model_contexts,
                     contexts: &runtime_model_contexts,
                     reasoning_efforts: &runtime_model_reasoning_efforts,
                 },
@@ -773,6 +776,7 @@ async fn prepare_startup_model_catalog(
                         model_catalog::apply_catalog_overrides(
                             &catalog_home,
                             model_catalog::CatalogOverrides {
+                                plugin_contexts: &runtime_plugin_model_contexts,
                                 contexts: &runtime_model_contexts,
                                 reasoning_efforts: &runtime_model_reasoning_efforts,
                             },
@@ -867,6 +871,9 @@ async fn prepare_startup_model_catalog(
     // configured a budget, in which case the generated catalog must be used.
     if custom_context && !catalog_available_for_runtime {
         anyhow::bail!(model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE);
+    }
+    if plugin_context && !catalog_available_for_runtime {
+        anyhow::bail!("插件模型需要可用的运行时模型目录，请恢复目录后重试");
     }
     let use_official_catalog = should_install_codey_model_catalog(
         use_builtin_official_catalog,

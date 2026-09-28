@@ -24,7 +24,7 @@ parser.add_argument("--version", required=True)
 parser.add_argument("--platform", choices=["macos", "windows", "linux"], default={"Darwin":"macos", "Windows":"windows", "Linux":"linux"}.get(platform.system()))
 parser.add_argument("--arch", default={"arm64":"aarch64", "AMD64":"x86_64"}.get(platform.machine(), platform.machine()))
 parser.add_argument("--header", action="append", default=[])
-parser.add_argument("--capability", action="append", default=[], choices=["request.lifecycle.v1", "request.lifecycle.auth", "provider.route.v1", "appserver.call.v1"])
+parser.add_argument("--capability", action="append", default=[], choices=["request.lifecycle.v1", "request.lifecycle.auth", "provider.route.v1", "provider.transport.v1", "provider.account.v1", "appserver.call.v1"])
 parser.add_argument("--response-header", action="append", default=[])
 parser.add_argument("--lifecycle-failure-policy", choices=["abort", "continue"])
 parser.add_argument("--lifecycle-max-wait-ms", type=int)
@@ -32,6 +32,9 @@ args = parser.parse_args()
 if args.output.suffix != ".codey-plugin":
     parser.error("输出文件必须使用 .codey-plugin 扩展名")
 capabilities = list(args.capability)
+transport = "provider.transport.v1" in capabilities
+if (transport and "provider.route.v1" not in capabilities) or (("provider.account.v1" in capabilities) != transport):
+    parser.error("插件传输须同时声明线路、传输与账号授权能力")
 if len(set(capabilities)) != len(capabilities):
     parser.error("扩展能力不能重复声明")
 lifecycle = "request.lifecycle.v1" in capabilities

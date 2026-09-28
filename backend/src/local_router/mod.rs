@@ -172,6 +172,7 @@ mod errors;
 mod http;
 mod lifecycle;
 mod native_history;
+mod plugin_transport;
 mod request_log_tap;
 mod request_meta;
 mod resource_budget;

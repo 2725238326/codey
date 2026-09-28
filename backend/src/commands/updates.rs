@@ -18,6 +18,7 @@ use crate::config::ConfigStore;
 const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
 const UPDATE_DOWNLOAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_UPDATE_MANIFEST_BYTES: usize = 1024 * 1024;
+static DEVICE_IDENTITY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct UpdateManifest {
@@ -136,6 +137,7 @@ pub(super) async fn invoke(
 ) -> Result<Value, String> {
     match command {
         "check_for_updates" => check_for_updates(state).await,
+        "get_device_machine_no" => get_device_machine_no(state).await,
         "download_update" => download_update(state).await,
         "update_install_report" => update_install_report(state).await,
         "install_downloaded_update" => {
@@ -148,6 +150,21 @@ pub(super) async fn invoke(
 pub async fn check_for_updates(state: &Arc<AppState>) -> Result<Value, String> {
     let candidate = check_for_update_candidate(state).await?;
     serde_json::to_value(candidate.check).map_err(|error| error.to_string())
+}
+
+async fn get_device_machine_no(state: &AppState) -> Result<Value, String> {
+    {
+        let _guard = DEVICE_IDENTITY_LOCK.lock().await;
+        if let Some(identity) = read_device_identity(&state.store).await? {
+            return Ok(json!(identity.machine_no));
+        }
+    }
+    let Some(base_url) = configured_release_admin_url(state).await? else {
+        return Ok(Value::Null);
+    };
+    let identity = load_or_register_device(state, &base_url).await?;
+    // 页面只需要机器号，注册密钥始终留在后端。
+    Ok(json!(identity.machine_no))
 }
 
 pub async fn download_update(state: &Arc<AppState>) -> Result<Value, String> {
@@ -306,18 +323,28 @@ async fn retry_pending_device_event(state: &AppState) {
     }
 }
 
-async fn load_or_register_device(
-    state: &AppState,
-    base_url: &str,
-) -> Result<DeviceIdentity, String> {
-    let path = device_identity_path(&state.store).await?;
+async fn read_device_identity(store: &ConfigStore) -> Result<Option<DeviceIdentity>, String> {
+    let path = device_identity_path(store).await?;
     if let Ok(bytes) = tokio::fs::read(&path).await
         && let Ok(identity) = serde_json::from_slice::<DeviceIdentity>(&bytes)
         && !identity.install_key.trim().is_empty()
         && !identity.machine_no.trim().is_empty()
     {
+        return Ok(Some(identity));
+    }
+    Ok(None)
+}
+
+async fn load_or_register_device(
+    state: &AppState,
+    base_url: &str,
+) -> Result<DeviceIdentity, String> {
+    // 设置弹窗和自动更新可能同时首次登记，必须共用同一份设备身份。
+    let _guard = DEVICE_IDENTITY_LOCK.lock().await;
+    if let Some(identity) = read_device_identity(&state.store).await? {
         return Ok(identity);
     }
+    let path = device_identity_path(&state.store).await?;
 
     let install_key = format!("{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let body = json!({
@@ -1243,6 +1270,110 @@ fn spawn_update_installer(_update_path: &Path, _asset: &UpdateAssetInfo) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn device_machine_no_reads_registered_identity_without_exposing_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            ..AppState::default()
+        });
+        state.config.write().await.release_admin_url = "invalid-offline-url".into();
+        let identity =
+            json!({ "installKey": "private-install-key", "machineNo": "m_Existing-AbC_123" });
+        tokio::fs::write(
+            device_identity_path(&state.store).await.unwrap(),
+            identity.to_string(),
+        )
+        .await
+        .unwrap();
+        let result = invoke(&state, "get_device_machine_no", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(result, json!("m_Existing-AbC_123"));
+        assert!(!result.to_string().contains("private-install-key"));
+    }
+
+    #[tokio::test]
+    async fn device_machine_no_is_absent_without_registration_or_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            ..AppState::default()
+        };
+        state.config.write().await.release_admin_url.clear();
+        assert_eq!(get_device_machine_no(&state).await.unwrap(), Value::Null);
+        assert!(!device_identity_path(&state.store).await.unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_device_registration_matches_display_and_update_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            http_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            ..AppState::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let body = if request.starts_with("POST /api/devices/register ") {
+                    r#"{"machineNo":"m_registered-AbC_123"}"#
+                } else {
+                    r#"{"updateAvailable":false}"#
+                };
+                captured.lock().await.push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            let (first, second) = tokio::join!(
+                load_or_register_device(&state, &base_url),
+                load_or_register_device(&state, &base_url),
+            );
+            let first = first.unwrap();
+            let second = second.unwrap();
+            assert_eq!(first.machine_no, second.machine_no);
+            assert_eq!(first.install_key, second.install_key);
+            let displayed = get_device_machine_no(&state).await.unwrap();
+            assert_eq!(displayed, json!(first.machine_no));
+            fetch_release_admin_update(&state, &base_url).await.unwrap();
+            first
+        })
+        .await;
+        server.abort();
+        let identity = result.unwrap();
+        let requests = requests.lock().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST /api/devices/register "))
+                .count(),
+            1
+        );
+        let report = requests
+            .iter()
+            .find(|request| request.starts_with("GET /api/updates/check?"))
+            .unwrap();
+        assert!(report.contains(&format!("x-machine-no: {}\r\n", identity.machine_no)));
+        assert!(report.contains(&format!("x-device-key: {}\r\n", identity.install_key)));
+    }
 
     fn valid_asset() -> UpdateManifestAsset {
         UpdateManifestAsset {

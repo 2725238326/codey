@@ -1,4 +1,4 @@
-//! 可选的声明式线路。插件只描述线路，不提供传输实现。
+//! 声明式线路；自定义传输须额外声明 transport 能力。
 use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY: &str = "provider.route.v1";
@@ -21,6 +21,8 @@ pub struct RouteDescriptor {
     pub models: Vec<String>,
     #[serde(default)]
     pub headers: Vec<RouteHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<crate::transport::TransportOptions>,
 }
 
 #[cfg(test)]

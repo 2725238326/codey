@@ -88,13 +88,22 @@ impl LifecyclePlugin {
         })
     }
 
-    async fn call(
+    pub(super) fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+        self.waiters.notify_waiters();
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn call(
         self: &Arc<Self>,
         method: &'static str,
         params: Value,
         deadline: Option<Instant>,
     ) -> Result<Value, LifecycleError> {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP {
             return Err(failure("plugin_disabled"));
         }
         let call_deadline = (Instant::now() + self.invoke_timeout)
@@ -103,7 +112,7 @@ impl LifecyclePlugin {
         // 排队和原生调用共用一次回调期限，挂起实例不会积累阻塞线程。
         // 先订阅 Notify 再 CAS，避免实例刚释放时丢掉唤醒。
         let guard = loop {
-            if !self.active.load(Ordering::Acquire) {
+            if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP {
                 return Err(failure("plugin_disabled"));
             }
             let remaining = call_deadline.saturating_duration_since(Instant::now());
@@ -122,7 +131,8 @@ impl LifecyclePlugin {
         let plugin = self.clone();
         let mut task = tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            if !plugin.active.load(Ordering::Acquire) {
+            if !plugin.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP
+            {
                 return Err("插件已停用".into());
             }
             (plugin.callback)(method, params)
@@ -134,14 +144,16 @@ impl LifecyclePlugin {
             loop {
                 tokio::select! {
                     result = &mut task => return result.map_err(|_| failure("plugin_callback_failed"))?
-                        .map_err(|_| failure("plugin_callback_failed")),
+                        .map_err(|error| failure(if codey_plugin_sdk::transport::is_reserved(method) {
+                            codey_plugin_sdk::transport::public_error_code(&error)
+                        } else { "plugin_callback_failed" })),
                     _ = sleep(Duration::from_millis(50)) => {
-                        if !self.active.load(Ordering::Acquire) { return Err(failure("plugin_disabled")); }
+                        if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP { return Err(failure("plugin_disabled")); }
                     }
                 }
             }
         }).await.map_err(|_| failure("plugin_callback_timeout"))?;
-        if !self.active.load(Ordering::Acquire) {
+        if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP {
             return Err(failure("plugin_disabled"));
         }
         result
@@ -504,7 +516,9 @@ async fn dispatch_one(
                 let wake = Instant::now() + delay;
                 while Instant::now() < wake {
                     let notified = plugin.waiters.notified();
-                    if !plugin.active.load(Ordering::Acquire) {
+                    if !plugin.active.load(Ordering::Acquire)
+                        && method != codey_plugin_sdk::transport::STOP
+                    {
                         return Err(failure("plugin_disabled"));
                     }
                     if Instant::now() >= end {
@@ -535,7 +549,7 @@ async fn dispatch_one(
 tokio::task_local! { static TEST_PLUGINS: Arc<Vec<Arc<LifecyclePlugin>>>; }
 #[cfg(test)]
 pub(crate) struct TestPlugin {
-    plugin: Arc<LifecyclePlugin>,
+    pub(super) plugin: Arc<LifecyclePlugin>,
 }
 #[cfg(test)]
 impl TestPlugin {

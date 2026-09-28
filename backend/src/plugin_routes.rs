@@ -99,7 +99,12 @@ pub(crate) fn release(config: &mut CodeyConfig, plugin_id: &str) {
             continue;
         }
         changed = true;
-        if profile.api_key.trim().is_empty() {
+        if profile.api_key.trim().is_empty()
+            || profile
+                .plugin_route_spec
+                .as_ref()
+                .is_some_and(|spec| spec.transport.is_some())
+        {
             removed.push(profile.provider_id().to_string());
         } else {
             detach(profile);
@@ -123,7 +128,29 @@ pub(crate) fn retain_plugin_ownership(
         return Ok(());
     }
     if structure_matches(profile) {
+        if previous
+            .plugin_route_spec
+            .as_ref()
+            .is_some_and(|spec| spec.transport.is_some())
+        {
+            profile.api_key.clear();
+            profile.api_key_configured = false;
+            profile.supports_websockets = false;
+            profile.supports_remote_compaction = false;
+            profile.supports_native_web_search = false;
+            profile.supports_auto_review = false;
+            if !profile.upstream_proxy.trim().is_empty() {
+                return Err("当前插件传输协议不支持线路代理，请清空代理设置".into());
+            }
+        }
         return Ok(());
+    }
+    if previous
+        .plugin_route_spec
+        .as_ref()
+        .is_some_and(|spec| spec.transport.is_some())
+    {
+        return Err("插件传输线路的结构由插件配置管理".into());
     }
     if profile.api_key.trim().is_empty() {
         return Err(format!(
@@ -185,6 +212,15 @@ fn apply_spec(
         profile.supports_auto_review = false;
     }
     profile.plugin_owner_id = Some(plugin_id.to_string());
+    if spec.transport.is_some() {
+        profile.api_key.clear();
+        profile.api_key_configured = false;
+        profile.upstream_proxy.clear();
+        profile.supports_websockets = false;
+        profile.supports_remote_compaction = false;
+        profile.supports_native_web_search = false;
+        profile.supports_auto_review = false;
+    }
     profile.normalize();
     let mut stored = spec.clone();
     stored.short_name = profile.short_name.clone();
@@ -325,6 +361,7 @@ mod tests {
             models: vec!["demo-model".into()],
             headers: BTreeMap::from([("x-region".into(), "us".into())]),
             short_name: String::new(),
+            transport: None,
         }
     }
 
@@ -544,5 +581,39 @@ mod tests {
             crate::local_router::CODEX_AUTO_REVIEW_MODEL,
             "codex-auto-review"
         );
+    }
+
+    #[test]
+    fn plugin_transport_route_cannot_detach_or_enable_unsupported_modes() {
+        let mut config = CodeyConfig::default();
+        let mut descriptor = spec("https://unused.invalid");
+        descriptor.headers.clear();
+        descriptor.transport = Some(codey_plugin_sdk::transport::TransportOptions {
+            account_email: "user@example.com".into(),
+            models: BTreeMap::new(),
+            image_generation: true,
+            image_edit: true,
+        });
+        let id = upsert(&mut config, "dev.transport", descriptor, true)
+            .unwrap()
+            .unwrap();
+        let previous = config.profiles.iter().find(|p| p.id == id).unwrap().clone();
+        let mut edited = previous.clone();
+        edited.base_url = "https://elsewhere.invalid".into();
+        edited.api_key = "fake-key".into();
+        assert!(retain_plugin_ownership(&mut edited, &previous).is_err());
+        let mut edited = previous.clone();
+        edited.supports_websockets = true;
+        edited.supports_remote_compaction = true;
+        retain_plugin_ownership(&mut edited, &previous).unwrap();
+        assert!(!edited.supports_websockets && !edited.supports_remote_compaction);
+        config
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .api_key = "fake-key".into();
+        release(&mut config, "dev.transport");
+        assert!(config.profiles.iter().all(|p| p.id != id));
     }
 }

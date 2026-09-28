@@ -1191,6 +1191,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             }
         }
         "check_for_updates"
+        | "get_device_machine_no"
         | "download_update"
         | "update_install_report"
         | "install_downloaded_update" => updates::invoke(state, command, &args).await,
@@ -1977,6 +1978,25 @@ async fn save_codey_config_locked(
 }
 
 pub(crate) fn install_plugin_route_handler(state: Arc<AppState>) {
+    let account_state = Arc::downgrade(&state);
+    crate::codey_plugins::transport::set_account_handler(Arc::new(move |email| {
+        let weak = account_state.clone();
+        Box::pin(async move {
+            let state = weak.upgrade().ok_or("宿主正在关闭")?;
+            let store = state.official_accounts();
+            let lookup_email = email.clone();
+            let original = tokio::task::spawn_blocking(move || store.by_email(&lookup_email))
+                .await
+                .map_err(|_| "读取插件账号失败")?
+                .map_err(|e| e.to_string())?;
+            official_accounts::refresh_official_account_tokens(&state, &original.id).await?;
+            let store = state.official_accounts();
+            tokio::task::spawn_blocking(move || store.plugin_credentials(&email, &original))
+                .await
+                .map_err(|_| "读取插件账号失败")?
+                .map_err(|error| error.to_string())
+        })
+    }));
     let state = Arc::clone(&state);
     crate::codey_plugins::set_route_handler(Arc::new(move |plugin_id, change| {
         let (route_id, changed) = apply_plugin_route_change(&state, plugin_id, change)?;

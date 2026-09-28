@@ -197,6 +197,11 @@ export function PluginImportDialog({
                     {preview.manifest.headerNames.join("、")}
                   </div>
                 ) : null}
+                {capabilities.includes("provider.account.v1") ? (
+                  <p className="m-0 pt-1 leading-relaxed text-muted">
+                    启用后，插件将接收其线路的请求正文，以及配置邮箱对应账号的访问令牌；不会接收刷新令牌。
+                  </p>
+                ) : null}
               </div>
 
               <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/10 p-3 text-amber-800 dark:text-amber-300">

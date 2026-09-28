@@ -191,6 +191,8 @@ pub(crate) struct CapabilityLists<'a> {
 /// 生成目录时一并应用的上下文与思考等级覆盖。
 #[derive(Clone, Copy)]
 pub(crate) struct CatalogOverrides<'a> {
+    pub(crate) plugin_contexts:
+        &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) contexts: &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) reasoning_efforts:
         &'a std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
@@ -284,6 +286,17 @@ pub(crate) fn apply_catalog_overrides(home: &Path, overrides: CatalogOverrides<'
 
 fn apply_overrides_to_models(models: &mut [Value], overrides: CatalogOverrides<'_>) -> Result<()> {
     for model in models {
+        let plugin_policy = model.get("slug").and_then(Value::as_str).and_then(|slug| {
+            overrides
+                .plugin_contexts
+                .iter()
+                .find(|(key, _)| model_id::equal(key, slug))
+                .map(|(_, policy)| policy)
+        });
+        if let Some(policy) = plugin_policy {
+            apply_model_context(model, Some(policy))?;
+            model["codey_context_source"] = json!("plugin_declared");
+        }
         let policy = model.get("slug").and_then(Value::as_str).and_then(|slug| {
             overrides
                 .contexts
@@ -2862,6 +2875,7 @@ mod tests {
             }],
         )]);
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -2887,6 +2901,7 @@ mod tests {
         apply_catalog_overrides(
             combined.path(),
             CatalogOverrides {
+                plugin_contexts: &Default::default(),
                 contexts: &contexts,
                 reasoning_efforts: &no_efforts,
             },
@@ -2924,6 +2939,7 @@ mod tests {
         )]);
         let efforts = std::collections::BTreeMap::new();
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -2976,6 +2992,7 @@ mod tests {
             .collect();
         let efforts = std::collections::BTreeMap::new();
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -5239,4 +5256,62 @@ mod tests {
             "CACHED instructions for gpt-5.6-sol"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
+    use crate::config::ModelContextConfig;
+    use std::collections::BTreeMap;
+    let plugin = BTreeMap::from([(
+        "route/model".into(),
+        ModelContextConfig {
+            context_window_tokens: 918000,
+            auto_compact_token_limit: Some(826000),
+            reserve_output_tokens: None,
+        },
+    )]);
+    let user = BTreeMap::from([(
+        "route/model".into(),
+        ModelContextConfig {
+            context_window_tokens: 100000,
+            auto_compact_token_limit: Some(80000),
+            reserve_output_tokens: None,
+        },
+    )]);
+    let empty = BTreeMap::new();
+    let reasoning = BTreeMap::new();
+    let mut models = vec![json!({"slug":"route/model"})];
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &empty,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 918000);
+    assert_eq!(models[0]["codey_context_source"], "plugin_declared");
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &user,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 100000);
+    assert_eq!(models[0]["codey_context_source"], "user_declared");
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &empty,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 918000);
 }

@@ -27,6 +27,10 @@ fn package(path: &Path, library: &[u8], version: &str) {
 }
 
 fn package_with_header(path: &Path, library: &[u8], version: &str, header: &str) {
+    package_with_options(path, library, version, header, false);
+}
+
+fn package_with_options(path: &Path, library: &[u8], version: &str, header: &str, transport: bool) {
     let filename = if cfg!(target_os = "macos") {
         "libplugin.dylib"
     } else if cfg!(target_os = "windows") {
@@ -38,7 +42,8 @@ fn package_with_header(path: &Path, library: &[u8], version: &str, header: &str)
         "id":"dev.codey.header-demo","name":"Demo","version":version,
         "abiVersion":1,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,
         "entry":format!("lib/{filename}"),"librarySha256":format!("{:x}",Sha256::digest(library)),
-        "capabilities":["request.lifecycle.v1"],"headerNames":[header]
+        "capabilities": if transport { vec!["request.lifecycle.v1", "provider.route.v1", "provider.transport.v1", "provider.account.v1"] } else { vec!["request.lifecycle.v1"] },
+        "headerNames":[header]
     });
     let config = INITIAL_CONFIG;
     let mut archive = zip::ZipWriter::new(fs::File::create(path).unwrap());
@@ -114,6 +119,29 @@ fn uninstall_loaded_plugin(root: &Path, remove_data: bool) {
 
 #[tokio::test]
 async fn complete_native_plugin_lifecycle() {
+    if let Some(root) = std::env::var_os("CODEY_TEST_TRANSPORT_STARTUP_ROOT") {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        host::set_route_handler(std::sync::Arc::new(move |id, change| {
+            if matches!(change, host::RouteChange::Upsert { .. }) {
+                assert!(
+                    host::transport::Instance::capture(id)
+                        .unwrap()
+                        .open()
+                        .is_ok(),
+                    "startup published the route before its instance"
+                );
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(Some("fixture-route".into()));
+            }
+            Ok(None)
+        }));
+        host::initialize(root.into()).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(host::list().unwrap().plugins[0].enabled);
+        host::shutdown();
+        return;
+    }
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let temp = tempfile::tempdir().unwrap();
     // Compile a separate consumer project, with no Codey workspace membership.
@@ -133,7 +161,7 @@ async fn complete_native_plugin_lifecycle() {
         ),
         (
             "match method {",
-            "match method {\n            \"config.received\" => Ok(self.received_config.clone()),",
+            "match method {\n            \"provider.describe\" => Ok(json!({\"name\":\"Fixture\",\"baseUrl\":\"https://example.invalid/v1\",\"upstreamProtocol\":\"openaiResponses\",\"models\":[\"fixture-model\"],\"headers\":[],\"transport\":{\"accountEmail\":\"fixture@example.com\",\"models\":{},\"imageGeneration\":false,\"imageEdit\":false}})),\n            \"provider.request.stop\" => Ok(json!({})),\n            \"config.received\" => Ok(self.received_config.clone()),",
         ),
         (
             "\"request.completed\" | \"request.failed\" | \"request.cancelled\" => Ok(json!({})),",
@@ -471,10 +499,47 @@ async fn complete_native_plugin_lifecycle() {
         host::invoke("dev.codey.header-demo", "storage.context", json!(null)).unwrap(),
         context
     );
+    host::set_enabled("dev.codey.header-demo", false).unwrap();
+    package_with_options(&path, &library, "1.4.0", "x-plugin-demo", true);
+    let inspection = host::inspect(&path).unwrap();
+    host::install(&path, &inspection.sha256).unwrap();
+    host::set_route_handler(std::sync::Arc::new(|id, change| {
+        // 同步重入模拟并发管理调用，不依赖调度或 sleep。
+        assert!(host::set_enabled(id, true).is_err());
+        assert!(host::set_enabled(id, false).is_err());
+        if matches!(change, host::RouteChange::Upsert { .. }) {
+            assert!(
+                host::transport::Instance::capture(id)
+                    .unwrap()
+                    .open()
+                    .is_ok()
+            );
+            Ok(Some("fixture-route".into()))
+        } else {
+            Ok(None)
+        }
+    }));
+    host::set_enabled("dev.codey.header-demo", true).unwrap();
+    host::set_enabled("dev.codey.header-demo", false).unwrap();
+    host::set_enabled("dev.codey.header-demo", true).unwrap();
     host::shutdown();
     assert!(!LifecycleRequest::new(json!({}), None).is_active());
     assert!(host::invoke("dev.codey.header-demo", "ping", json!(null)).is_err());
     assert!(host::set_enabled("dev.codey.header-demo", true).is_err());
+    let restarted = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "complete_native_plugin_lifecycle", "--nocapture"])
+        .env(
+            "CODEY_TEST_TRANSPORT_STARTUP_ROOT",
+            temp.path().join("host"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        restarted.status.success(),
+        "restart failed: {} {}",
+        String::from_utf8_lossy(&restarted.stdout),
+        String::from_utf8_lossy(&restarted.stderr)
+    );
 }
 
 #[test]

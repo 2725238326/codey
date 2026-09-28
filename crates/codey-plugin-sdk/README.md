@@ -36,7 +36,9 @@
 
 声明 `appserver.call.v1` 后，插件发送 `{"schema":"codey.appserver.v1","call":"codey://getTasks"}` 查询正在运行和失败的任务数量。未列入 `schema/appserver.v1.json` 的调用不会执行。
 
-声明 `provider.route.v1` 后，宿主在启用时调用 `provider.describe`。返回对象包含 `name`、`baseUrl`、`upstreamProtocol`（`openaiResponses`、`openaiChatCompletions` 或 `anthropicMessages`）、至少 1 个且最多 32 个 `models`，以及可选 `headers`。线路名最多 15 个字符。请求头不能携带密钥，名称限制与生命周期相同。密钥由用户填写在线路上。该调用不能通过管理接口进入。插件不提供自己的传输实现。
+声明 `provider.route.v1` 后，宿主在启用时调用 `provider.describe`。返回对象包含 `name`、`baseUrl`、`upstreamProtocol`（`openaiResponses`、`openaiChatCompletions` 或 `anthropicMessages`）、至少 1 个且最多 32 个 `models`，以及可选 `headers`。线路名最多 15 个字符。请求头不能携带密钥，名称限制与生命周期相同；普通线路的密钥由用户填写。该调用不能通过管理接口进入。
+
+同时声明 `provider.transport.v1` 与 `provider.account.v1` 可接管本插件线路的请求传输，通过邮箱绑定已保存账号并声明模型上下文预算。正文通过有界分块传递，客户端断开或插件停用时取消请求；管理接口拒绝整个 `provider.request.*` 前缀。完整协议与清理约定见 [供应商传输协议](PROVIDER_TRANSPORT.md)，迁移示例见 `examples/plugins/excel-bridge`。
 
 ## 示例
 

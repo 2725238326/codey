@@ -524,6 +524,15 @@ pub(crate) fn preserve_declared_official_models(
 }
 
 pub(crate) async fn fetch_provider_models(profile: ProviderProfile) -> anyhow::Result<Vec<String>> {
+    // 原生传输插件的模型由配置声明，上游不一定提供标准 /models。
+    if profile.plugin_owner_id.is_some()
+        && let Some(spec) = profile
+            .plugin_route_spec
+            .as_ref()
+            .filter(|spec| spec.transport.is_some())
+    {
+        return Ok(spec.models.clone());
+    }
     let home = codex_home();
     let fetch_profile = tokio::task::spawn_blocking(move || {
         codex_provider::provider_model_fetch_profile(&profile, home)
@@ -531,6 +540,21 @@ pub(crate) async fn fetch_provider_models(profile: ProviderProfile) -> anyhow::R
     .await
     .map_err(|error| anyhow::anyhow!("解析模型源 API 配置任务异常退出：{error}"))??;
     provider_models::fetch(&fetch_profile, provider_models::http_client()).await
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn plugin_transport_models_are_local_without_credentials_or_network() {
+    let mut profile = ProviderProfile::new("Excel Bridge");
+    profile.plugin_owner_id = Some("dev.transport".into());
+    profile.plugin_route_spec = Some(serde_json::from_value(json!({
+        "name":"Excel Bridge","baseUrl":"https://unused.invalid","upstreamProtocol":"openaiResponses",
+        "models":["demo-model"],"headers":{},"transport":{"accountEmail":"user@example.com"}
+    })).unwrap());
+    assert_eq!(
+        fetch_provider_models(profile).await.unwrap(),
+        vec!["demo-model"]
+    );
 }
 
 pub(crate) async fn sync_provider_models_for_launch(
