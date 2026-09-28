@@ -189,6 +189,21 @@ fn prepare_startup_require_in(
     options: PatchOptions,
     runtime_config_overrides: &[String],
 ) -> Result<StartupRequire> {
+    prepare_startup_require_with_path(
+        state_dir,
+        options,
+        runtime_config_overrides,
+        space_free_path,
+    )
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn prepare_startup_require_with_path(
+    state_dir: &std::path::Path,
+    options: PatchOptions,
+    runtime_config_overrides: &[String],
+    resolve_path: impl FnOnce(&std::path::Path) -> Result<std::path::PathBuf>,
+) -> Result<StartupRequire> {
     let directory = state_dir.join(STARTUP_REQUIRE_DIR);
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("创建 Codex 启动补丁目录失败：{}", directory.display()))?;
@@ -209,7 +224,18 @@ fn prepare_startup_require_in(
     );
     crate::fs_util::atomic_write_private_with_parent(&script_path, expression.as_bytes())
         .with_context(|| format!("写入 Codex 启动补丁失败：{}", script_path.display()))?;
-    let require_path = space_free_path(&script_path)?;
+    let require_argument =
+        match resolve_path(&script_path).and_then(|path| node_require_argument(&path)) {
+            Ok(argument) => argument,
+            Err(error) => {
+                if let Err(cleanup) = std::fs::remove_file(&script_path) {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}；清理未使用的启动补丁失败：{cleanup}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
     Ok(StartupRequire {
         environment: vec![
             ("CODEX_SPARKLE_ENABLED".to_string(), "false".to_string()),
@@ -217,10 +243,7 @@ fn prepare_startup_require_in(
                 "CODEY_DISABLE_MACOS_CHILD_PROCESS_SAMPLER".to_string(),
                 "true".to_string(),
             ),
-            (
-                "NODE_OPTIONS".to_string(),
-                node_require_argument(&require_path)?,
-            ),
+            ("NODE_OPTIONS".to_string(), require_argument),
             (
                 STARTUP_PATCH_MARKER_ENV.to_string(),
                 marker_path.to_string_lossy().into_owned(),
@@ -776,55 +799,17 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
 
 #[cfg(windows)]
 fn run_windows_package_resume_helper_if_requested() -> Result<bool> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let Some(thread_id) = windows_package_resume_thread_id(&arguments)? else {
-        return Ok(false);
-    };
-    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
-        .context("打开 Windows Store Codex 启动线程失败")?;
-    let previous_suspend_count = unsafe { ResumeThread(thread) };
-    let resume_error = (previous_suspend_count == u32::MAX).then(windows::core::Error::from_win32);
-    unsafe { CloseHandle(thread) }.context("关闭 Windows Store Codex 启动线程句柄失败")?;
-    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-        "launcher.windows_package_thread_resumed",
-        serde_json::json!({
-            "threadId": thread_id,
-            "previousSuspendCount": previous_suspend_count,
-            "succeeded": resume_error.is_none(),
-            "helperWrapperEnvironmentPresent": std::env::var_os(CLI_WRAPPER_TARGET_ENV).is_some(),
-            "helperWslEnvironmentPresent": std::env::var_os("WSL_DISTRO_NAME").is_some(),
-        }),
-    );
-    // 助手随即退出，确保这次恢复结果已写入磁盘。
-    let _ = codey_runtime_core::diagnostic_log::flush_diagnostic_log();
-    if let Some(error) = resume_error {
-        return Err(error).context("恢复 Windows Store Codex 启动线程失败");
-    }
-    Ok(true)
+    windows_package_resume_thread_id(&arguments).map(|_| false)
 }
 
 #[cfg(any(windows, test))]
 fn windows_package_resume_thread_id(arguments: &[OsString]) -> Result<Option<u32>> {
-    if arguments.first().and_then(|value| value.to_str()) != Some(WINDOWS_PACKAGE_RESUME_ARGUMENT) {
-        return Ok(None);
-    }
-    let value = arguments
-        .windows(2)
-        .find(|pair| {
-            pair[0]
-                .to_str()
-                .is_some_and(|value| value.eq_ignore_ascii_case("-tid"))
-        })
-        .and_then(|pair| pair[1].to_str())
-        .context("Windows Store 未向 Codey 传递待恢复的线程 ID")?;
-    let thread_id = value
-        .parse::<u32>()
-        .context("Windows Store 传递了无效的线程 ID")?;
-    anyhow::ensure!(thread_id != 0, "Windows Store 传递了空线程 ID");
-    Ok(Some(thread_id))
+    anyhow::ensure!(
+        arguments.first().and_then(|value| value.to_str()) != Some(WINDOWS_PACKAGE_RESUME_ARGUMENT),
+        "旧版 Windows 包调试助手已停用；请通过官方安装程序修复残留的包调试设置"
+    );
+    Ok(None)
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1634,14 +1619,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_package_resume_helper_requires_its_marker_and_thread_id() {
+    fn windows_package_resume_helper_rejects_legacy_invocations() {
         assert_eq!(windows_package_resume_thread_id(&[]).unwrap(), None);
-        assert_eq!(
+        assert!(
             windows_package_resume_thread_id(
                 &[WINDOWS_PACKAGE_RESUME_ARGUMENT, "-p", "42", "-tid", "73"].map(OsString::from)
             )
-            .unwrap(),
-            Some(73)
+            .is_err()
         );
         assert!(
             windows_package_resume_thread_id(
@@ -2452,6 +2436,36 @@ mod tests {
         assert!(!path_has_whitespace(&resolved));
         assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "1");
         std::fs::remove_file(resolved).unwrap();
+    }
+
+    #[test]
+    fn failed_path_preparation_removes_the_unused_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = PatchOptions {
+            disable_pet: false,
+            subagent_gate_active: false,
+            misc_model: None,
+        };
+        let failure = prepare_startup_require_with_path(temp.path(), options.clone(), &[], |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        });
+        assert!(failure.is_err());
+        let invalid_argument =
+            prepare_startup_require_with_path(temp.path(), options.clone(), &[], |_| {
+                Ok(temp.path().join("missing patch.js"))
+            });
+        assert!(invalid_argument.is_err());
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(STARTUP_REQUIRE_DIR))
+                .unwrap()
+                .count(),
+            0
+        );
+        let first = prepare_startup_require_in(temp.path(), options.clone(), &[]).unwrap();
+        let second = prepare_startup_require_in(temp.path(), options, &[]).unwrap();
+        assert_ne!(first.marker_path, second.marker_path);
+        assert!(first.marker_path.with_extension("js").is_file());
+        assert!(second.marker_path.with_extension("js").is_file());
     }
 
     #[test]

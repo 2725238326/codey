@@ -67,17 +67,14 @@ impl FuseState {
         }
     }
 
-    /// Whether `--inspect-brk` can still open a main-process Inspector. An
-    /// unknown wire keeps the Inspector attempt so a scan failure never removes
-    /// a working path; the runtime probes then decide.
+    /// Only use Inspector when the runtime explicitly enables it.
     pub(crate) fn inspector_possible(self) -> bool {
-        !matches!(self, FuseState::Disabled | FuseState::Removed)
+        self == FuseState::Enabled
     }
 
-    /// Whether Electron still honours `NODE_OPTIONS` in the main process. Unknown
-    /// keeps the `--require` attempt for the same reason as Inspector.
+    /// An unreadable or unknown fuse is not permission to inject through it.
     pub(crate) fn node_options_possible(self) -> bool {
-        !matches!(self, FuseState::Disabled | FuseState::Removed)
+        self == FuseState::Enabled
     }
 }
 
@@ -531,15 +528,19 @@ fn normalized_digest(file: &mut std::fs::File, offset: u64) -> Result<String> {
 
 #[cfg(any(windows, test))]
 fn change_node_options(binary: &Path, backup: &Path, cache: &Path, restore: bool) -> Result<bool> {
+    anyhow::ensure!(
+        restore,
+        "不再修改 Codex 安全开关；请使用官方扩展或当前版本允许的兼容入口"
+    );
     let binary = std::fs::canonicalize(binary).context("找不到待修复的 Electron 运行时")?;
     let mut file = open_runtime_exclusive(&binary).with_context(|| {
         format!("无法独占写入 {}；请确认 Codex 已关闭、运行时未被其他程序占用，并确认当前账户具有运行时文件写入权限", binary.display())
     })?;
     let inspection = inspect_node_options(&mut file)?;
-    if !prepare_node_options_change(&binary, backup, cache, restore, &inspection)? {
+    if !prepare_node_options_restore(&binary, backup, cache, &inspection)? {
         return Ok(false);
     }
-    write_node_options(&mut file, &inspection, if restore { b'0' } else { b'1' })?;
+    write_node_options(&mut file, &inspection, b'0')?;
     Ok(true)
 }
 
@@ -587,11 +588,10 @@ fn inspect_node_options(file: &mut std::fs::File) -> Result<NodeOptionsInspectio
 }
 
 #[cfg(any(windows, test))]
-fn prepare_node_options_change(
+fn prepare_node_options_restore(
     binary: &Path,
     backup: &Path,
     cache: &Path,
-    restore: bool,
     inspection: &NodeOptionsInspection,
 ) -> Result<bool> {
     let NodeOptionsInspection {
@@ -599,32 +599,12 @@ fn prepare_node_options_change(
         current,
         digest,
     } = inspection;
-    let saved = match read_node_options_backup(backup)? {
-        Some(saved) if node_options_backup_matches(&saved, binary, *offset, digest) => Some(saved),
-        // An in-place update replaces the runtime and invalidates the recorded
-        // original byte. Enabling may record the current byte again, because the
-        // byte below still is the state a later restore must return to.
-        Some(_) if restore => {
-            anyhow::bail!("NODE_OPTIONS 备份与当前运行时不匹配（文件可能已更新），未修改运行时")
-        }
-        Some(saved) => {
-            crate::error_log::record_failure(
-                "runtime_repair_failed",
-                "node_options_backup_replaced",
-                "NODE_OPTIONS 备份与当前运行时不匹配，已按当前运行时重新记录".to_string(),
-                serde_json::json!({
-                    "binary": binary,
-                    "backup": backup,
-                    "savedDigest": saved.normalized_sha256,
-                    "runtimeDigest": digest,
-                }),
-            );
-            None
-        }
-        None if restore => anyhow::bail!("没有此运行时的 NODE_OPTIONS 备份，无法恢复"),
-        None => None,
-    };
-    let desired = if restore { b'0' } else { b'1' };
+    let saved =
+        read_node_options_backup(backup)?.context("没有此运行时的 NODE_OPTIONS 备份，无法恢复")?;
+    anyhow::ensure!(
+        node_options_backup_matches(&saved, binary, *offset, digest),
+        "NODE_OPTIONS 备份与当前运行时不匹配（文件可能已更新），未修改运行时"
+    );
     // Invalidate even for an already-correct runtime: a previous same-size edit
     // may not have changed its millisecond timestamp.
     match std::fs::remove_file(cache) {
@@ -632,25 +612,10 @@ fn prepare_node_options_change(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("清除 Electron fuse 缓存失败，未修改运行时"),
     }
-    if *current == desired {
-        return Ok(false);
-    }
-    if saved.is_none() {
-        let saved = NodeOptionsBackup {
-            format: 1,
-            binary: binary.to_path_buf(),
-            offset: *offset,
-            normalized_sha256: digest.clone(),
-            original: *current,
-        };
-        crate::fs_util::atomic_write_private_with_parent(backup, &serde_json::to_vec(&saved)?)
-            .context("保存 NODE_OPTIONS 原始字节备份失败，未修改运行时")?;
-    }
-    Ok(true)
+    Ok(*current != saved.original)
 }
 
-/// Reads the recorded original byte. A damaged or foreign backup is an error;
-/// the caller decides whether it may be replaced.
+/// Reads the recorded original byte without replacing damaged or foreign backups.
 #[cfg(any(windows, test))]
 fn read_node_options_backup(backup: &Path) -> Result<Option<NodeOptionsBackup>> {
     if !backup.exists() {
@@ -730,12 +695,7 @@ fn write_node_options_with(
 
 #[cfg(windows)]
 const NODE_OPTIONS_BACKUP_DIR: &str = "node-options-backups";
-/// Automatic attempts live next to the backups so both follow the runtime path.
-#[cfg(windows)]
-const NODE_OPTIONS_AUTO_REPAIR_DIR: &str = "node-options-auto-repair";
-
-/// Fingerprint of the runtime path; keeps the backup and the automatic-attempt
-/// record stable while the install path itself does not change.
+/// Fingerprint of the runtime path used to locate its existing backup.
 #[cfg(windows)]
 fn runtime_key(binary: &Path) -> String {
     crate::fs_util::sha256_hex_str(&binary.to_string_lossy())
@@ -750,174 +710,6 @@ fn repair_target(app_dir: &Path) -> Result<(PathBuf, PathBuf)> {
         .join(NODE_OPTIONS_BACKUP_DIR)
         .join(format!("{}.json", runtime_key(&binary)));
     Ok((binary, backup))
-}
-
-/// Called after the managed Codex has stopped; the exclusive handle below is
-/// the final guard against another process still using this runtime.
-#[cfg(windows)]
-pub(crate) fn repair_node_options(app_dir: &Path) -> Result<()> {
-    let (binary, backup) = repair_target(app_dir)?;
-    windows_repair::repair(&binary, &backup, &cache_path())
-}
-
-/// Raised instead of opening a UAC prompt when only an administrator may write
-/// the runtime. The launcher must not elevate during startup; the manual repair
-/// keeps that path.
-#[cfg(windows)]
-#[derive(Debug)]
-pub(crate) struct RepairNeedsElevation;
-
-#[cfg(windows)]
-impl std::fmt::Display for RepairNeedsElevation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("修复受保护的 Codex 运行时需要管理员权限")
-    }
-}
-
-#[cfg(windows)]
-impl std::error::Error for RepairNeedsElevation {}
-
-/// What the launcher's automatic repair attempt reached. Only [`Repaired`]
-/// releases the launch path back to `NODE_OPTIONS`; every other outcome keeps
-/// the CLI compatibility mode and the manual repair button.
-///
-/// [`Repaired`]: AutoRepairOutcome::Repaired
-#[cfg(windows)]
-#[derive(Debug)]
-pub(crate) enum AutoRepairOutcome {
-    Repaired,
-    AlreadyEnabled,
-    AlreadyAttempted,
-    NeedsElevation,
-    Failed(String),
-}
-
-#[cfg(windows)]
-impl AutoRepairOutcome {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Repaired => "repaired",
-            Self::AlreadyEnabled => "already_enabled",
-            Self::AlreadyAttempted => "already_attempted",
-            Self::NeedsElevation => "needs_elevation",
-            Self::Failed(_) => "failed",
-        }
-    }
-
-    pub(crate) fn repaired(&self) -> bool {
-        matches!(self, Self::Repaired)
-    }
-
-    pub(crate) fn error(&self) -> Option<&str> {
-        match self {
-            Self::Failed(error) => Some(error.as_str()),
-            _ => None,
-        }
-    }
-}
-
-/// One automatic attempt per runtime build. The runtime is identified by size
-/// and modification time: a Codex update replaces the file, which releases the
-/// record, while a repeated failure keeps the compatibility mode instead of
-/// looping.
-#[cfg(any(windows, test))]
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NodeOptionsAutoRepairState {
-    format: u8,
-    binary: PathBuf,
-    len: u64,
-    modified_ms: Option<u64>,
-    outcome: String,
-    error: Option<String>,
-}
-
-#[cfg(any(windows, test))]
-fn auto_repair_attempted(state_path: &Path, binary: &Path, signature: (u64, Option<u64>)) -> bool {
-    let Ok(bytes) = crate::fs_util::read_bounded(state_path, MAX_CACHE_BYTES) else {
-        return false;
-    };
-    let Ok(state) = serde_json::from_slice::<NodeOptionsAutoRepairState>(&bytes) else {
-        return false;
-    };
-    state.format == 1
-        && state.binary == binary
-        && state.len == signature.0
-        && state.modified_ms == signature.1
-}
-
-#[cfg(any(windows, test))]
-fn record_auto_repair_attempt(
-    state_path: &Path,
-    binary: &Path,
-    signature: (u64, Option<u64>),
-    outcome: &str,
-    error: Option<&str>,
-) -> Result<()> {
-    let state = NodeOptionsAutoRepairState {
-        format: 1,
-        binary: binary.to_path_buf(),
-        len: signature.0,
-        modified_ms: signature.1,
-        outcome: outcome.to_string(),
-        error: error.map(|error| error.chars().take(512).collect()),
-    };
-    crate::fs_util::atomic_write_private_with_parent(state_path, &serde_json::to_vec(&state)?)
-}
-
-/// Automatic repair for the launcher. It never elevates and never retries the
-/// same runtime build twice, so a locked or protected runtime falls back to the
-/// CLI compatibility mode instead of blocking or looping during startup.
-#[cfg(windows)]
-pub(crate) fn auto_repair_node_options(app_dir: &Path) -> AutoRepairOutcome {
-    let cache = cache_path();
-    let (binary, _wire, _cached) = match electron_runtime_with_wire(app_dir, Some(&cache)) {
-        Ok(resolved) => resolved,
-        Err(error) => return AutoRepairOutcome::Failed(format!("{error:#}")),
-    };
-    let binary = match std::fs::canonicalize(&binary) {
-        Ok(binary) => binary,
-        Err(error) => {
-            return AutoRepairOutcome::Failed(format!("找不到待修复的 Electron 运行时：{error}"));
-        }
-    };
-    let Some(signature) = binary_signature(&binary) else {
-        return AutoRepairOutcome::Failed("无法读取待修复的 Electron 运行时信息".to_string());
-    };
-    let key = runtime_key(&binary);
-    let state_dir = codey_runtime_core::paths::default_app_state_dir();
-    let state_path = state_dir
-        .join(NODE_OPTIONS_AUTO_REPAIR_DIR)
-        .join(format!("{key}.json"));
-    if auto_repair_attempted(&state_path, &binary, signature) {
-        return AutoRepairOutcome::AlreadyAttempted;
-    }
-    let backup = state_dir
-        .join(NODE_OPTIONS_BACKUP_DIR)
-        .join(format!("{key}.json"));
-    let outcome = match windows_repair::repair_without_elevation(&binary, &backup, &cache) {
-        Ok(true) => AutoRepairOutcome::Repaired,
-        Ok(false) => AutoRepairOutcome::AlreadyEnabled,
-        Err(error) if error.downcast_ref::<RepairNeedsElevation>().is_some() => {
-            AutoRepairOutcome::NeedsElevation
-        }
-        Err(error) => AutoRepairOutcome::Failed(format!("{error:#}")),
-    };
-    if let Err(error) = record_auto_repair_attempt(
-        &state_path,
-        &binary,
-        signature,
-        outcome.as_str(),
-        outcome.error(),
-    ) {
-        crate::error_log::record_failure(
-            "runtime_repair_failed",
-            "record_auto_repair_attempt",
-            format!("{error:#}"),
-            serde_json::json!({ "state": state_path }),
-        );
-    }
-    outcome
 }
 
 fn is_node_options_repair_command(command: &str) -> bool {
@@ -938,10 +730,17 @@ pub(crate) fn run_node_options_repair_if_requested() -> Result<bool> {
         return Ok(false);
     }
     let restore = match command {
-        "--repair-codex-node-options" => false,
+        "--repair-codex-node-options" => anyhow::bail!(
+            "不再修改 Codex 安全开关；需要撤销旧版修改时，请使用 --restore-codex-node-options"
+        ),
         "--restore-codex-node-options" => true,
         "--help-codex-node-options" => {
-            let help = "Codey Windows 主进程注入修复\n\n--repair-codex-node-options [Codex 安装目录]\n启用 NODE_OPTIONS，备份原始字节。\n--restore-codex-node-options [Codex 安装目录]\n校验当前运行时后恢复原始字节。\n\n省略目录时使用 Codey 配置中的安装目录。请先退出 Codex 和其他 Codey 进程。修复需要文件写入权限；商店更新后可能需要重新修复。修改运行时可能使原签名失效。";
+            let help = "Codey Windows 旧版修改恢复
+
+--restore-codex-node-options [Codex 安装目录]
+校验备份与当前运行时一致后恢复原始字节，不请求提权。
+
+请先退出 Codex。备份缺失、损坏或版本已变化时停止修改，请通过官方安装程序修复客户端。Codey 不再启用被关闭的 Electron 安全开关。";
             println!("{help}");
             #[cfg(windows)]
             rfd::MessageDialog::new()
@@ -995,10 +794,8 @@ pub(crate) fn run_node_options_repair_if_requested() -> Result<bool> {
                 "{}。请重新从 Codey 启动 Codex。\n运行时：{}{backup_note}",
                 if !changed {
                     "NODE_OPTIONS 已处于目标状态"
-                } else if restore {
-                    "已恢复 NODE_OPTIONS 原始状态"
                 } else {
-                    "已启用 NODE_OPTIONS"
+                    "已恢复 NODE_OPTIONS 原始状态"
                 },
                 binary.display()
             ))
@@ -1074,11 +871,11 @@ mod tests {
             FuseState::Unknown
         );
         assert!(FuseState::Enabled.inspector_possible());
-        assert!(FuseState::Unknown.inspector_possible());
+        assert!(!FuseState::Unknown.inspector_possible());
         assert!(!FuseState::Disabled.inspector_possible());
         assert!(!FuseState::Removed.inspector_possible());
         assert!(FuseState::Enabled.node_options_possible());
-        assert!(FuseState::Unknown.node_options_possible());
+        assert!(!FuseState::Unknown.node_options_possible());
         assert!(!FuseState::Disabled.node_options_possible());
         assert!(!FuseState::Removed.node_options_possible());
         let fuses = ElectronFuses::from_wire(Some(&wire));
@@ -1197,8 +994,26 @@ mod tests {
         );
     }
 
+    /// A backup as an older Codey build would have recorded it: the byte the
+    /// fuse had before Codey enabled it, plus the runtime fingerprint.
+    fn recorded_node_options_backup(binary: &Path) -> NodeOptionsBackup {
+        let mut file = open_runtime_exclusive(binary).unwrap();
+        let inspection = inspect_node_options(&mut file).unwrap();
+        NodeOptionsBackup {
+            format: 1,
+            binary: std::fs::canonicalize(binary).unwrap(),
+            offset: inspection.offset,
+            normalized_sha256: inspection.digest,
+            original: b'0',
+        }
+    }
+
+    fn write_node_options_backup(backup: &Path, saved: &NodeOptionsBackup) {
+        std::fs::write(backup, serde_json::to_vec(saved).unwrap()).unwrap();
+    }
+
     #[test]
-    fn repair_and_restore_only_change_node_options_and_invalidate_cache() {
+    fn repair_is_rejected_and_restore_returns_the_recorded_original_byte() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("chrome.dll");
         let backup = temp.path().join("backup.json");
@@ -1206,31 +1021,39 @@ mod tests {
         let mut original = b"runtime prefix".to_vec();
         original.extend(wire_bytes("010011001"));
         original.extend(b"runtime suffix");
-        std::fs::write(&binary, &original).unwrap();
+        let mut edited = b"runtime prefix".to_vec();
+        edited.extend(wire_bytes("011011001"));
+        edited.extend(b"runtime suffix");
+        std::fs::write(&binary, &edited).unwrap();
         cached_fuse_wire(&binary, &cache).unwrap();
-        assert!(change_node_options(&binary, &backup, &cache, false).unwrap());
-        assert!(!cache.exists());
-        let patched = std::fs::read(&binary).unwrap();
-        assert_eq!(
-            original
-                .iter()
-                .zip(&patched)
-                .filter(|(a, b)| a != b)
-                .count(),
-            1
-        );
-        let (wire, cached) = cached_fuse_wire(&binary, &cache).unwrap();
-        assert!(!cached);
-        assert_eq!(wire.unwrap().states, "011011001");
-        assert!(!change_node_options(&binary, &backup, &cache, false).unwrap());
+        assert!(cache.exists());
+
+        // Enabling the fuse is no longer something Codey does.
+        let error = change_node_options(&binary, &backup, &cache, false).unwrap_err();
+        assert!(format!("{error:#}").contains("不再修改 Codex 安全开关"));
+        assert_eq!(std::fs::read(&binary).unwrap(), edited);
+        assert!(!backup.exists());
+
+        // A runtime an older Codey build already edited is restored from the
+        // recorded original byte, and the stale fuse cache goes with it.
+        write_node_options_backup(&backup, &recorded_node_options_backup(&binary));
         assert!(change_node_options(&binary, &backup, &cache, true).unwrap());
         assert!(!cache.exists());
-        assert_eq!(std::fs::read(&binary).unwrap(), original);
+        let restored = std::fs::read(&binary).unwrap();
+        assert_eq!(
+            edited.iter().zip(&restored).filter(|(a, b)| a != b).count(),
+            1
+        );
+        assert_eq!(restored, original);
+        assert_eq!(
+            read_fuse_wire(&binary).unwrap().unwrap().states,
+            "010011001"
+        );
         assert!(!change_node_options(&binary, &backup, &cache, true).unwrap());
     }
 
     #[test]
-    fn repair_rejects_ambiguous_removed_unknown_and_truncated_wires() {
+    fn restore_rejects_ambiguous_removed_unknown_and_truncated_wires() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("chrome.dll");
         let backup = temp.path().join("backup.json");
@@ -1248,7 +1071,7 @@ mod tests {
             b"no wire".to_vec(),
         ] {
             std::fs::write(&binary, &bytes).unwrap();
-            assert!(change_node_options(&binary, &backup, &cache, false).is_err());
+            assert!(change_node_options(&binary, &backup, &cache, true).is_err());
             assert_eq!(std::fs::read(&binary).unwrap(), bytes);
             assert!(!backup.exists());
         }
@@ -1260,25 +1083,22 @@ mod tests {
         let binary = temp.path().join("chrome.dll");
         let backup = temp.path().join("backup.json");
         let cache = temp.path().join(CACHE_FILE);
-        std::fs::write(&binary, wire_bytes("010011001")).unwrap();
-        assert!(change_node_options(&binary, &backup, &cache, true).is_err());
-        change_node_options(&binary, &backup, &cache, false).unwrap();
-        let saved = std::fs::read(&backup).unwrap();
+        std::fs::write(&binary, wire_bytes("011011001")).unwrap();
+
+        // Without a recorded original byte there is nothing to restore.
+        let error = change_node_options(&binary, &backup, &cache, true).unwrap_err();
+        assert!(format!("{error:#}").contains("没有此运行时的 NODE_OPTIONS 备份"));
+
+        let saved = recorded_node_options_backup(&binary);
         std::fs::write(&backup, b"bad json").unwrap();
         assert!(change_node_options(&binary, &backup, &cache, true).is_err());
-        std::fs::write(&backup, saved).unwrap();
+
         // An in-place update replaces the runtime and invalidates the recorded
-        // original byte: restoring must refuse, enabling records the new byte.
+        // original byte: restoring must refuse and leave the file untouched.
+        write_node_options_backup(&backup, &saved);
         let updated = wire_bytes("110011001");
         std::fs::write(&binary, &updated).unwrap();
         assert!(change_node_options(&binary, &backup, &cache, true).is_err());
-        assert_eq!(std::fs::read(&binary).unwrap(), updated);
-        assert!(change_node_options(&binary, &backup, &cache, false).unwrap());
-        assert_eq!(
-            read_fuse_wire(&binary).unwrap().unwrap().states,
-            "111011001"
-        );
-        assert!(change_node_options(&binary, &backup, &cache, true).unwrap());
         assert_eq!(std::fs::read(&binary).unwrap(), updated);
     }
 
@@ -1349,77 +1169,67 @@ mod tests {
     }
 
     #[test]
-    fn automatic_repair_is_attempted_once_per_runtime_build() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("chrome.dll");
-        std::fs::write(&binary, wire_bytes("010011001")).unwrap();
-        let state_path = temp.path().join("auto-repair.json");
-        let signature = binary_signature(&binary).unwrap();
-        assert!(!auto_repair_attempted(&state_path, &binary, signature));
-        record_auto_repair_attempt(
-            &state_path,
-            &binary,
-            signature,
-            "failed",
-            Some(&"错误信息".repeat(200)),
-        )
-        .unwrap();
-        assert!(auto_repair_attempted(&state_path, &binary, signature));
-        let saved: NodeOptionsAutoRepairState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(saved.outcome, "failed");
-        assert_eq!(
-            saved.error.as_deref().map(str::chars).map(Iterator::count),
-            Some(512)
-        );
-
-        // A new runtime build releases the record, and a damaged record never
-        // blocks the automatic attempt permanently.
-        std::fs::write(&binary, wire_bytes("0100110011")).unwrap();
-        let updated = binary_signature(&binary).unwrap();
-        assert!(!auto_repair_attempted(&state_path, &binary, updated));
-        std::fs::write(&state_path, b"damaged").unwrap();
-        assert!(!auto_repair_attempted(&state_path, &binary, updated));
-
-        // A record for another runtime does not skip this one.
-        record_auto_repair_attempt(
-            &state_path,
-            &temp.path().join("other.dll"),
-            updated,
-            "repaired",
-            None,
-        )
-        .unwrap();
-        assert!(!auto_repair_attempted(&state_path, &binary, updated));
-    }
-
-    #[test]
-    fn repair_does_not_write_if_cache_cannot_be_invalidated() {
+    fn restore_does_not_write_if_cache_cannot_be_invalidated() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("chrome.dll");
         let backup = temp.path().join("backup.json");
         let cache = temp.path().join("cache-directory");
         std::fs::create_dir(&cache).unwrap();
-        let original = wire_bytes("010011001");
+        let original = wire_bytes("011011001");
         std::fs::write(&binary, &original).unwrap();
-        assert!(change_node_options(&binary, &backup, &cache, false).is_err());
+        write_node_options_backup(&backup, &recorded_node_options_backup(&binary));
+        assert!(change_node_options(&binary, &backup, &cache, true).is_err());
         assert_eq!(std::fs::read(&binary).unwrap(), original);
+    }
+
+    #[test]
+    fn restore_rolls_back_when_sync_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("runtime");
+        let original = wire_bytes("011011001");
+        std::fs::write(&binary, &original).unwrap();
+        let mut file = open_runtime_exclusive(&binary).unwrap();
+        let inspection = inspect_node_options(&mut file).unwrap();
+        let error = write_node_options_with(&mut file, &inspection, b'0', |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("已还原原始字节"));
+        drop(file);
+        assert_eq!(std::fs::read(binary).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_runtime_is_not_modified() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("runtime");
+        let backup = temp.path().join("backup.json");
+        let original = wire_bytes("011011001");
+        std::fs::write(&binary, &original).unwrap();
+        write_node_options_backup(&backup, &recorded_node_options_backup(&binary));
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o400)).unwrap();
+        // Root can write read-only files; this permission check applies to ordinary users.
+        if open_runtime_exclusive(&binary).is_err() {
+            assert!(
+                change_node_options(&binary, &backup, &temp.path().join("cache"), true).is_err()
+            );
+            assert_eq!(std::fs::read(&binary).unwrap(), original);
+        }
     }
 
     #[cfg(windows)]
     #[test]
-    fn repair_refuses_a_runtime_open_in_another_process() {
+    fn restore_refuses_a_runtime_open_in_another_process() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("chrome.dll");
-        std::fs::write(&binary, wire_bytes("010011001")).unwrap();
+        let backup = temp.path().join("backup");
+        std::fs::write(&binary, wire_bytes("011011001")).unwrap();
+        write_node_options_backup(&backup, &recorded_node_options_backup(&binary));
         let _reader = std::fs::File::open(&binary).unwrap();
-        let error = change_node_options(
-            &binary,
-            &temp.path().join("backup"),
-            &temp.path().join("cache"),
-            false,
-        )
-        .unwrap_err();
+        let error =
+            change_node_options(&binary, &backup, &temp.path().join("cache"), true).unwrap_err();
         assert!(error.to_string().contains("Codex 已关闭"));
     }
 

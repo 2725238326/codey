@@ -46,12 +46,10 @@ export function isMainProcessInjectionConfirmed(
 }
 
 export function canRepairMainProcessInjection(
-  status: Pick<RuntimeStatus, "running" | "clientPlatform" | "restartInProgress" | "maintenance">,
+  _status: Pick<RuntimeStatus, "running" | "clientPlatform" | "restartInProgress" | "maintenance">,
 ): boolean {
-  return status.clientPlatform === "windows" &&
-    status.running &&
-    !status.restartInProgress &&
-    status.maintenance?.startupInjectionMode === "cli";
+  // Electron security settings belong to the installed client.
+  return false;
 }
 
 export function buildEnabledOptimizationFeatures(

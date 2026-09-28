@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(windows)]
-use std::path::Path;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,49 +190,6 @@ const RENDERER_READY_REQUIRE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 #[cfg(any(windows, target_os = "macos"))]
 const RENDERER_READY_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// One automatic fuse repair before the first Windows launch attempt.
-///
-/// The launcher restarts Codex itself, so a repaired runtime continues with
-/// `--require` inside the same startup. Only installs the current user may write
-/// are repaired; a protected runtime, a build that was already attempted or a
-/// failure keeps the CLI compatibility mode and the manual repair button.
-#[cfg(windows)]
-async fn repair_main_process_injection_before_launch(
-    app_dir: &Path,
-    fuses: crate::electron_fuses::ElectronFuses,
-) -> crate::electron_fuses::ElectronFuses {
-    use crate::electron_fuses::AutoRepairOutcome;
-
-    let repair_dir = app_dir.to_path_buf();
-    let outcome = tokio::task::spawn_blocking(move || {
-        crate::electron_fuses::auto_repair_node_options(&repair_dir)
-    })
-    .await
-    .unwrap_or_else(|error| {
-        AutoRepairOutcome::Failed(format!("主进程注入自动修复任务异常退出：{error}"))
-    });
-    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-        "launcher.main_process_injection_auto_repair",
-        serde_json::json!({
-            "appPath": app_dir,
-            "outcome": outcome.as_str(),
-            "error": outcome.error(),
-        }),
-    );
-    if let Some(error) = outcome.error() {
-        error_log::record_failure(
-            "runtime_repair_failed",
-            "auto_repair_main_process_injection",
-            error.to_string(),
-            serde_json::json!({ "platform": "windows", "appPath": app_dir }),
-        );
-    }
-    if !outcome.repaired() {
-        return fuses;
-    }
-    crate::electron_fuses::detect_electron_fuses(app_dir.to_path_buf()).await
-}
-
 /// Whether this app directory is launched through Microsoft Store activation.
 ///
 /// Such a launch is activated over COM rather than started as a child process,
@@ -251,38 +206,22 @@ fn windows_app_dir_supports_packaged_activation(app_dir: &std::path::Path) -> bo
     codey_runtime_core::app_paths::packaged_app_user_model_id(app_dir).is_some()
 }
 
-#[cfg(any(windows, test))]
-fn windows_should_repair_main_process_injection(
-    attempt: u32,
-    packaged_activation: bool,
-    fuses: crate::electron_fuses::ElectronFuses,
-) -> bool {
-    // A Store package is a protected copy, so repairing it would neither
-    // succeed nor make `NODE_OPTIONS` survive the activation; it only adds a
-    // failed write and a possible elevation prompt to the first attempt.
-    attempt == 1
-        && !packaged_activation
-        && !fuses.node_options.node_options_possible()
-        && !fuses.node_cli_inspect.inspector_possible()
-}
-
 /// Whether this attempt should prepare the `NODE_OPTIONS --require` payload.
 ///
 /// A Store activation cannot observe Codey's environment, so `NODE_OPTIONS` is
-/// dropped and its marker never arrives; the entry is only worth preparing when
-/// Inspector is unavailable and `NODE_OPTIONS` is the last main-process entry
-/// left. Standalone installs keep the existing preference.
+/// dropped and its marker never arrives. Standalone installs keep the existing
+/// preference; Store installs never prepare an environment-dependent payload.
 #[cfg(any(windows, test))]
 fn windows_should_prepare_require_patch(
     packaged_activation: bool,
-    inspect_fuse: crate::electron_fuses::FuseState,
+    _inspect_fuse: crate::electron_fuses::FuseState,
     options_fuse: crate::electron_fuses::FuseState,
     retry_without_require: bool,
 ) -> bool {
     if retry_without_require || !options_fuse.node_options_possible() {
         return false;
     }
-    !packaged_activation || !inspect_fuse.inspector_possible()
+    !packaged_activation
 }
 
 #[cfg_attr(
@@ -327,25 +266,13 @@ pub(super) async fn spawn_codex(
         loop {
             attempt += 1;
             *app_dir = refresh_windows_packaged_app_dir(app_dir)?;
+            codey_runtime_core::app_paths::validate_codex_app_dir(app_dir)?;
             error_log::refresh_codex_app_version(Some(app_dir), None);
-            // A Store activation sets the launch environment through the package
-            // debug settings and cannot be observed from Codey's own environment,
-            // so the first attempt must not spend the readiness budget on a
-            // channel the runtime drops silently. Inspector carries the launch
-            // arguments the activation interface does accept, which is why it is
-            // preferred here instead of `NODE_OPTIONS`. Both entries stay fused
-            // as Electron ships them; if an update turns the inspect flags off,
-            // `NODE_OPTIONS` remains the only main-process entry left.
+            // Ordinary Store activation accepts arguments, not our environment.
+            // Use Inspector only when explicitly enabled by the shipped runtime;
+            // do not register a debugger to make NODE_OPTIONS available.
             let packaged_activation = windows_app_dir_supports_packaged_activation(app_dir);
-            let mut fuses =
-                crate::electron_fuses::detect_electron_fuses(app_dir.to_path_buf()).await;
-            if windows_should_repair_main_process_injection(attempt, packaged_activation, fuses) {
-                // Both main-process entries are off, so the launcher would fall
-                // back to the CLI wrapper. Repairing the fuse byte now reuses the
-                // restart this launch already performs; the manual repair stays
-                // for installs that need administrator rights.
-                fuses = repair_main_process_injection_before_launch(app_dir, fuses).await;
-            }
+            let fuses = crate::electron_fuses::detect_electron_fuses(app_dir.to_path_buf()).await;
             let inspect_fuse = fuses.node_cli_inspect;
             let require_wanted = windows_should_prepare_require_patch(
                 packaged_activation,
@@ -395,7 +322,7 @@ pub(super) async fn spawn_codex(
                                 "platform": "windows",
                             }),
                         );
-                        error
+                        recovery::recoverable(error)
                     })?,
                 )
             } else {
@@ -440,7 +367,7 @@ pub(super) async fn spawn_codex(
                 use_require || (!use_inspector && constrained),
             )
             .await;
-            let (mut spawned, package_debug_session, wrapper_environment_applied) = match launch {
+            let (mut spawned, wrapper_environment_applied) = match launch {
                 Ok(launch) => launch,
                 Err(error) => {
                     let retry = should_retry_startup(&error, attempt);
@@ -489,11 +416,6 @@ pub(super) async fn spawn_codex(
                 // The process is already running without any compatibility
                 // entry. It carries no constraints (see above), so keep it
                 // instead of stopping and relaunching the same configuration.
-                if let Some(session) = package_debug_session {
-                    session
-                        .finish()
-                        .context("Windows Store Codex 兼容环境清理失败")?;
-                }
                 let startup_error = format!(
                     "启动尝试 {attempt}/2：未能应用主进程注入环境（Inspector {}，NODE_OPTIONS {}），且 Windows 未能应用 CLI 兼容环境，详见启动错误日志",
                     inspect_fuse.as_str(),
@@ -538,20 +460,6 @@ pub(super) async fn spawn_codex(
                     None => patch_error,
                 }
             });
-            let package_cleanup = package_debug_session
-                .map(WindowsPackageDebugSession::finish)
-                .transpose()
-                .map(|_| ());
-            let package_cleanup_succeeded = package_cleanup.is_ok();
-            let startup_result = match (startup_result, package_cleanup) {
-                (mode, Ok(())) => mode,
-                (Ok(_), Err(cleanup_error)) => {
-                    Err(cleanup_error.context("Windows Store Codex 兼容环境清理失败"))
-                }
-                (Err(startup_error), Err(cleanup_error)) => Err(anyhow::anyhow!(
-                    "{startup_error:#}；Windows Store Codex 兼容环境清理失败：{cleanup_error:#}"
-                )),
-            };
 
             match startup_result {
                 Ok(mode) => {
@@ -596,25 +504,20 @@ pub(super) async fn spawn_codex(
                             "Codex 启动兼容方案未能安装，且无法安全清理启动进程：{startup_error}；{cleanup_error:#}"
                         );
                     }
-                    if !package_cleanup_succeeded {
-                        anyhow::bail!(
-                            "Codex 启动兼容环境未能安全清理，已停止重试：{startup_error}"
-                        );
-                    }
                     if single_instance_exit {
-                        // The instance holding the lock is not the one just
-                        // stopped; sweep every Codex install before retrying.
+                        // Report other installations without stopping them;
+                        // only the selected installation may be restarted.
                         match stop_running_windows_codex_instances(app_dir).await {
                             Ok(instances) if instances.is_empty() => startup_error.push_str(
-                                "；退出码 0 通常表示已有 Codex 实例占用了单实例锁，但未检测到其他 Codex 进程，请在任务管理器中结束所有 Codex 进程后重试",
+                                "；退出码 0 通常表示已有 Codex 实例占用了单实例锁，请确认其他客户端已正常退出后重试",
                             ),
                             Ok(instances) => startup_error.push_str(&format!(
-                                "；已停止占用单实例锁的其他 Codex 实例：{}",
+                                "；已停止所选安装目录的 Codex 实例：{}",
                                 windows_codex_instances_summary(&instances)
                             )),
-                            Err(sweep_error) => startup_error.push_str(&format!(
-                                "；退出码 0 通常表示已有 Codex 实例占用了单实例锁，且未能停止：{sweep_error:#}"
-                            )),
+                            Err(sweep_error) => anyhow::bail!(
+                                "{startup_error}；无法确认所选客户端可以重新启动：{sweep_error:#}"
+                            ),
                         }
                     }
                     // A main process paused at an unreachable `--inspect-brk`,
@@ -631,19 +534,19 @@ pub(super) async fn spawn_codex(
                         continue;
                     }
                     if !runtime_config_overrides.is_empty() {
-                        anyhow::bail!(
-                            "Codex 启动兼容方案未能确认 app-server 运行时覆盖；为避免丢失 Codey 运行时约束，已停止 Codex：{startup_error}"
-                        );
+                        return Err(recovery::recoverable(format!(
+                            "Codex 启动兼容方案未能确认 app-server 运行时覆盖；Codey 集成未启用：{startup_error}"
+                        )));
                     }
                     if subagent_gate_active {
-                        anyhow::bail!(
-                            "Codex 启动兼容方案未能安装；为避免丢失 Codey 运行时约束，已停止 Codex：{startup_error}"
-                        );
+                        return Err(recovery::recoverable(format!(
+                            "Codex 启动兼容方案未能安装；Codey 集成未启用：{startup_error}"
+                        )));
                     }
                     match spawn_windows_codex(app_dir, debug_port, &runtime_arguments, &[], false)
                         .await
                     {
-                        Ok((mut fallback, _, _)) => {
+                        Ok((mut fallback, _)) => {
                             fallback.performance_status = "degraded".to_string();
                             fallback.performance_detail =
                             "Codex 已启动，但部分启动设置未能应用；页面功能以检测结果为准，下次启动将重试"
@@ -683,10 +586,9 @@ pub(super) async fn spawn_codex(
         .await;
         let use_require = require_patch.is_some();
         let use_inspector = !use_require && inspect_fuse.inspector_possible();
-        // Pass `--inspect-brk` when using Inspector, or as a cleanup marker that
-        // Electron drops when the inspect fuse is off. Never pass it together
-        // with NODE_OPTIONS `--require` while inspect is on: both wrap Module._load.
-        let pass_inspect_brk = use_inspector || !inspect_fuse.inspector_possible();
+        // Only request a breakpoint when the runtime explicitly allows it.
+        // Never combine Inspector and NODE_OPTIONS: both wrap Module._load.
+        let pass_inspect_brk = use_inspector;
         let inspector_port = if pass_inspect_brk {
             Some(
                 crate::codex_startup_patch::reserve_loopback_port().map_err(|error| {
@@ -699,7 +601,7 @@ pub(super) async fn spawn_codex(
                             "platform": "macos",
                         }),
                     );
-                    error
+                    recovery::recoverable(error)
                 })?,
             )
         } else {
@@ -719,10 +621,13 @@ pub(super) async fn spawn_codex(
                 runtime_config_overrides,
                 use_inspector || require_patch.is_some(),
             )
-            .await?;
-            add_macos_cli_wrapper(&mut command, &wrapper.environment)?;
+            .await
+            .map_err(recovery::recoverable)?;
+            add_macos_cli_wrapper(&mut command, &wrapper.environment)
+                .map_err(recovery::recoverable)?;
             if let Some(require) = &require_patch {
-                add_macos_cli_wrapper(&mut command, &require.environment)?;
+                add_macos_cli_wrapper(&mut command, &require.environment)
+                    .map_err(recovery::recoverable)?;
             }
             Some(wrapper)
         } else {
@@ -809,7 +714,9 @@ pub(super) async fn spawn_codex(
                         "Codex 启动兼容方案未能安装，且无法安全清理旧进程：{error:#}；{stop_error:#}"
                     );
                 }
-                Err(error).context("Codex 启动兼容方案未能安装；已停止 Codex")
+                Err(recovery::recoverable(format!(
+                    "Codex 启动兼容方案未能安装：{error:#}"
+                )))
             }
         }
     }
@@ -1712,19 +1619,18 @@ async fn launch_windows_codex_without_compatibility(
     startup_error: String,
 ) -> Result<SpawnedCodex> {
     if !runtime_config_overrides.is_empty() {
-        anyhow::bail!(
-            "Codex 启动兼容入口不可用，无法应用 app-server 运行时覆盖；为避免丢失 Codey 运行时约束，已停止启动：{startup_error}"
-        );
+        return Err(recovery::recoverable(format!(
+            "Codex 启动兼容入口不可用，无法应用 app-server 运行时覆盖；Codey 集成未启用：{startup_error}"
+        )));
     }
     if subagent_gate_active {
-        anyhow::bail!(
-            "Codex 启动兼容入口不可用；为避免丢失 Codey 运行时约束，已停止启动：{startup_error}"
-        );
+        return Err(recovery::recoverable(format!(
+            "Codex 启动兼容入口不可用；Codey 集成未启用：{startup_error}"
+        )));
     }
-    let (mut spawned, _, _) =
-        spawn_windows_codex(app_dir, debug_port, runtime_arguments, &[], false)
-            .await
-            .with_context(|| format!("Codex 启动设置未能应用，且启动失败：{startup_error}"))?;
+    let (mut spawned, _) = spawn_windows_codex(app_dir, debug_port, runtime_arguments, &[], false)
+        .await
+        .with_context(|| format!("Codex 启动设置未能应用，且启动失败：{startup_error}"))?;
     spawned.performance_status = "degraded".to_string();
     spawned.performance_detail =
         "Codex 已启动，但部分启动设置未能应用；页面功能以检测结果为准，下次启动将重试".to_string();
@@ -2436,10 +2342,8 @@ pub(super) async fn prepare_codex_for_launch(app_dir: &std::path::Path) -> Resul
     // relaunch it under Codey instead of leaving the user to quit it manually.
     #[cfg(windows)]
     {
-        // Electron's single-instance lock is per app, not per install path: a
-        // Codex left running from any directory (another install, a manual
-        // start, a build that updated into a new folder) would make the launch
-        // below quit with exit code 0, so every instance is stopped here.
+        // A different installation may own the shared single-instance lock.
+        // The helper refuses that conflict before stopping the selected app.
         let stopped = stop_running_windows_codex_instances(app_dir)
             .await
             .context("停止正在运行的 Codex 失败")?;
@@ -3063,20 +2967,18 @@ mod cli_wrapper_tests {
         ));
     }
 
-    /// Both entries ship enabled, but an update may turn the inspect flags off.
-    /// A Store package then has to fall back to `NODE_OPTIONS` instead of giving
-    /// up on main-process injection.
+    /// Store activation never inherits NODE_OPTIONS, even without Inspector.
     #[test]
-    fn packaged_activation_keeps_require_when_inspector_is_gone() {
+    fn packaged_activation_refuses_require_when_inspector_is_gone() {
         use crate::electron_fuses::FuseState;
 
-        assert!(windows_should_prepare_require_patch(
+        assert!(!windows_should_prepare_require_patch(
             true,
             FuseState::Disabled,
             FuseState::Enabled,
             false
         ));
-        assert!(windows_should_prepare_require_patch(
+        assert!(!windows_should_prepare_require_patch(
             true,
             FuseState::Removed,
             FuseState::Unknown,
@@ -3099,36 +3001,6 @@ mod cli_wrapper_tests {
             FuseState::Enabled,
             FuseState::Enabled,
             true
-        ));
-    }
-
-    #[test]
-    fn store_packages_skip_the_protected_fuse_repair() {
-        use crate::electron_fuses::{ElectronFuses, FuseState};
-
-        let blocked = |node_options, node_cli_inspect| ElectronFuses {
-            node_cli_inspect,
-            node_options,
-        };
-        assert!(windows_should_repair_main_process_injection(
-            1,
-            false,
-            blocked(FuseState::Disabled, FuseState::Disabled)
-        ));
-        assert!(!windows_should_repair_main_process_injection(
-            1,
-            true,
-            blocked(FuseState::Disabled, FuseState::Disabled)
-        ));
-        assert!(!windows_should_repair_main_process_injection(
-            2,
-            false,
-            blocked(FuseState::Disabled, FuseState::Disabled)
-        ));
-        assert!(!windows_should_repair_main_process_injection(
-            1,
-            false,
-            blocked(FuseState::Enabled, FuseState::Unknown)
         ));
     }
 

@@ -19,6 +19,16 @@ struct AppPackageSpec {
 const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
 const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
 
+/// `package.json` names the Codex desktop client has shipped under. The client
+/// merged into the ChatGPT app still identifies as `openai-codex-electron`, so
+/// discovery must match the Electron metadata rather than the bundle name.
+const CODEX_ELECTRON_PACKAGE_NAMES: &[&str] = &[
+    "openai-codex-electron",
+    "codex",
+    "codex-desktop",
+    "@openai/codex",
+];
+
 /// Windows resolves program names case-insensitively, so an install whose main
 /// binary is spelled `codex.exe` must not be skipped.
 const EXECUTABLE_NAMES_ARE_CASE_INSENSITIVE: bool = cfg!(windows);
@@ -77,7 +87,6 @@ pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
     {
         // Store activation uses the registered package, which may have moved to another drive.
         find_latest_codex_app_dir_from_appx_package()
-            .or_else(|| find_latest_codex_app_dir_from_roots(&windows_app_package_roots()))
     }
 
     #[cfg(not(windows))]
@@ -88,56 +97,64 @@ pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn find_latest_codex_app_dir_from_appx_package() -> Option<PathBuf> {
+    unique_installation(registered_codex_app_dirs()?)
+}
+
+#[cfg(windows)]
+fn registered_codex_app_dirs() -> Option<Vec<PathBuf>> {
     let output = Command::new("powershell")
         .creation_flags(crate::windows_create_no_window())
         .args([
             "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
             "-Command",
-            "$names=@('OpenAI.Codex','OpenAI.CodexBeta'); Get-AppxPackage | Where-Object { $names -contains $_.Name } | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation",
+            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); $names=@('OpenAI.Codex','OpenAI.CodexBeta'); Get-AppxPackage | Where-Object { $names -contains $_.Name } | Select-Object -ExpandProperty InstallLocation",
         ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    latest_appx_install_location_from_output(&String::from_utf8_lossy(&output.stdout))
-        .and_then(|location| normalize_codex_app_path(Path::new(&location)))
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|location| normalize_codex_app_path(Path::new(location)))
+        .collect()
+}
+
+fn unique_installation(paths: Vec<PathBuf>) -> Option<PathBuf> {
+    let mut paths = paths
+        .into_iter()
+        .map(std::fs::canonicalize)
+        .collect::<std::io::Result<Vec<_>>>()
+        .ok()?;
+    paths.sort();
+    paths.dedup();
+    (paths.len() == 1).then(|| paths.remove(0))
 }
 
 pub fn latest_appx_install_location_from_output(output: &str) -> Option<String> {
-    output
+    let mut paths = output
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(ToString::to_string)
-}
-
-#[cfg(windows)]
-fn windows_app_package_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        roots.push(PathBuf::from(program_files).join("WindowsApps"));
-    }
-    if let Some(program_files) = std::env::var_os("ProgramW6432") {
-        roots.push(PathBuf::from(program_files).join("WindowsApps"));
-    }
-    roots.push(PathBuf::from(r"C:\Program Files\WindowsApps"));
-    roots.sort();
-    roots.dedup();
-    roots
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    (paths.len() == 1).then(|| paths[0].to_string())
 }
 
 pub fn find_macos_codex_app(search_roots: &[PathBuf]) -> Option<PathBuf> {
-    for root in search_roots {
-        for candidate in macos_app_candidates(root) {
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    let mut candidates = search_roots
+        .iter()
+        .flat_map(|root| macos_app_candidates(root))
+        .filter(|path| validate_codex_app_dir(path).is_ok())
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 pub fn find_macos_codex_app_default() -> Option<PathBuf> {
@@ -155,8 +172,19 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         return find_macos_codex_app_default();
     }
-    // Windows: try MS Store version first, then standalone install
-    find_latest_codex_app_dir_default().or_else(find_standalone_codex_app_dir)
+    #[cfg(windows)]
+    {
+        // A failed registration query must not turn into a standalone guess.
+        let mut paths = registered_codex_app_dirs()?;
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            paths.extend(standalone_codex_app_dirs_from(Path::new(&local)));
+        }
+        unique_installation(paths)
+    }
+    #[cfg(not(windows))]
+    {
+        find_standalone_codex_app_dir()
+    }
 }
 
 /// Search for standalone Codex installations (non-MS Store).
@@ -173,6 +201,10 @@ pub fn find_standalone_codex_app_dir() -> Option<PathBuf> {
 }
 
 fn find_standalone_codex_app_dir_from(local_appdata: &Path) -> Option<PathBuf> {
+    unique_installation(standalone_codex_app_dirs_from(local_appdata))
+}
+
+fn standalone_codex_app_dirs_from(local_appdata: &Path) -> Vec<PathBuf> {
     let candidates: &[PathBuf] = &[
         local_appdata.join("Programs").join("Codex"),
         local_appdata.join("OpenAI").join("Codex").join("bin"),
@@ -180,14 +212,11 @@ fn find_standalone_codex_app_dir_from(local_appdata: &Path) -> Option<PathBuf> {
         local_appdata.join("Programs").join("OpenAI").join("Codex"),
     ];
 
-    for candidate in candidates {
-        if let Some(path) = normalize_codex_app_path(candidate)
-            && build_codex_executable(&path).exists()
-        {
-            return Some(path);
-        }
-    }
-    None
+    candidates
+        .iter()
+        .filter_map(|candidate| normalize_codex_app_path(candidate))
+        .filter(|path| build_codex_executable(path).is_file())
+        .collect()
 }
 
 pub fn resolve_codex_app_dir_with_saved(
@@ -219,7 +248,7 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
     }
 
     if path.extension() == Some(OsStr::new("app")) {
-        return Some(path.to_path_buf());
+        return path.is_dir().then(|| path.to_path_buf());
     }
 
     if path.is_file() {
@@ -237,9 +266,12 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         path.join("versions").join("current"),
     ]
     .into_iter()
-    .find(|nested| executable_in_dir(nested).is_some());
-    if nested.is_some() {
-        return nested;
+    .filter(|nested| executable_in_dir(nested).is_some())
+    .collect::<Vec<_>>();
+    if let Some(first) = nested.first().cloned() {
+        // Preserve the selected layout, but refuse different installations
+        // underneath it. Canonicalization allows aliases of the same install.
+        return unique_installation(nested).map(|_| first);
     }
 
     #[cfg(not(windows))]
@@ -286,6 +318,82 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
     app_dir.join("Codex.exe")
 }
 
+/// Identifies the application without replacing the OS signature checks.
+pub fn validate_codex_app_dir(app_dir: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    anyhow::ensure!(app_dir.is_absolute(), "Codex 安装路径必须是绝对路径");
+    let root = std::fs::canonicalize(app_dir).context("Codex 安装路径不存在或无法访问")?;
+    anyhow::ensure!(root.is_dir(), "Codex 安装路径不是目录");
+    let executable = std::fs::canonicalize(build_codex_executable(&root))
+        .context("Codex 启动程序不存在或无法访问")?;
+    anyhow::ensure!(
+        executable.is_file() && executable.starts_with(&root),
+        "Codex 启动程序超出安装目录或不是普通文件"
+    );
+    let macos = root.extension() == Some(OsStr::new("app"));
+    let resources = if macos {
+        root.join("Contents/Resources")
+    } else {
+        root.join("resources")
+    };
+    let archive = resources.join("app.asar");
+    let package = if archive.try_exists().context("无法检查 Codex 应用归档")? {
+        asar_app_package(&archive)
+    } else {
+        read_app_package_json(&resources.join("app/package.json"))
+    }
+    .context("无法读取 Codex 应用身份，安装可能不完整或版本不受支持")?;
+    let name = package.get("name").and_then(serde_json::Value::as_str);
+    let product = package
+        .get("productName")
+        .and_then(serde_json::Value::as_str);
+    // Either marker is enough here: the platform identity below is the one that
+    // decides, so a renamed bundle or product must not strand an installation.
+    anyhow::ensure!(
+        product == Some("Codex")
+            || name.is_some_and(|name| CODEX_ELECTRON_PACKAGE_NAMES
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))),
+        "应用元数据不属于已支持的 Codex 客户端"
+    );
+    anyhow::ensure!(
+        package
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalize_version_value)
+            .is_some(),
+        "Codex 应用版本缺失或无效"
+    );
+    if macos {
+        anyhow::ensure!(
+            macos_app_plist_value(&root, "CFBundleIdentifier").as_deref()
+                == Some("com.openai.codex"),
+            "macOS 应用标识不属于已支持的 Codex 客户端"
+        );
+    } else if let Some(package_name) = package_name_from_app_dir(&root)
+        && let Some((_, version, publisher)) = codex_package_parts(&package_name)
+    {
+        anyhow::ensure!(
+            publisher == "2p2nqsd0c76g0"
+                && version.split('.').count() == 4
+                && version.split('.').all(|part| part.parse::<u16>().is_ok()),
+            "不支持的 Codex Windows 包身份或版本"
+        );
+    } else {
+        anyhow::ensure!(
+            !root
+                .components()
+                .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+                && !root.join("AppxManifest.xml").exists()
+                && !root
+                    .parent()
+                    .is_some_and(|parent| parent.join("AppxManifest.xml").exists()),
+            "无法安全识别 Windows 打包安装，未按独立安装处理"
+        );
+    }
+    Ok(())
+}
+
 pub fn codex_app_version(app_dir: &Path) -> Option<String> {
     // 应用版本与平台包版本独立，不能从安装目录名或 build 编号推导。
     if app_dir.extension() == Some(OsStr::new("app")) {
@@ -307,6 +415,11 @@ fn codex_resources_app_version(resources_dir: &Path) -> Option<String> {
 }
 
 fn app_package_json_version(path: &Path) -> Option<String> {
+    let package = read_app_package_json(path)?;
+    normalize_version_value(package.get("version")?.as_str()?)
+}
+
+fn read_app_package_json(path: &Path) -> Option<serde_json::Value> {
     use std::io::Read;
 
     let mut contents = Vec::new();
@@ -315,18 +428,18 @@ fn app_package_json_version(path: &Path) -> Option<String> {
         .take(MAX_APP_PACKAGE_JSON_BYTES + 1)
         .read_to_end(&mut contents)
         .ok()?;
-    package_json_version(&contents)
-}
-
-fn package_json_version(contents: &[u8]) -> Option<String> {
     if contents.len() as u64 > MAX_APP_PACKAGE_JSON_BYTES {
         return None;
     }
-    let package: serde_json::Value = serde_json::from_slice(contents).ok()?;
-    normalize_version_value(package.get("version")?.as_str()?)
+    serde_json::from_slice(&contents).ok()
 }
 
 fn asar_app_version(path: &Path) -> Option<String> {
+    let package = asar_app_package(path)?;
+    normalize_version_value(package.get("version")?.as_str()?)
+}
+
+fn asar_app_package(path: &Path) -> Option<serde_json::Value> {
     use std::io::{Read, Seek, SeekFrom};
 
     // 只解析根 package.json 的索引，其余文件条目由反序列化器跳过。
@@ -378,9 +491,7 @@ fn asar_app_version(path: &Path) -> Option<String> {
         return None;
     }
     if package.unpacked {
-        return app_package_json_version(
-            &path.with_extension("asar.unpacked").join("package.json"),
-        );
+        return read_app_package_json(&path.with_extension("asar.unpacked").join("package.json"));
     }
 
     let offset = package.offset?.parse::<u64>().ok()?;
@@ -391,7 +502,7 @@ fn asar_app_version(path: &Path) -> Option<String> {
     archive.seek(SeekFrom::Start(start)).ok()?;
     let mut contents = vec![0u8; package.size as usize];
     archive.read_exact(&mut contents).ok()?;
-    package_json_version(&contents)
+    serde_json::from_slice(&contents).ok()
 }
 
 #[cfg(windows)]
@@ -620,8 +731,25 @@ fn macos_app_version(app_dir: &Path) -> Option<String> {
 }
 
 fn macos_app_plist_value(app_dir: &Path, key: &str) -> Option<String> {
-    let plist = std::fs::read_to_string(app_dir.join("Contents").join("Info.plist")).ok()?;
-    plist_string_value(&plist, key)
+    let path = app_dir.join("Contents").join("Info.plist");
+    if let Ok(plist) = std::fs::read_to_string(&path) {
+        return plist_string_value(&plist, key);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/bin/plutil")
+            .args(["-extract", key, "raw", "-o", "-"])
+            .arg(path)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            return String::from_utf8(output.stdout)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+        }
+    }
+    None
 }
 
 fn plist_string_value(plist: &str, key: &str) -> Option<String> {
@@ -809,7 +937,7 @@ mod tests {
 
         assert_eq!(
             find_standalone_codex_app_dir_from(temp.path()).as_deref(),
-            Some(app_dir.as_path())
+            std::fs::canonicalize(&app_dir).ok().as_deref()
         );
     }
 
@@ -855,18 +983,231 @@ mod tests {
         bytes
     }
 
-    fn write_app_asar(resources: &Path, version: &str) {
-        let package = serde_json::to_vec(&serde_json::json!({
-            "name": "openai-codex-electron",
-            "version": version,
-            "codexBuildNumber": "9922"
-        }))
-        .unwrap();
+    fn write_app_asar_metadata(resources: &Path, package: serde_json::Value) {
+        let package = serde_json::to_vec(&package).unwrap();
         let mut data = b"other file".to_vec();
         let entry = serde_json::json!({ "size": package.len(), "offset": data.len().to_string() });
         data.extend_from_slice(&package);
         std::fs::create_dir_all(resources).unwrap();
         std::fs::write(resources.join("app.asar"), test_asar(entry, &data)).unwrap();
+    }
+
+    fn write_app_asar(resources: &Path, version: &str) {
+        write_app_asar_metadata(
+            resources,
+            serde_json::json!({
+                "name": "openai-codex-electron",
+                "version": version,
+                "codexBuildNumber": "9922"
+            }),
+        );
+    }
+
+    /// The client that replaced `Codex.app` installs as `ChatGPT.app`, so the
+    /// installation identity has to come from the bundle and Electron metadata.
+    fn write_macos_bundle(bundle: &Path, bundle_id: &str, package: serde_json::Value) {
+        let contents = bundle.join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::write(contents.join("MacOS").join("ChatGPT"), "desktop").unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                "<key>CFBundleExecutable</key><string>ChatGPT</string>\
+                 <key>CFBundleIdentifier</key><string>{bundle_id}</string>"
+            ),
+        )
+        .unwrap();
+        write_app_asar_metadata(&contents.join("Resources"), package);
+    }
+
+    fn codex_client_package() -> serde_json::Value {
+        serde_json::json!({
+            "name": "openai-codex-electron",
+            "productName": "Codex",
+            "version": "26.924.22138"
+        })
+    }
+
+    fn write_windows_client(app: &Path) {
+        std::fs::create_dir_all(app).unwrap();
+        std::fs::write(app.join("Codex.exe"), b"desktop fixture").unwrap();
+        write_app_asar_metadata(&app.join("resources"), codex_client_package());
+    }
+
+    #[test]
+    fn windows_discovery_refuses_multiple_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("Programs/Codex");
+        let second = temp.path().join("OpenAI/Codex/bin");
+        write_windows_client(&first);
+        write_windows_client(&second);
+        assert!(find_standalone_codex_app_dir_from(temp.path()).is_none());
+        assert!(unique_installation(vec![first.clone(), second]).is_none());
+        assert_eq!(
+            unique_installation(vec![first.clone(), first.clone()]),
+            Some(std::fs::canonicalize(first).unwrap())
+        );
+        assert!(
+            latest_appx_install_location_from_output("C:/Store/stable\nD:/Store/beta").is_none()
+        );
+        assert_eq!(
+            latest_appx_install_location_from_output("C:/Store/stable\nC:/Store/stable"),
+            Some("C:/Store/stable".into())
+        );
+    }
+
+    #[test]
+    fn selected_parent_refuses_multiple_nested_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write_windows_client(&app);
+        assert_eq!(normalize_codex_app_path(temp.path()), Some(app.clone()));
+        write_windows_client(&temp.path().join("current"));
+        assert!(normalize_codex_app_path(temp.path()).is_none());
+        assert_eq!(normalize_codex_app_path(&app), Some(app));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_parent_accepts_aliases_of_the_same_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write_windows_client(&app);
+        std::os::unix::fs::symlink(&app, temp.path().join("current")).unwrap();
+        assert_eq!(normalize_codex_app_path(temp.path()), Some(app));
+    }
+
+    #[test]
+    fn validates_windows_channels_and_rejects_unknown_package_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "Standalone",
+            "OpenAI.Codex_26.915.4065.0_x64__2p2nqsd0c76g0/app",
+            "OpenAI.CodexBeta_26.915.4065.0_arm64__2p2nqsd0c76g0/app",
+        ] {
+            let app = temp.path().join(name);
+            write_windows_client(&app);
+            validate_codex_app_dir(&app).unwrap();
+        }
+        for name in [
+            "OpenAI.Codex_26.915.4065.0_x64__unknown/app",
+            "OpenAI.Codex_26.915.99999.0_x64__2p2nqsd0c76g0/app",
+            "WindowsApps/Unknown/app",
+        ] {
+            let app = temp.path().join(name);
+            write_windows_client(&app);
+            assert!(validate_codex_app_dir(&app).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_relative_and_corrupt_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(validate_codex_app_dir(Path::new("relative/Codex.app")).is_err());
+        assert!(validate_codex_app_dir(&temp.path().join("missing")).is_err());
+        let app = temp.path().join("Codex");
+        write_windows_client(&app);
+        write_app_asar_metadata(
+            &app.join("resources"),
+            serde_json::json!({
+                "name": "openai-codex-electron", "version": "broken"
+            }),
+        );
+        assert!(validate_codex_app_dir(&app).is_err());
+        let fallback = app.join("resources/app");
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::write(
+            fallback.join("package.json"),
+            codex_client_package().to_string(),
+        )
+        .unwrap();
+        std::fs::write(app.join("resources/app.asar"), b"truncated").unwrap();
+        assert!(validate_codex_app_dir(&app).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_executable_symlinks_outside_the_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Codex.app");
+        write_macos_bundle(&app, "com.openai.codex", codex_client_package());
+        let binary = app.join("Contents/MacOS/ChatGPT");
+        let external = temp.path().join("unrelated");
+        std::fs::write(&external, b"not Codex").unwrap();
+        std::fs::remove_file(&binary).unwrap();
+        std::os::unix::fs::symlink(external, binary).unwrap();
+        assert!(validate_codex_app_dir(&app).is_err());
+    }
+
+    #[test]
+    fn macos_chatgpt_bundle_is_accepted_as_the_codex_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("ChatGPT.app");
+        write_macos_bundle(&bundle, "com.openai.codex", codex_client_package());
+
+        assert!(
+            validate_codex_app_dir(&bundle).is_ok(),
+            "合法的合并版客户端必须通过校验"
+        );
+        assert_eq!(
+            find_macos_codex_app(&[temp.path().to_path_buf()]).as_deref(),
+            std::fs::canonicalize(&bundle).ok().as_deref()
+        );
+    }
+
+    #[test]
+    fn macos_bundle_requires_the_codex_bundle_identifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("ChatGPT.app");
+        write_macos_bundle(&bundle, "com.example.chatgpt", codex_client_package());
+
+        assert!(validate_codex_app_dir(&bundle).is_err());
+        assert_eq!(find_macos_codex_app(&[temp.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn electron_metadata_must_identify_the_codex_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("ChatGPT.app");
+        write_macos_bundle(
+            &bundle,
+            "com.openai.codex",
+            serde_json::json!({ "name": "unrelated-electron-app", "version": "1.2.3" }),
+        );
+
+        let error = validate_codex_app_dir(&bundle).unwrap_err();
+        assert!(format!("{error:#}").contains("应用元数据"), "{error:#}");
+    }
+
+    #[test]
+    fn product_name_alone_identifies_the_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("ChatGPT.app");
+        write_macos_bundle(
+            &bundle,
+            "com.openai.codex",
+            serde_json::json!({
+                "name": "renamed-desktop-client",
+                "productName": "Codex",
+                "version": "26.924.22138"
+            }),
+        );
+
+        assert!(validate_codex_app_dir(&bundle).is_ok());
+    }
+
+    #[test]
+    fn macos_discovery_refuses_ambiguous_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["ChatGPT.app", "Codex.app"] {
+            write_macos_bundle(
+                &temp.path().join(name),
+                "com.openai.codex",
+                codex_client_package(),
+            );
+        }
+
+        assert_eq!(find_macos_codex_app(&[temp.path().to_path_buf()]), None);
     }
 
     #[test]

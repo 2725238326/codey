@@ -15,6 +15,12 @@ test("Windows startup compatibility failure cleans the process before compatible
 
   assert.ok(cleanupCall >= 0);
   assert.ok(compatibleRestart > cleanupCall);
+  const singleInstanceCleanup = windowsSpawn.indexOf("if single_instance_exit {", cleanupCall);
+  assert.ok(singleInstanceCleanup > cleanupCall && singleInstanceCleanup < compatibleRestart);
+  assert.match(
+    windowsSpawn.slice(singleInstanceCleanup, compatibleRestart),
+    /Err\(sweep_error\) => anyhow::bail!\(/,
+  );
   assert.match(windowsSpawn, /fallback\.performance_status = "degraded"/);
   assert.match(
     windowsSpawn,
@@ -46,13 +52,13 @@ test("Windows skips the Inspector when the Electron fuse is off and retries with
   const launch = windowsSpawn.indexOf("spawn_windows_codex(", noEntry);
   const budget = windowsSpawn.indexOf("let deadline =");
   const cleanup = windowsSpawn.indexOf("if let Err(cleanup_error) =");
-  const packageGuard = windowsSpawn.indexOf("if !package_cleanup_succeeded {");
   const retry = windowsSpawn.indexOf("if should_retry_startup(&error, attempt) {");
   const requiredConfigGuard = windowsSpawn.indexOf("if !runtime_config_overrides.is_empty() {");
 
   // Store updates can change the executable between attempts; refresh before probing it.
   const refresh = windowsSpawn.indexOf("refresh_windows_packaged_app_dir(app_dir)");
-  assert.ok(loop >= 0 && loop < refresh && refresh < fuseProbe && fuseProbe < prepareRequire);
+  const validate = windowsSpawn.indexOf("validate_codex_app_dir(app_dir)");
+  assert.ok(loop >= 0 && loop < refresh && refresh < validate && validate < fuseProbe && fuseProbe < prepareRequire);
   assert.ok(prepareRequire < prepare);
   // Electron strips `--require` from NODE_OPTIONS in packaged apps, so a
   // failed require attempt hands the retry to Inspector instead of repeating.
@@ -86,20 +92,19 @@ test("Windows skips the Inspector when the Electron fuse is off and retries with
     windowsSpawn,
     /StartupWaitContext \{\s*platform: "windows",\s*deadline,\s*renderer_debug_port: Some\(debug_port\),\s*spawned: Some\(&mut spawned\),/,
   );
-  assert.ok(cleanup > launch && packageGuard > cleanup && retry > packageGuard);
+  assert.ok(cleanup > launch && retry > cleanup);
   assert.ok(requiredConfigGuard > retry);
   assert.match(windowsSpawn.slice(cleanup, retry), /if let Err\(cleanup_error\)[\s\S]*?anyhow::bail!/);
-  assert.match(windowsSpawn.slice(packageGuard, retry), /anyhow::bail!/);
   assert.match(
     windowsSpawn.slice(retry, requiredConfigGuard),
     /if should_retry_startup\(&error, attempt\) \{\s*if use_inspector \{\s*retry_without_inspector = true;\s*\}\s*if use_require \{\s*retry_without_require = true;\s*\}\s*continue;\s*\}/,
   );
-  // Exit code 0 is Electron's single-instance handoff: every Codex install is
-  // swept after the spawned process is cleaned up and before the retry.
+  // Exit code 0 may indicate a different installation owns the lock. The
+  // selected-installation guard runs after cleanup and before the retry.
   const singleInstanceSweep = windowsSpawn.indexOf(
     "stop_running_windows_codex_instances(app_dir).await",
   );
-  assert.ok(singleInstanceSweep > packageGuard && singleInstanceSweep < retry);
+  assert.ok(singleInstanceSweep > cleanup && singleInstanceSweep < retry);
   assert.match(windowsSpawn, /exited\.exit_code == Some\(0\)/);
   assert.match(windowsSpawn, /return Ok\(spawned\);/);
 
@@ -172,16 +177,13 @@ test("Windows startup patch requires app-server runtime override validation", as
     windowsSpawn,
     /match startup_result \{\s*Ok\(mode\) => \{\s*spawned\.startup_injection_mode = mode\.as_str\(\)\.to_string\(\);\s*spawned\.performance_status = "ready"/,
   );
-  assert.match(windowsSpawn, /WindowsPackageDebugSession::finish/);
-  assert.match(launcherPlatform, /WindowsPackageDebugSession::start\(app_dir, &environment\)/);
-  assert.match(launcherPlatform, /settings\.EnableDebugging\(/);
-  assert.match(launcherPlatform, /settings\.DisableDebugging\(/);
+  assert.doesNotMatch(launcherPlatform, /WindowsPackageDebugSession|EnableDebugging|DisableDebugging/);
   assert.match(launcherPlatform, /child_command\.envs\(environment/);
-  const packageSetup = launcherPlatform.indexOf("match WindowsPackageDebugSession::start(app_dir, &environment)");
+  const packageSetup = launcherPlatform.indexOf("if require_wrapper_environment || require_home_environment");
   assert.ok(packageSetup >= 0);
   const activation = launcherPlatform.indexOf("codey_runtime_core::launcher::activate_packaged_app", packageSetup);
   assert.ok(activation > packageSetup);
-  assert.match(launcherPlatform.slice(packageSetup, activation), /if require_wrapper_environment \{\s*return Err\(error\)/);
+  assert.match(launcherPlatform.slice(packageSetup, activation), /return Err\(recovery::recoverable\(/);
 });
 
 test("macOS startup patch requires app-server runtime override validation", async () => {
@@ -210,7 +212,7 @@ test("macOS startup patch requires app-server runtime override validation", asyn
   );
   assert.match(
     macosSpawn,
-    /let pass_inspect_brk = use_inspector \|\| !inspect_fuse\.inspector_possible\(\);/,
+    /let pass_inspect_brk = use_inspector;/,
   );
   assert.match(
     macosSpawn,
@@ -253,7 +255,7 @@ test("NODE_OPTIONS require path follows platform and fuse availability", async (
   const requirePolicy = launcher.match(/fn windows_should_prepare_require_patch\([\s\S]*?\n\}/)?.[0];
   assert.ok(requirePolicy, "应存在 Windows require 补丁选择函数");
   assert.match(requirePolicy, /if retry_without_require \|\| !options_fuse\.node_options_possible\(\) \{\s*return false;/);
-  assert.match(requirePolicy, /!packaged_activation \|\| !inspect_fuse\.inspector_possible\(\)/);
+  assert.match(requirePolicy, /!packaged_activation\s*\}/);
   assert.match(windowsSpawn, /let use_require = require_patch\.is_some\(\);/);
   assert.match(
     windowsSpawn,
