@@ -2019,7 +2019,7 @@ fn apply_plugin_route_change(
         crate::codey_plugins::RouteChange::Upsert {
             spec,
             create_if_missing,
-        } => crate::plugin_routes::upsert(&mut next, plugin_id, spec, create_if_missing)?,
+        } => crate::plugin_routes::upsert(&mut next, plugin_id, *spec, create_if_missing)?,
         crate::codey_plugins::RouteChange::Release => {
             crate::plugin_routes::release(&mut next, plugin_id);
             None

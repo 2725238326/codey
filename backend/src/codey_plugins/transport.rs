@@ -136,6 +136,8 @@ pub(crate) async fn account_credentials(
 #[cfg(test)]
 tokio::task_local! { static TEST_TRANSPORTS: Plugins; }
 #[cfg(test)]
+// SDK 宿主测试也会编译此模块，但只有后端路由测试使用该辅助函数。
+#[allow(dead_code)]
 pub(crate) async fn with_test_transport<F: std::future::Future>(
     id: &str,
     plugin: super::lifecycle::TestPlugin,

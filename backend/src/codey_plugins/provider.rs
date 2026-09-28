@@ -36,7 +36,7 @@ pub struct PluginRouteSpec {
 #[allow(dead_code)]
 pub enum RouteChange {
     Upsert {
-        spec: PluginRouteSpec,
+        spec: Box<PluginRouteSpec>,
         create_if_missing: bool,
     },
     Release,
@@ -97,7 +97,7 @@ pub(crate) fn publish_route(
     dispatch(
         plugin_id,
         RouteChange::Upsert {
-            spec,
+            spec: Box::new(spec),
             create_if_missing,
         },
     )
