@@ -51,15 +51,11 @@ const RUNTIME_SUBAGENT_ATTESTATION_PREFIX: &str = "runtime-attestation-";
 const MAX_RUNTIME_ATTESTATION_TRANSCRIPT_BYTES: u64 = 2 * 1024 * 1024;
 const LEGACY_RUNTIME_ID: &str = "legacy-runtime";
 const PENDING_INIT_GRACE_MILLIS: u64 = 10 * 60 * 1000;
-const STOP_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
-const STOP_ABSOLUTE_GRACE_MILLIS: u64 = 60 * 60 * 1000;
+const STATE_ERROR_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const UNAVAILABLE_STATUS_GRACE_MILLIS: u64 = 30 * 1000;
 const UNAVAILABLE_STATUS_SINCE_FILE: &str = "unavailable-status-since.state";
 const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
-const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
-const STOP_ABSOLUTE_SINCE_FILE: &str = "stop-absolute-since.state";
 const CHILD_TOOL_IN_FLIGHT_PREFIX: &str = "child-tool-in-flight-";
-const STATUS_PROGRESS_FINGERPRINT_FILE: &str = "status-progress.state";
 const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
 const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
 const PROTOCOL_HEALTH_SCHEMA_VERSION: u32 = 1;
@@ -502,16 +498,6 @@ fn record_hook_evaluation(
     ]);
     if sampled_allow {
         event.attributes.insert("sampled".into(), json!(true));
-    }
-    if input.hook_event_name == "Stop" {
-        let session_dir = session_state_dir(state_root, &input.session_id);
-        let path = session_auxiliary_path(&session_dir, runtime_id, STOP_ABSOLUTE_SINCE_FILE);
-        if let Ok(Some(started_at_ms)) = read_observation_timestamp(&path) {
-            event.attributes.insert(
-                "root_barrier.duration_ms".into(),
-                json!(now_ms.saturating_sub(started_at_ms)),
-            );
-        }
     }
     if result.is_err() {
         event.error_code = Some("hook_error".into());
@@ -968,11 +954,9 @@ fn pre_tool_use_output(
             tool_name,
             input.tool_input.as_ref(),
         ) {
-            refresh_stop_stall_clock_if_running(state_root, runtime_id, &input.session_id, now_ms)?;
             return Ok(json!({}));
         }
         if let Some(reason) = runtime_subagent_attestation_denial(input, state_root, runtime_id)? {
-            refresh_stop_stall_clock_if_running(state_root, runtime_id, &input.session_id, now_ms)?;
             return Ok(pre_tool_reason_denial(&reason));
         }
         if let Some(agent_id) = child_agent_id {
@@ -989,12 +973,6 @@ fn pre_tool_use_output(
                 },
                 now_ms,
             )? {
-                refresh_stop_stall_clock_if_running(
-                    state_root,
-                    runtime_id,
-                    &input.session_id,
-                    now_ms,
-                )?;
                 return Ok(pre_tool_reason_denial(&reason));
             }
             note_allowed_child_tool(state_root, runtime_id, &input.session_id, agent_id, now_ms)?;
@@ -1174,7 +1152,6 @@ fn post_tool_use_output(
 ) -> Result<Value> {
     if input_has_subagent_context(input) {
         if input.tool_name.is_some() {
-            refresh_stop_stall_clock_if_running(state_root, runtime_id, &input.session_id, now_ms)?;
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
                 clear_child_tool_in_flight(state_root, runtime_id, &input.session_id, agent_id)?;
             }
@@ -1281,14 +1258,6 @@ fn post_tool_use_output(
             &input.session_id,
             UNAVAILABLE_STATUS_SINCE_FILE,
         )?;
-        if record_status_progress(state_root, runtime_id, &input.session_id, status_response)? {
-            remove_session_auxiliary_file(
-                state_root,
-                runtime_id,
-                &input.session_id,
-                STOP_BLOCKED_SINCE_FILE,
-            )?;
-        }
         clear_unknown_status_protocol_issue(state_root, runtime_id, &input.session_id, now_ms)?;
     } else {
         record_protocol_issue(
@@ -1370,14 +1339,6 @@ fn post_tool_use_output(
         remove_session_state(state_root, runtime_id, &input.session_id)?;
         return Ok(json!({}));
     }
-    if remaining < active {
-        remove_session_auxiliary_file(
-            state_root,
-            runtime_id,
-            &input.session_id,
-            STOP_BLOCKED_SINCE_FILE,
-        )?;
-    }
     let active = recover_root_active_state(input, state_root, runtime_id, now_ms)?;
     if active == 0 {
         return Ok(json!({}));
@@ -1454,24 +1415,6 @@ fn stop_output(
     Ok(stop_continuation(active, protocol_issue.as_deref()))
 }
 
-// Child tool calls are progress even when the root status snapshot stays on the
-// same "running" value. Only an already-started stall clock moves; the absolute
-// cap is untouched. An allowed call also stays in flight until PostToolUse or
-// SubagentStop, so one long command is not fenced at the 10-minute mark.
-fn refresh_stop_stall_clock_if_running(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    now_ms: u64,
-) -> Result<()> {
-    let session_dir = session_state_dir(state_root, session_id);
-    let path = session_auxiliary_path(&session_dir, runtime_id, STOP_BLOCKED_SINCE_FILE);
-    if read_observation_timestamp(&path)?.is_some() {
-        write_observation_timestamp(&session_dir, &path, now_ms)?;
-    }
-    Ok(())
-}
-
 fn note_allowed_child_tool(
     state_root: &Path,
     runtime_id: &str,
@@ -1485,8 +1428,7 @@ fn note_allowed_child_tool(
         runtime_id,
         &child_tool_in_flight_file_name(agent_id),
     );
-    write_observation_timestamp(&session_dir, &path, now_ms)?;
-    refresh_stop_stall_clock_if_running(state_root, runtime_id, session_id, now_ms)
+    write_observation_timestamp(&session_dir, &path, now_ms)
 }
 
 fn clear_child_tool_in_flight(
@@ -1542,8 +1484,8 @@ fn any_child_tool_in_flight(state_root: &Path, runtime_id: &str, session_id: &st
     Ok(false)
 }
 
-// Every root entry point advances the same bounded recovery clock. Recovery
-// must not depend on Stop being installed or on a missing tool producing a hook.
+// Recover only observed initialization or collaboration failures. Elapsed task
+// time and unchanged status snapshots do not prove a running child is lost.
 // Keep ledger tombstones here; only Stop finalizes the turn.
 fn recover_root_active_state(
     input: &HookInput,
@@ -1581,25 +1523,12 @@ fn recover_root_active_state(
         for agent_id_hash in recovery {
             remove_active_marker_by_hash(state_root, runtime_id, &input.session_id, agent_id_hash)?;
         }
-        let remaining = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
-        if remaining < active {
-            // Recovering a stuck pending child is progress for the batch. Give
-            // live siblings their own stall window instead of expiring both.
-            remove_session_auxiliary_file(
-                state_root,
-                runtime_id,
-                &input.session_id,
-                STOP_BLOCKED_SINCE_FILE,
-            )?;
-        }
-        active = remaining;
+        active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
         if active == 0 {
             remove_session_state(state_root, runtime_id, &input.session_id)?;
             return Ok(0);
         }
     }
-    // 先检查可重置的停滞窗口，确保绝对放行后如果协作路径不再推进，遗留
-    // 活跃标记仍能在后续 10 分钟内回收，而不会被已到期的绝对计时永久短路。
     let legacy_pending_init_elapsed = ledger_pending_recovery.is_none()
         && observation_elapsed_if_present(
             state_root,
@@ -1609,63 +1538,25 @@ fn recover_root_active_state(
             now_ms,
             PENDING_INIT_GRACE_MILLIS,
         )?;
-    let stall_elapsed = observe_and_check_elapsed(
-        state_root,
-        runtime_id,
-        &input.session_id,
-        STOP_BLOCKED_SINCE_FILE,
-        now_ms,
-        STOP_STALL_GRACE_MILLIS,
-    )?;
-    // 已放行、尚未结束的 child 工具说明子代理仍在工作。根代理状态快照
-    // 不变不能据此做 10 分钟回收；60 分钟绝对上限不看这个标记。
+    // An unavailable status tool does not stop an already-running child tool.
     let child_tool_running = any_child_tool_in_flight(state_root, runtime_id, &input.session_id)?;
-    if observation_elapsed_if_present(
+    let status_unavailable = observation_elapsed_if_present(
         state_root,
         runtime_id,
         &input.session_id,
         UNAVAILABLE_STATUS_SINCE_FILE,
         now_ms,
         UNAVAILABLE_STATUS_GRACE_MILLIS,
-    )? || legacy_pending_init_elapsed
-        || (stall_elapsed && !child_tool_running)
-    {
+    )?;
+    if !child_tool_running && (status_unavailable || legacy_pending_init_elapsed) {
         crate::subagent_orchestrator::recover_active_reservations(
             state_root,
             runtime_id,
             &input.session_id,
-            "gate recovery grace elapsed before an authoritative terminal outcome",
+            "initialization or status-tool failure persisted through its recovery grace",
             now_ms,
         )?;
         remove_session_state(state_root, runtime_id, &input.session_id)?;
-        return Ok(0);
-    }
-    // 绝对上限自首次受阻起算，不被有效 wait/list 响应重置；到期后 fence
-    // 遗留 attempt，并保留诊断，要求下一轮派发前先对账。
-    if observe_and_check_elapsed(
-        state_root,
-        runtime_id,
-        &input.session_id,
-        STOP_ABSOLUTE_SINCE_FILE,
-        now_ms,
-        STOP_ABSOLUTE_GRACE_MILLIS,
-    )? {
-        crate::subagent_orchestrator::recover_active_reservations(
-            state_root,
-            runtime_id,
-            &input.session_id,
-            "absolute gate grace elapsed before an authoritative terminal outcome",
-            now_ms,
-        )?;
-        remove_session_state(state_root, runtime_id, &input.session_id)?;
-        record_protocol_issue(
-            state_root,
-            runtime_id,
-            &input.session_id,
-            ProtocolIssueKind::AbsoluteStopTimeout,
-            "根代理受阻累计超过 60 分钟，已撤销活动子代理的工具权限并按绝对上限放行",
-            now_ms,
-        )?;
         return Ok(0);
     }
     Ok(active)
@@ -1704,7 +1595,7 @@ fn active_agent_count_or_recover_corrupt_state(
                 session_id,
                 STATE_ERROR_SINCE_FILE,
                 now_ms,
-                STOP_STALL_GRACE_MILLIS,
+                STATE_ERROR_GRACE_MILLIS,
             )? {
                 crate::subagent_orchestrator::recover_corrupt_gate_state(
                     state_root, runtime_id, session_id, now_ms,
@@ -1838,7 +1729,7 @@ fn post_wait_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；任一 attempt 终态或被根成功中断并 fence 后，如仍有计划内未派发的独立任务，按该任务角色重新计算并发上限，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；若持续没有可信终态，根调用、用户输入或 Stop 会在恢复等待期结束后撤销遗留子代理的工具权限。工具明确未注册时不要重复调用；使用当前可用的 list_agents 或 agent_status 核对，仍无法恢复则在 30 秒后由下一次根调用触发恢复，不得把失联任务当作成功。{local_read_guidance}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；任一 attempt 终态或被根成功中断并 fence 后，如仍有计划内未派发的独立任务，按该任务角色重新计算并发上限，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；不得仅因运行时长、状态未变化或缺少新消息中断或回收子代理。工具明确未注册时不要重复调用；使用当前可用的 list_agents 或 agent_status 核对，收到工具不可用回执后，若 30 秒内仍无可用状态回复且没有子代理工具正在执行，下一次根调用才会触发恢复，不得把失联任务当作成功。{local_read_guidance}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -1861,7 +1752,7 @@ fn post_list_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。任一 attempt 已终态或被成功中断并 fence 后，如仍有计划内未派发的独立任务，可信根代理应按该任务角色重新计算并发上限，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待、转向或停止。completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait，也不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。任一 attempt 已终态或被成功中断并 fence 后，如仍有计划内未派发的独立任务，可信根代理应按该任务角色重新计算并发上限，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待、转向或停止。completed、errored、shutdown 和 not_found 不再阻塞。不得仅因运行时长、状态未变化或缺少新消息中断子代理；只有用户明确取消或有证据确认任务无法继续时才中断一次。中断获得结构化成功回执后，确认遗留工具和写入任务已停止再接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。每次等待保持有界并继续核对，不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -1877,7 +1768,7 @@ fn stop_continuation(active: usize, protocol_issue: Option<&str>) -> Value {
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理调用 agents.wait_agent；累计 10 分钟仍无终态时只中断一次对应代理。中断获得结构化成功回执后立即接管，不再等待该 target；只有中断失败或目标无法匹配时才继续对账。不得无限重试或自动重派。仅使用本轮实际提供的协作工具，工具未注册时不要重复调用。Hook 收到明确的工具未注册错误后，若 30 秒内没有可用状态回复，下一次根调用、用户输入或 Stop 会撤销遗留子代理的工具权限并恢复主会话；没有错误回执时保留 10 分钟无进展恢复期。恢复后的任务按失联处理，不代表成功完成。{compatibility}"
+            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理调用 agents.wait_agent；不得仅因运行时长、状态未变化或缺少新消息中断子代理；只有用户明确取消或有证据确认任务无法继续时才中断一次。中断获得结构化成功回执后，确认遗留工具和写入任务已停止再接管，不再等待该 target；只有中断失败或目标无法匹配时才继续对账。不得无限重试或自动重派。仅使用本轮实际提供的协作工具，工具未注册时不要重复调用。Hook 收到明确的工具未注册错误后，若 30 秒内没有可用状态回复且没有子代理工具正在执行，下一次根调用、用户输入或 Stop 会撤销遗留子代理的工具权限并恢复主会话；没有故障证据时继续等待。恢复后的任务按失联处理，不代表成功完成。{compatibility}"
         ),
     })
 }
@@ -2005,129 +1896,6 @@ fn wait_agent_response_is_usable(tool_response: Option<&Value>) -> bool {
             .as_ref()
             .is_some_and(|value| wait_agent_response_is_usable(Some(value))),
         _ => false,
-    }
-}
-
-/// Records semantic collaboration progress instead of treating every usable
-/// poll as progress. Repeated `interrupted` or timeout snapshots therefore do
-/// not postpone the bounded Stop recovery window indefinitely.
-fn record_status_progress(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    tool_response: Option<&Value>,
-) -> Result<bool> {
-    let Some(fingerprint) = status_progress_fingerprint(tool_response) else {
-        return Ok(false);
-    };
-    let session_dir = session_state_dir(state_root, session_id);
-    fs::create_dir_all(&session_dir).with_context(|| {
-        format!(
-            "创建 Codex 子代理状态进展目录失败：{}",
-            session_dir.display()
-        )
-    })?;
-    let path = session_auxiliary_path(&session_dir, runtime_id, STATUS_PROGRESS_FINGERPRINT_FILE);
-    match fs::read_to_string(&path) {
-        Ok(previous) if previous.trim() == fingerprint => Ok(false),
-        Ok(_) => {
-            crate::fs_util::atomic_write_private(&path, format!("{fingerprint}\n").as_bytes())
-                .with_context(|| {
-                    format!("写入 Codex 子代理状态进展指纹失败：{}", path.display())
-                })?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::fs_util::atomic_write_private(&path, format!("{fingerprint}\n").as_bytes())
-                .with_context(|| {
-                    format!("写入 Codex 子代理状态进展指纹失败：{}", path.display())
-                })?;
-            Ok(true)
-        }
-        Err(error) => Err(error)
-            .with_context(|| format!("读取 Codex 子代理状态进展指纹失败：{}", path.display())),
-    }
-}
-
-fn status_progress_fingerprint(tool_response: Option<&Value>) -> Option<String> {
-    let response = tool_response?;
-    let decoded;
-    let response = if let Value::String(encoded) = response {
-        decoded = serde_json::from_str::<Value>(encoded).ok();
-        decoded.as_ref().unwrap_or(response)
-    } else {
-        response
-    };
-    let mut tokens = Vec::new();
-    collect_status_progress_tokens(response, &mut tokens, 0);
-    tokens.sort();
-    tokens.dedup();
-    if tokens.is_empty() {
-        return None;
-    }
-    let encoded = serde_json::to_string(&tokens).ok()?;
-    Some(hash_component(&encoded))
-}
-
-fn collect_status_progress_tokens(value: &Value, tokens: &mut Vec<String>, depth: usize) {
-    if depth > 8 {
-        return;
-    }
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                collect_status_progress_tokens(value, tokens, depth + 1);
-            }
-        }
-        Value::Object(values) => {
-            let identifier = object_value_any(
-                values,
-                &["agentid", "agentname", "subagentid", "taskname", "name"],
-            )
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(normalized_ascii_identifier)
-            .unwrap_or_else(|| "_".to_string());
-            let status = object_value_any(
-                values,
-                &["previousstatus", "agentstatus", "status", "state"],
-            )
-            .and_then(Value::as_str)
-            .map(normalized_ascii_identifier);
-            let is_root = identifier == "root";
-            if !is_root && let Some(status) = status.as_deref() {
-                tokens.push(format!("state:{identifier}:{status}"));
-                if matches!(status, "message" | "partial")
-                    && let Some(message) = object_value_any(values, &["message", "output", "text"])
-                {
-                    tokens.push(format!(
-                        "message:{identifier}:{}",
-                        hash_component(&canonical_json(message).to_string())
-                    ));
-                }
-            }
-            for (key, value) in values {
-                let key = normalized_ascii_identifier(key);
-                if !(is_root || identifier == "_" && matches!(key.as_str(), "timedout" | "timeout"))
-                    && protocol::is_terminal_marker_field(&key)
-                    && !matches!(value, Value::Bool(false) | Value::Null)
-                {
-                    tokens.push(format!("terminal:{identifier}:{key}"));
-                }
-                if protocol::is_agent_collection_field(&key)
-                    || protocol::is_provider_envelope_field(&key)
-                {
-                    collect_status_progress_tokens(value, tokens, depth + 1);
-                }
-            }
-        }
-        Value::String(encoded) => {
-            if let Ok(decoded) = serde_json::from_str::<Value>(encoded) {
-                collect_status_progress_tokens(&decoded, tokens, depth + 1);
-            }
-        }
-        _ => {}
     }
 }
 

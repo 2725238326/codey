@@ -41,7 +41,7 @@ fn unavailable_wait(session: &str) -> HookInput {
 }
 
 #[test]
-fn root_entry_points_recover_without_a_stop_hook_or_status_receipt() {
+fn root_entry_points_recover_after_status_tool_failure_without_stop() {
     for event in ["PreToolUse", "UserPromptSubmit", "PostToolUse"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -53,6 +53,7 @@ fn root_entry_points_recover_without_a_stop_hook_or_status_receipt() {
                 ["permissionDecision"],
             "deny"
         );
+        handle_hook_for_runtime_at(&unavailable_wait(session), root, "runtime-a", 1_000).unwrap();
         let mut trigger = input(event, session);
         if event == "PreToolUse" {
             trigger = root_command(session);
@@ -60,8 +61,13 @@ fn root_entry_points_recover_without_a_stop_hook_or_status_receipt() {
         if event == "PostToolUse" {
             trigger = unavailable_wait(session);
         }
-        handle_hook_for_runtime_at(&trigger, root, "runtime-a", 1_000 + STOP_STALL_GRACE_MILLIS)
-            .unwrap();
+        handle_hook_for_runtime_at(
+            &trigger,
+            root,
+            "runtime-a",
+            1_000 + UNAVAILABLE_STATUS_GRACE_MILLIS,
+        )
+        .unwrap();
         assert_eq!(
             active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
             0,
@@ -72,7 +78,7 @@ fn root_entry_points_recover_without_a_stop_hook_or_status_receipt() {
                 &command,
                 root,
                 "runtime-a",
-                1_001 + STOP_STALL_GRACE_MILLIS
+                1_001 + UNAVAILABLE_STATUS_GRACE_MILLIS
             )
             .unwrap(),
             json!({}),
@@ -265,7 +271,7 @@ fn corrupt_ledger_and_marker_recovery_persists_across_later_hooks() {
                 &command,
                 root,
                 "runtime-a",
-                1_000 + STOP_STALL_GRACE_MILLIS
+                1_000 + STATE_ERROR_GRACE_MILLIS
             )
             .unwrap(),
             json!({})
@@ -275,7 +281,7 @@ fn corrupt_ledger_and_marker_recovery_persists_across_later_hooks() {
                 &command,
                 root,
                 "runtime-a",
-                1_001 + STOP_STALL_GRACE_MILLIS
+                1_001 + STATE_ERROR_GRACE_MILLIS
             )
             .unwrap(),
             json!({})
@@ -301,18 +307,24 @@ fn corrupt_ledger_and_marker_recovery_persists_across_later_hooks() {
 }
 
 #[test]
-fn child_hooks_cannot_release_a_stalled_root_gate() {
+fn child_hooks_cannot_release_root_gate_after_status_failure() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let session = "child-recovery";
     start_recovery_child(root, session);
     handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap();
+    handle_hook_for_runtime_at(&unavailable_wait(session), root, "runtime-a", 1_000).unwrap();
     for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"] {
         let mut child = input(event, session);
         child.agent_id = Some("/root/reader".into());
         child.agent_type = Some("codey_quick_scan".into());
-        handle_hook_for_runtime_at(&child, root, "runtime-a", 1_000 + STOP_STALL_GRACE_MILLIS)
-            .unwrap();
+        handle_hook_for_runtime_at(
+            &child,
+            root,
+            "runtime-a",
+            1_000 + UNAVAILABLE_STATUS_GRACE_MILLIS,
+        )
+        .unwrap();
         assert_eq!(
             active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
             1,
@@ -332,7 +344,7 @@ fn corruption_recovery_cannot_remove_a_newer_runtimes_ledger() {
     let ledger_path = session_state_dir(root, session).join("orchestrator-ledger-v1.json");
     let expected = fs::read(&ledger_path).unwrap();
     let command = root_command(session);
-    for now_ms in [1_000, 1_000 + STOP_STALL_GRACE_MILLIS] {
+    for now_ms in [1_000, 1_000 + STATE_ERROR_GRACE_MILLIS] {
         let error = handle_hook_for_runtime_at(&command, root, "runtime-a", now_ms).unwrap_err();
         assert!(
             error
@@ -341,42 +353,6 @@ fn corruption_recovery_cannot_remove_a_newer_runtimes_ledger() {
         );
         assert_eq!(fs::read(&ledger_path).unwrap(), expected);
     }
-}
-
-#[test]
-fn post_status_absolute_recovery_retains_the_next_turn_diagnostic() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let session = "post-absolute-recovery";
-    start_recovery_child(root, session);
-    handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap();
-    let mut status = input("PostToolUse", session);
-    status.tool_name = Some("agents.agent_status".into());
-    status.tool_input = Some(json!({"target": "/root/reader"}));
-    status.tool_response = Some(json!({"agent_id": "/root/reader", "status": "running"}));
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &status,
-            root,
-            "runtime-a",
-            1_000 + STOP_ABSOLUTE_GRACE_MILLIS
-        )
-        .unwrap(),
-        json!({})
-    );
-    let next_turn = handle_hook_for_runtime_at(
-        &input("UserPromptSubmit", session),
-        root,
-        "runtime-a",
-        1_001 + STOP_ABSOLUTE_GRACE_MILLIS,
-    )
-    .unwrap();
-    assert!(
-        next_turn["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("绝对上限")
-    );
 }
 
 #[test]
@@ -429,199 +405,7 @@ fn child_tool_in_flight_exists(root: &Path, session: &str) -> bool {
 }
 
 #[test]
-fn child_tool_activity_postpones_stall_recovery_without_moving_the_absolute_deadline() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let session = "child-still-working";
-    start_recovery_child(root, session);
-    let session_dir = session_state_dir(root, session);
-    let stalled = session_auxiliary_path(&session_dir, "runtime-a", STOP_BLOCKED_SINCE_FILE);
-    let absolute = session_auxiliary_path(&session_dir, "runtime-a", STOP_ABSOLUTE_SINCE_FILE);
-
-    // 根代理还没受阻时，child 工具不能自己打开停滞计时。
-    let mut child = reader_tool(session, "PreToolUse");
-    attest_test_child(&child, root, "runtime-a");
-    assert_eq!(
-        handle_hook_for_runtime_at(&child, root, "runtime-a", 500).unwrap(),
-        json!({})
-    );
-    child.hook_event_name = "PostToolUse".into();
-    handle_hook_for_runtime_at(&child, root, "runtime-a", 600).unwrap();
-    assert!(!stalled.exists());
-    assert!(!child_tool_in_flight_exists(root, session));
-
-    assert_eq!(
-        handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap()["hookSpecificOutput"]
-            ["permissionDecision"],
-        "deny"
-    );
-    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
-
-    let activity_at = 1_000 + STOP_STALL_GRACE_MILLIS - 1;
-    child.hook_event_name = "PreToolUse".into();
-    assert_eq!(
-        handle_hook_for_runtime_at(&child, root, "runtime-a", activity_at).unwrap(),
-        json!({})
-    );
-    assert_eq!(
-        fs::read_to_string(&stalled).unwrap(),
-        format!("{activity_at}\n")
-    );
-    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_command(session),
-            root,
-            "runtime-a",
-            1_000 + STOP_STALL_GRACE_MILLIS
-        )
-        .unwrap()["hookSpecificOutput"]["permissionDecision"],
-        "deny"
-    );
-    assert_eq!(
-        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
-        1
-    );
-
-    child.hook_event_name = "PostToolUse".into();
-    let finished_at = activity_at + 1_000;
-    handle_hook_for_runtime_at(&child, root, "runtime-a", finished_at).unwrap();
-    assert_eq!(
-        fs::read_to_string(&stalled).unwrap(),
-        format!("{finished_at}\n")
-    );
-    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
-    assert!(!child_tool_in_flight_exists(root, session));
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_command(session),
-            root,
-            "runtime-a",
-            finished_at + STOP_STALL_GRACE_MILLIS - 1
-        )
-        .unwrap()["hookSpecificOutput"]["permissionDecision"],
-        "deny"
-    );
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_command(session),
-            root,
-            "runtime-a",
-            finished_at + STOP_STALL_GRACE_MILLIS
-        )
-        .unwrap(),
-        json!({})
-    );
-    assert_eq!(
-        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
-        0
-    );
-}
-
-#[test]
-fn in_flight_child_tool_holds_past_the_stall_grace_until_the_absolute_cap() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let session = "long-child-tool";
-    start_recovery_child(root, session);
-    handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap();
-
-    let child = reader_tool(session, "PreToolUse");
-    attest_test_child(&child, root, "runtime-a");
-    assert_eq!(
-        handle_hook_for_runtime_at(&child, root, "runtime-a", 2_000).unwrap(),
-        json!({})
-    );
-    assert!(child_tool_in_flight_exists(root, session));
-
-    let past_stall = 2_000 + STOP_STALL_GRACE_MILLIS;
-    assert_eq!(
-        handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", past_stall).unwrap()
-            ["hookSpecificOutput"]["permissionDecision"],
-        "deny"
-    );
-    assert_eq!(
-        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
-        1
-    );
-    let session_dir = session_state_dir(root, session);
-    let absolute = session_auxiliary_path(&session_dir, "runtime-a", STOP_ABSOLUTE_SINCE_FILE);
-    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
-
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_command(session),
-            root,
-            "runtime-a",
-            1_000 + STOP_ABSOLUTE_GRACE_MILLIS
-        )
-        .unwrap(),
-        json!({})
-    );
-    assert_eq!(
-        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
-        0
-    );
-}
-
-#[test]
-fn denied_child_tool_postpones_stall_without_holding_an_in_flight_marker() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let session = "denied-child-tool";
-    start_recovery_child(root, session);
-    handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap();
-
-    let mut child = input("PreToolUse", session);
-    child.agent_id = Some("/root/reader".into());
-    child.agent_type = Some("codey_quick_scan".into());
-    child.tool_name = Some("functions.exec_command".into());
-    child.tool_input = Some(json!({"cmd": "git status --short"}));
-    attest_test_child(&child, root, "runtime-a");
-    let denied_at = 1_000 + STOP_STALL_GRACE_MILLIS - 1;
-    assert_eq!(
-        handle_hook_for_runtime_at(&child, root, "runtime-a", denied_at).unwrap()["hookSpecificOutput"]
-            ["permissionDecision"],
-        "deny"
-    );
-    assert!(!child_tool_in_flight_exists(root, session));
-    let stalled = session_auxiliary_path(
-        &session_state_dir(root, session),
-        "runtime-a",
-        STOP_BLOCKED_SINCE_FILE,
-    );
-    assert_eq!(
-        fs::read_to_string(&stalled).unwrap(),
-        format!("{denied_at}\n")
-    );
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_command(session),
-            root,
-            "runtime-a",
-            1_000 + STOP_STALL_GRACE_MILLIS
-        )
-        .unwrap()["hookSpecificOutput"]["permissionDecision"],
-        "deny"
-    );
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_command(session),
-            root,
-            "runtime-a",
-            denied_at + STOP_STALL_GRACE_MILLIS
-        )
-        .unwrap(),
-        json!({})
-    );
-    assert_eq!(
-        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
-        0
-    );
-}
-
-#[test]
-fn stopping_a_child_clears_its_in_flight_tool_so_stall_recovery_can_continue() {
+fn stopping_a_child_clears_its_in_flight_tool_before_status_failure_recovery() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let session = "stop-clears-in-flight";
@@ -633,6 +417,7 @@ fn stopping_a_child_clears_its_in_flight_tool_so_stall_recovery_can_continue() {
     attest_test_child(&child, root, "runtime-a");
     handle_hook_for_runtime_at(&child, root, "runtime-a", 2_000).unwrap();
     assert!(child_tool_in_flight_exists(root, session));
+    handle_hook_for_runtime_at(&unavailable_wait(session), root, "runtime-a", 2_000).unwrap();
 
     let mut stopped = input("SubagentStop", session);
     stopped.agent_id = Some("/root/reader".into());
@@ -648,7 +433,7 @@ fn stopping_a_child_clears_its_in_flight_tool_so_stall_recovery_can_continue() {
             &root_command(session),
             root,
             "runtime-a",
-            2_000 + STOP_STALL_GRACE_MILLIS - 1
+            2_000 + UNAVAILABLE_STATUS_GRACE_MILLIS - 1
         )
         .unwrap()["hookSpecificOutput"]["permissionDecision"],
         "deny"
@@ -658,7 +443,7 @@ fn stopping_a_child_clears_its_in_flight_tool_so_stall_recovery_can_continue() {
             &root_command(session),
             root,
             "runtime-a",
-            2_000 + STOP_STALL_GRACE_MILLIS
+            2_000 + UNAVAILABLE_STATUS_GRACE_MILLIS
         )
         .unwrap(),
         json!({})

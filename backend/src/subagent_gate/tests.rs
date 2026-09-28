@@ -2907,7 +2907,7 @@ fn root_only_full_list_recovers_a_spawn_that_never_started() {
 }
 
 #[test]
-fn stale_pending_init_and_unusable_collaboration_paths_release_after_grace() {
+fn stale_pending_init_releases_after_grace() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let runtime_id = "runtime-a";
@@ -2945,42 +2945,6 @@ fn stale_pending_init_and_unusable_collaboration_paths_release_after_grace() {
             root,
             runtime_id,
             1_000 + PENDING_INIT_GRACE_MILLIS,
-        )
-        .unwrap(),
-        json!({})
-    );
-
-    let mut stalled_start = input("SubagentStart", "stalled-session");
-    stalled_start.agent_id = Some("agent-b".to_string());
-    handle_hook_for_runtime_at(&stalled_start, root, runtime_id, 2_000).unwrap();
-    assert_eq!(
-        handle_hook_for_runtime_at(&input("Stop", "stalled-session"), root, runtime_id, 2_000,)
-            .unwrap()["decision"]
-            .as_str(),
-        Some("block")
-    );
-    let mut unavailable_wait = input("PostToolUse", "stalled-session");
-    unavailable_wait.tool_name = Some("agents.wait_agent".to_string());
-    unavailable_wait.tool_response = Some(Value::String(
-        "该工具未在当前线程注册，无法执行 agents.wait_agent".to_string(),
-    ));
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &unavailable_wait,
-            root,
-            runtime_id,
-            2_000 + STOP_STALL_GRACE_MILLIS - 1,
-        )
-        .unwrap()["decision"]
-            .as_str(),
-        Some("block")
-    );
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &input("Stop", "stalled-session"),
-            root,
-            runtime_id,
-            2_000 + STOP_STALL_GRACE_MILLIS,
         )
         .unwrap(),
         json!({})
@@ -3201,59 +3165,6 @@ fn live_observation_clears_only_that_reservations_pending_init_timer() {
 }
 
 #[test]
-fn ledger_backed_stale_attempt_is_fenced_before_stop_recovery() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    write_test_runtime_policy(root);
-    let runtime_id = "runtime-a";
-    let session_id = "ledger-stale-session";
-    let mut spawn = input("PreToolUse", session_id);
-    spawn.cwd = Some("/repo".to_string());
-    spawn.tool_name = Some("agents.spawn_agent".to_string());
-    spawn.tool_input = Some(json!({
-        "task_name": "stale_reader",
-        "agent_type": "codey_deep_research",
-        "fork_turns": "none",
-        "message": delegation_message(json!({
-            "id": "stale_reader",
-            "why": "breadth",
-            "visual": false,
-            "root": "/repo",
-            "read": ["backend/src"],
-            "write": [],
-            "checks": []
-        }))
-    }));
-    assert_eq!(
-        handle_hook_for_runtime_at(&spawn, root, runtime_id, 1_000).unwrap(),
-        json!({})
-    );
-    assert_eq!(
-        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
-        1
-    );
-    assert_eq!(
-        handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000,)
-            .unwrap()["decision"]
-            .as_str(),
-        Some("block")
-    );
-
-    let recovered = handle_hook_for_runtime_at(
-        &input("Stop", session_id),
-        root,
-        runtime_id,
-        2_000 + STOP_STALL_GRACE_MILLIS,
-    )
-    .unwrap();
-    assert_eq!(recovered, json!({}));
-    assert_eq!(
-        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
-        0
-    );
-}
-
-#[test]
 fn collaboration_tool_output_is_bounded_on_unicode_boundaries() {
     let payload = "界".repeat(MAX_RENDERED_TOOL_RESULT_CHARS + 32);
     let rendered = render_tool_result(Some(&Value::String(payload)), "wait_agent");
@@ -3309,7 +3220,7 @@ fn corrupted_active_state_fails_closed_then_recovers_after_grace() {
         &input("Stop", session_id),
         root,
         runtime_id,
-        2_000 + STOP_STALL_GRACE_MILLIS,
+        2_000 + STATE_ERROR_GRACE_MILLIS,
     )
     .unwrap();
     assert_eq!(recovered, json!({}));
@@ -3335,7 +3246,7 @@ fn healthy_active_state_clears_a_stale_corruption_observation() {
         &input("Stop", session_id),
         root,
         runtime_id,
-        1_000 + STOP_STALL_GRACE_MILLIS,
+        1_000 + STATE_ERROR_GRACE_MILLIS,
     )
     .unwrap();
     assert_eq!(blocked["decision"].as_str(), Some("block"));
@@ -3344,206 +3255,6 @@ fn healthy_active_state_clears_a_stale_corruption_observation() {
         active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
         1
     );
-}
-
-#[test]
-fn repeated_interrupted_snapshots_do_not_extend_the_stall_grace() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let runtime_id = "runtime-a";
-    let session_id = "unchanged-interrupt-session";
-    let mut start = input("SubagentStart", session_id);
-    start.agent_id = Some("agent-a".to_string());
-    handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
-
-    assert_eq!(
-        handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000)
-            .unwrap()["decision"]
-            .as_str(),
-        Some("block")
-    );
-    let session_dir = session_state_dir(root, session_id);
-    let stalled = session_auxiliary_path(&session_dir, runtime_id, STOP_BLOCKED_SINCE_FILE);
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "2000\n");
-
-    let mut wait = input("PostToolUse", session_id);
-    wait.tool_name = Some("agents.wait_agent".to_string());
-    wait.tool_response = Some(json!({
-        "updates": [{ "agent_id": "agent-a", "status": "interrupted" }]
-    }));
-    handle_hook_for_runtime_at(&wait, root, runtime_id, 3_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "3000\n");
-
-    handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 4_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "3000\n");
-    handle_hook_for_runtime_at(&wait, root, runtime_id, 5_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "3000\n");
-
-    wait.tool_response = Some(json!({
-        "updates": [{ "agent_id": "agent-a", "status": "running" }]
-    }));
-    handle_hook_for_runtime_at(&wait, root, runtime_id, 6_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "6000\n");
-    handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 7_000).unwrap();
-    handle_hook_for_runtime_at(&wait, root, runtime_id, 8_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "6000\n");
-    let stop_trace = hook_trace_events(root)
-        .into_iter()
-        .find(|event| event.timestamp_ms == 7_000 && event.event == TraceEventKind::HookEvaluated)
-        .unwrap();
-    assert_eq!(
-        stop_trace.attributes["root_barrier.duration_ms"],
-        json!(5_000)
-    );
-
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &input("Stop", session_id),
-            root,
-            runtime_id,
-            7_000 + STOP_STALL_GRACE_MILLIS,
-        )
-        .unwrap(),
-        json!({})
-    );
-}
-
-#[test]
-fn timeout_and_root_only_snapshots_do_not_reset_the_stall_grace() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let runtime_id = "runtime-a";
-    let session_id = "no-progress-session";
-    let mut start = input("SubagentStart", session_id);
-    start.agent_id = Some("agent-a".to_string());
-    handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
-
-    handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000).unwrap();
-    let session_dir = session_state_dir(root, session_id);
-    let stalled = session_auxiliary_path(&session_dir, runtime_id, STOP_BLOCKED_SINCE_FILE);
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "2000\n");
-
-    let mut wait = input("PostToolUse", session_id);
-    wait.tool_name = Some("agents.wait_agent".to_string());
-    wait.tool_response = Some(json!({ "timed_out": true, "message": "Wait timed out." }));
-    handle_hook_for_runtime_at(&wait, root, runtime_id, 3_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "2000\n");
-
-    let mut list = input("PostToolUse", session_id);
-    list.tool_name = Some("agents.list_agents".to_string());
-    list.tool_input = Some(json!({}));
-    list.tool_response = Some(json!({
-        "agents": [{ "agent_name": "/root", "agent_status": "running" }]
-    }));
-    handle_hook_for_runtime_at(&list, root, runtime_id, 4_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "2000\n");
-
-    assert_eq!(
-        handle_hook_for_runtime_at(
-            &input("Stop", session_id),
-            root,
-            runtime_id,
-            2_000 + STOP_STALL_GRACE_MILLIS,
-        )
-        .unwrap(),
-        json!({})
-    );
-}
-
-#[test]
-fn stop_absolute_release_still_allows_later_stall_cleanup() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let runtime_id = "runtime-a";
-    let session_id = "absolute-stop-session";
-    let mut start = input("SubagentStart", session_id);
-    start.agent_id = Some("agent-a".to_string());
-    handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
-
-    let first_blocked =
-        handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000).unwrap();
-    assert_eq!(first_blocked["decision"].as_str(), Some("block"));
-    let session_dir = session_state_dir(root, session_id);
-    let absolute = session_auxiliary_path(&session_dir, runtime_id, STOP_ABSOLUTE_SINCE_FILE);
-    assert_eq!(fs::read_to_string(&absolute).unwrap(), "2000\n");
-
-    // 带具体代理状态的 wait 进展只重置 10 分钟停滞计时，绝对计时保持不变。
-    let mut wait = input("PostToolUse", session_id);
-    wait.tool_name = Some("agents.wait_agent".to_string());
-    wait.tool_response = Some(json!({
-        "updates": [{ "agent_id": "agent-a", "status": "running" }]
-    }));
-    handle_hook_for_runtime_at(&wait, root, runtime_id, 3_000).unwrap();
-    assert_eq!(fs::read_to_string(&absolute).unwrap(), "2000\n");
-
-    // 持续到绝对上限前仍有有效等待结果，避免 10 分钟停滞窗口提前回收。
-    let absolute_deadline = 2_000 + STOP_ABSOLUTE_GRACE_MILLIS;
-    for now_ms in (4_000..absolute_deadline).step_by((STOP_STALL_GRACE_MILLIS / 2) as usize) {
-        wait.tool_response = Some(json!({
-            "updates": [{ "agent_id": "agent-a", "status": "message", "message": format!("progress at {now_ms}") }]
-        }));
-        assert_eq!(
-            handle_hook_for_runtime_at(&wait, root, runtime_id, now_ms).unwrap()["decision"],
-            "block"
-        );
-    }
-    handle_hook_for_runtime_at(&wait, root, runtime_id, absolute_deadline - 1).unwrap();
-
-    let released = handle_hook_for_runtime_at(
-        &input("Stop", session_id),
-        root,
-        runtime_id,
-        absolute_deadline,
-    )
-    .unwrap();
-    assert_eq!(released, json!({}));
-    // 绝对放行先在账本中 fence 活动 attempt，再清理旧 marker，避免
-    // ledger-backed active count 在后续 Stop 中反复复活。
-    assert_eq!(
-        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
-        0
-    );
-    let issue = protocol_issue_reason(root, runtime_id, session_id)
-        .unwrap()
-        .unwrap();
-    assert!(issue.contains("绝对上限"), "{issue}");
-
-    let next_turn = handle_hook_for_runtime_at(
-        &input("UserPromptSubmit", session_id),
-        root,
-        runtime_id,
-        absolute_deadline + 1,
-    )
-    .unwrap();
-    let context = next_turn["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert!(context.contains("绝对上限"));
-    assert!(context.contains("首次派发前先调用不带筛选的 agents.list_agents"));
-    let mut spawn = input("PreToolUse", session_id);
-    spawn.tool_name = Some("agents.spawn_agent".to_string());
-    let denied =
-        handle_hook_for_runtime_at(&spawn, root, runtime_id, absolute_deadline + 2).unwrap();
-    let reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
-        .unwrap();
-    assert!(reason.contains("绝对上限"));
-    assert!(!reason.contains("无法可靠区分根代理和子代理"));
-
-    // 后续 Stop 保持幂等，不会重新建立停滞窗口或恢复旧 attempt。
-    let recovered = handle_hook_for_runtime_at(
-        &input("Stop", session_id),
-        root,
-        runtime_id,
-        absolute_deadline + STOP_STALL_GRACE_MILLIS,
-    )
-    .unwrap();
-    assert_eq!(recovered, json!({}));
-    assert_eq!(
-        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
-        0
-    );
-    assert!(!absolute.exists());
 }
 
 #[test]
@@ -3679,7 +3390,7 @@ fn recovery_timer_resets_on_backward_clock_jumps_but_accepts_late_checks() {
             root,
             "runtime-a",
             "clock-session",
-            STOP_BLOCKED_SINCE_FILE,
+            STATE_ERROR_SINCE_FILE,
             100_000,
             grace,
         )
@@ -3690,7 +3401,7 @@ fn recovery_timer_resets_on_backward_clock_jumps_but_accepts_late_checks() {
             root,
             "runtime-a",
             "clock-session",
-            STOP_BLOCKED_SINCE_FILE,
+            STATE_ERROR_SINCE_FILE,
             90_000,
             grace,
         )
@@ -3701,7 +3412,7 @@ fn recovery_timer_resets_on_backward_clock_jumps_but_accepts_late_checks() {
             root,
             "runtime-a",
             "clock-session",
-            STOP_BLOCKED_SINCE_FILE,
+            STATE_ERROR_SINCE_FILE,
             90_000 + grace + 60_001,
             grace,
         )
