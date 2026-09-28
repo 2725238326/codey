@@ -540,7 +540,7 @@ struct StartupModelCatalog {
     model_state: model_catalog::ModelSelectionState,
 }
 
-struct PreparedCodexStartupState {
+struct PreparedProviderState {
     runtime_config: CodeyConfig,
     runtime_config_overrides: Vec<String>,
 }
@@ -907,7 +907,7 @@ async fn prepare_codex_startup_state(
     home: &std::path::Path,
     local_router: &RuntimeRouterEndpoint,
     startup_catalog: StartupModelCatalog,
-) -> Result<PreparedCodexStartupState> {
+) -> Result<PreparedProviderState> {
     let StartupModelCatalog {
         use_official_catalog,
         model_state,
@@ -977,7 +977,7 @@ async fn prepare_codex_startup_state(
         error
     })?;
     runtime_subagent_config.fast_context_tools = applied.fast_context_tools_active;
-    Ok(PreparedCodexStartupState {
+    Ok(PreparedProviderState {
         runtime_config: runtime_subagent_config,
         runtime_config_overrides: applied.runtime_config_overrides,
     })
@@ -1445,11 +1445,6 @@ struct StartupStorageState {
     session_maintenance: SessionMaintenanceSummary,
 }
 
-struct PreparedProviderState {
-    runtime_config: CodeyConfig,
-    runtime_config_overrides: Vec<String>,
-}
-
 struct StartupPatchState {
     debug_port: u16,
 }
@@ -1626,28 +1621,6 @@ async fn prepare_startup_storage(
     let prepared = preparation?;
     storage_guards?;
     Ok(prepared)
-}
-
-async fn prepare_runtime_provider_state(
-    home: &std::path::Path,
-    config: &CodeyConfig,
-    current_profile: &ProviderProfile,
-    local_router: &LocalRouter,
-    startup_catalog: StartupModelCatalog,
-) -> Result<PreparedProviderState> {
-    let router_endpoint = local_router.endpoint();
-    let prepared_startup = prepare_codex_startup_state(
-        config,
-        current_profile,
-        home,
-        &router_endpoint,
-        startup_catalog,
-    )
-    .await?;
-    Ok(PreparedProviderState {
-        runtime_config: prepared_startup.runtime_config,
-        runtime_config_overrides: prepared_startup.runtime_config_overrides,
-    })
 }
 
 fn native_subagent_model(
@@ -2156,11 +2129,11 @@ impl CodeyRuntime {
                 local_router.as_ref(),
                 startup_catalog,
             ) {
-                prepare_runtime_provider_state(
-                    home,
+                prepare_codex_startup_state(
                     config,
                     startup_profile,
-                    local_router,
+                    home,
+                    &local_router.endpoint(),
                     startup_catalog,
                 )
                 .await

@@ -223,8 +223,10 @@ impl LocalRouter {
             websocket_backoffs: Arc::clone(&websocket_backoffs),
             native_history_cache: Arc::new(Mutex::new(NativeHistoryCache::default())),
             idle_downstreams: Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
-            client: upstream_http_client_builder()
-                .build()
+            // 系统证书与代理配置加载是同步操作，不占用路由的异步工作线程。
+            client: tokio::task::spawn_blocking(|| upstream_http_client_builder().build())
+                .await
+                .context("创建 Codey 本地路由 HTTP 客户端任务异常退出")?
                 .context("创建 Codey 本地路由 HTTP 客户端失败")?,
             proxied_clients: Mutex::new(HashMap::new()),
             official_auth_path,
@@ -834,8 +836,8 @@ impl RouterSnapshot {
                 raw_models
                     .entry(model_id::key(&model))
                     .or_default()
-                    .push(alias_target.clone());
-                target.models.insert(model.clone());
+                    .push(alias_target);
+                target.models.insert(model);
             }
             let route_rank = target
                 .official_account
@@ -897,12 +899,13 @@ impl RouterSnapshot {
         }
         let model = model.trim();
         if !model.is_empty() {
-            if let Some(alias) = self.aliases.get(&model_id::key(model)) {
+            let model_key = model_id::key(model);
+            if let Some(alias) = self.aliases.get(&model_key) {
                 return self
                     .target_for_route_model(&alias.provider_id, &alias.model, model)
                     .map(|selection| selection.route);
             }
-            if let Some(candidates) = self.raw_models.get(&model_id::key(model)) {
+            if let Some(candidates) = self.raw_models.get(&model_key) {
                 if candidates.len() > 1 {
                     anyhow::bail!("模型 {model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
                 }
@@ -936,15 +939,14 @@ impl RouterSnapshot {
         if requested_model.is_empty() {
             anyhow::bail!("请求缺少 model 字段");
         }
-        if let Some(alias) = self.aliases.get(&model_id::key(requested_model)) {
+        let requested_key = model_id::key(requested_model);
+        if let Some(alias) = self.aliases.get(&requested_key) {
             // A qualified `provider/model` selector already identifies the
             // route. Codex can replay client metadata from an earlier turn, so
             // an independent route hint must not redirect an explicit alias.
             return self.target_for_route_model(&alias.provider_id, &alias.model, requested_model);
         }
-        if !self
-            .raw_models
-            .contains_key(&model_id::key(requested_model))
+        if !self.raw_models.contains_key(&requested_key)
             && let Some(source_model) =
                 model_id::historical_source(requested_model, &self.model_alias_history)
         {

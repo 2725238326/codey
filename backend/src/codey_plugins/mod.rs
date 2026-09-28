@@ -63,6 +63,7 @@ where
     T::deserialize(deserializer).map(Some)
 }
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -656,8 +657,13 @@ impl Manager {
         }
         let state_path = root.join("state.json");
         let state: State = if state_path.exists() {
-            let bytes = fs::read(&state_path).map_err(|e| e.to_string())?;
-            if bytes.len() > 16 * 1024 * 1024 {
+            let mut bytes = Vec::new();
+            fs::File::open(&state_path)
+                .map_err(|e| e.to_string())?
+                .take(MAX_STATE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > MAX_STATE_BYTES {
                 return Err("插件状态文件过大".into());
             }
             serde_json::from_slice(&bytes).map_err(|e| format!("插件状态损坏: {e}"))?
@@ -1406,6 +1412,29 @@ fn checked_child_directory(parent: &Path, name: &str, create: bool) -> Result<Pa
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn state_file_read_preserves_the_size_limit_and_does_not_rewrite_input() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        let mut state = vec![b' '; MAX_STATE_BYTES as usize];
+        state[..2].copy_from_slice(b"{}");
+        fs::write(&path, &state).unwrap();
+        assert!(
+            Manager::open(root.path().into())
+                .unwrap()
+                .state
+                .plugins
+                .is_empty()
+        );
+
+        state.push(b' ');
+        fs::write(&path, &state).unwrap();
+        assert!(
+            matches!(Manager::open(root.path().into()), Err(error) if error == "插件状态文件过大")
+        );
+        assert_eq!(fs::read(&path).unwrap(), state);
+    }
 
     #[test]
     fn config_comments_are_removed_recursively_without_changing_business_values() {

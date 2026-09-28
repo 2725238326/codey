@@ -399,7 +399,6 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
 pub(super) async fn launch_codey_inner(state: &Arc<AppState>) -> Result<Value, String> {
     ensure_runtime_can_start(state)?;
     let _operation = state.runtime_operation.lock().await;
-    ensure_runtime_can_start(state)?;
     launch_codey_inner_locked(state).await
 }
 

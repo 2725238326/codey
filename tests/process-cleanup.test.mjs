@@ -75,11 +75,7 @@ test("startup stops the old Codex before permanent session maintenance", async (
   );
   const storagePreparation = launcher.slice(
     launcher.indexOf("async fn prepare_startup_storage("),
-    launcher.indexOf("async fn prepare_runtime_provider_state("),
-  );
-  const providerPreparation = launcher.slice(
-    launcher.indexOf("async fn prepare_runtime_provider_state("),
-    launcher.indexOf("async fn prepare_startup_patches_and_overlay("),
+    launcher.indexOf("fn native_subagent_model("),
   );
   const stopOldCodex = storagePreparation.indexOf(
     "prepare_codex_for_launch(&app_dir).await?",
@@ -88,12 +84,13 @@ test("startup stops the old Codex before permanent session maintenance", async (
     "run_startup_session_maintenance",
   );
   const storagePhase = startup.indexOf("prepare_startup_storage");
-  const providerPhase = startup.indexOf("prepare_runtime_provider_state");
-  const protocolProxy = providerPreparation.indexOf("start_runtime_protocol_proxy");
+  const providerPhase = startup.indexOf("prepare_codex_startup_state");
 
   assert.notEqual(stopOldCodex, -1);
   assert.notEqual(permanentMaintenance, -1);
-  assert.equal(protocolProxy, -1);
+  assert.notEqual(storagePhase, -1);
+  assert.notEqual(providerPhase, -1);
+  assert.doesNotMatch(launcher, /start_runtime_protocol_proxy/);
   assert.ok(
     stopOldCodex < permanentMaintenance,
     "the old Codex writer must stop before session files are maintained",

@@ -54,7 +54,7 @@ pub(crate) fn normalize_identifier(value: &str) -> String {
     value
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
+        .map(|character| character.to_ascii_lowercase())
         .collect()
 }
 
@@ -63,7 +63,7 @@ pub(crate) fn classify_agent_status(value: &Value) -> AgentState {
         Value::String(value) => match normalize_identifier(value).as_str() {
             "pending" | "pendinginit" => AgentState::PendingInit,
             "running" | "live" | "interrupted" => AgentState::Live,
-            value if is_terminal_value(value) => AgentState::Terminal,
+            value if terminal_outcome_from_identifier(value).is_some() => AgentState::Terminal,
             _ => AgentState::Unknown,
         },
         Value::Object(values) if object_reports_terminal(values) => AgentState::Terminal,

@@ -149,8 +149,7 @@ fn read_codex_installation_id(codex_home: &Path) -> Option<String> {
 }
 
 pub async fn optimize_prompt_command(state: &Arc<AppState>, text: String) -> Result<Value, String> {
-    let config = state.config.read().await.clone();
-    let optimization = config.prompt_optimization.clone();
+    let optimization = state.config.read().await.prompt_optimization.clone();
     if !optimization.enabled {
         return Err("提示词优化尚未启用，请先在 Codey 控制台开启".to_string());
     }
@@ -180,9 +179,9 @@ pub async fn fetch_prompt_optimization_models_command(
     state: &Arc<AppState>,
     draft: Option<PromptOptimizationConfig>,
 ) -> Result<Value, String> {
-    let config = state.config.read().await.clone();
-    let mut optimization = draft.unwrap_or_else(|| config.prompt_optimization.clone());
-    optimization.merge_redacted_secrets(&config.prompt_optimization);
+    let saved_optimization = state.config.read().await.prompt_optimization.clone();
+    let mut optimization = draft.unwrap_or_else(|| saved_optimization.clone());
+    optimization.merge_redacted_secrets(&saved_optimization);
     // 获取列表不需要预先选择模型，连接参数由后续请求流程校验。
     let uses_codey_route = optimization.uses_codey_route();
     let request_config = resolve_request_config(state, &optimization).await?;
@@ -209,9 +208,9 @@ pub async fn test_prompt_optimization_command(
     state: &Arc<AppState>,
     draft: Option<PromptOptimizationConfig>,
 ) -> Result<Value, String> {
-    let config = state.config.read().await.clone();
-    let mut optimization = draft.unwrap_or_else(|| config.prompt_optimization.clone());
-    optimization.merge_redacted_secrets(&config.prompt_optimization);
+    let saved_optimization = state.config.read().await.prompt_optimization.clone();
+    let mut optimization = draft.unwrap_or_else(|| saved_optimization.clone());
+    optimization.merge_redacted_secrets(&saved_optimization);
     optimization.validate()?;
     let uses_codey_route = optimization.uses_codey_route();
     let request_config = resolve_request_config(state, &optimization).await?;

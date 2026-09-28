@@ -50,17 +50,6 @@ impl fmt::Display for ModelListBodyError {
     }
 }
 
-#[derive(Debug)]
-struct OptimizedResponseError {
-    message: String,
-}
-
-impl OptimizedResponseError {
-    fn fatal(message: String) -> Self {
-        Self { message }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ResolvedPromptOptimizationConfig {
     pub base_url: String,
@@ -553,16 +542,12 @@ pub async fn optimize_prompt_resolved(
         && let Some(v1_endpoint) = v1_retry_endpoint(base_url, protocol)
     {
         let v1_response = post_optimization_request(client, &v1_endpoint, config, &payload).await?;
-        return parse_optimized_response(v1_response, &v1_endpoint, config, protocol)
-            .await
-            .map_err(|error| error.message);
+        return parse_optimized_response(v1_response, &v1_endpoint, config, protocol).await;
     }
 
     // A successful HTTP response may already represent a billed generation.
     // Invalid output is not evidence that trying another URL is safe.
-    parse_optimized_response(response, &endpoint, config, protocol)
-        .await
-        .map_err(|error| error.message)
+    parse_optimized_response(response, &endpoint, config, protocol).await
 }
 
 /// Sends a minimal Responses request to verify connectivity and
@@ -702,19 +687,17 @@ async fn parse_optimized_response(
     endpoint: &str,
     config: &ResolvedPromptOptimizationConfig,
     protocol: OptimizationUpstreamProtocol,
-) -> Result<String, OptimizedResponseError> {
+) -> Result<String, String> {
     let status = response.status().as_u16();
     if status >= 400 {
         let detail = sanitize_resolved_error(
-            &response_body_preview(response, config.api_key.trim())
-                .await
-                .map_err(OptimizedResponseError::fatal)?,
+            &response_body_preview(response, config.api_key.trim()).await?,
             config,
         );
         let detail: String = detail.chars().take(200).collect();
-        return Err(OptimizedResponseError::fatal(format!(
+        return Err(format!(
             "优化 API 请求失败（HTTP {status}，{endpoint}）：{detail}"
-        )));
+        ));
     }
     let body = read_bounded_body(
         response,
@@ -722,8 +705,7 @@ async fn parse_optimized_response(
         "优化 API 响应",
         config.api_key.trim(),
     )
-    .await
-    .map_err(OptimizedResponseError::fatal)?;
+    .await?;
     let body = strip_utf8_bom(&body);
     if protocol == OptimizationUpstreamProtocol::OpenAiResponses
         && config.response_stream == Some(true)
@@ -731,15 +713,11 @@ async fn parse_optimized_response(
     {
         let optimized = extract_responses_stream_optimized_text(body).map_err(|error| {
             let preview = sanitize_resolved_error(&error, config);
-            OptimizedResponseError::fatal(format!(
-                "优化 API 流式响应无法解析（{endpoint}）：{preview}"
-            ))
+            format!("优化 API 流式响应无法解析（{endpoint}）：{preview}")
         })?;
         let optimized = optimized.trim();
         if optimized.is_empty() {
-            return Err(OptimizedResponseError::fatal(format!(
-                "优化 API 流式响应没有返回文本内容（{endpoint}）"
-            )));
+            return Err(format!("优化 API 流式响应没有返回文本内容（{endpoint}）"));
         }
         return Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect());
     }
@@ -768,7 +746,7 @@ fn optimized_text_from_json_body(
     endpoint: &str,
     config: &ResolvedPromptOptimizationConfig,
     protocol: OptimizationUpstreamProtocol,
-) -> Result<String, OptimizedResponseError> {
+) -> Result<String, String> {
     let value: Value = serde_json::from_slice(body).map_err(|_| {
         let preview = sanitize_resolved_error(String::from_utf8_lossy(body).trim(), config);
         let preview: String = preview.chars().take(200).collect();
@@ -777,26 +755,22 @@ fn optimized_text_from_json_body(
         } else {
             preview
         };
-        OptimizedResponseError::fatal(format!(
-            "优化 API 返回的不是有效 JSON（{endpoint}）。响应摘要：{preview}"
-        ))
+        format!("优化 API 返回的不是有效 JSON（{endpoint}）。响应摘要：{preview}")
     })?;
     if protocol == OptimizationUpstreamProtocol::OpenAiResponses
         && let Some(failure) = responses_terminal_error_message(&value)
     {
         let failure = sanitize_resolved_error(&failure, config);
         let failure: String = failure.chars().take(200).collect();
-        return Err(OptimizedResponseError::fatal(format!(
+        return Err(format!(
             "优化 API 返回了未成功完成的响应（{endpoint}）：{failure}"
-        )));
+        ));
     }
     let optimized = extract_optimized_text(&value, protocol)
         .ok_or_else(|| missing_optimized_text_error(&value, endpoint, protocol, config))?;
     let optimized = optimized.trim();
     if optimized.is_empty() {
-        return Err(OptimizedResponseError::fatal(format!(
-            "优化 API 返回了空的优化结果（{endpoint}）"
-        )));
+        return Err(format!("优化 API 返回了空的优化结果（{endpoint}）"));
     }
     Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect())
 }
@@ -811,11 +785,9 @@ fn missing_optimized_text_error(
     endpoint: &str,
     protocol: OptimizationUpstreamProtocol,
     config: &ResolvedPromptOptimizationConfig,
-) -> OptimizedResponseError {
+) -> String {
     let detail = sanitize_resolved_error(&missing_text_detail(value, protocol), config);
-    OptimizedResponseError::fatal(format!(
-        "优化 API 响应中缺少优化结果（{endpoint}）：{detail}"
-    ))
+    format!("优化 API 响应中缺少优化结果（{endpoint}）：{detail}")
 }
 
 fn missing_text_detail(value: &Value, protocol: OptimizationUpstreamProtocol) -> String {
@@ -867,7 +839,18 @@ fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String
     let mut cursor = 0;
     let mut text = String::new();
     let mut final_text = None;
-    while let Some(frame) = take_next_sse_frame(body, &mut cursor) {
+    while cursor < body.len() {
+        let (frame, trailing) = match take_next_sse_frame(body, &mut cursor) {
+            Some(frame) => (frame, false),
+            None => {
+                let frame = &body[cursor..];
+                cursor = body.len();
+                (frame, true)
+            }
+        };
+        if frame.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
         let Some(data) = sse_frame_data(frame)? else {
             continue;
         };
@@ -875,8 +858,10 @@ fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
-        let event: Value = serde_json::from_str(data)
-            .map_err(|error| format!("Responses SSE data 不是有效 JSON：{error}"))?;
+        let event: Value = serde_json::from_str(data).map_err(|error| {
+            let position = if trailing { "末尾 data" } else { "data" };
+            format!("Responses SSE {position} 不是有效 JSON：{error}")
+        })?;
         if let Some(message) = responses_stream_error_message(&event) {
             return Err(message);
         }
@@ -901,23 +886,6 @@ fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String
                 }
             }
             _ => {}
-        }
-    }
-    if !body[cursor..].iter().all(u8::is_ascii_whitespace)
-        && let Some(data) = sse_frame_data(&body[cursor..])?
-    {
-        let data = data.trim();
-        if !data.is_empty() && data != "[DONE]" {
-            let event: Value = serde_json::from_str(data)
-                .map_err(|error| format!("Responses SSE 末尾 data 不是有效 JSON：{error}"))?;
-            if let Some(message) = responses_stream_error_message(&event) {
-                return Err(message);
-            }
-            if event.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
-                && let Some(delta) = event.get("delta").and_then(Value::as_str)
-            {
-                text.push_str(delta);
-            }
         }
     }
     if text.is_empty() {
@@ -1953,6 +1921,24 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_handles_trailing_events_consistently() {
+        for event in [
+            json!({"type": "response.output_text.delta", "delta": "优化结果"}),
+            json!({"type": "response.output_text.done", "text": "优化结果"}),
+            json!({"type": "response.completed", "response": {"output_text": "优化结果"}}),
+        ] {
+            for ending in ["", "\n", "\n\n", "\r\n\r\n"] {
+                let body = format!("data: {event}{ending}");
+                assert_eq!(
+                    extract_responses_stream_optimized_text(body.as_bytes()).unwrap(),
+                    "优化结果",
+                    "{body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn responses_json_and_sse_reject_the_same_terminal_failures() {
         let endpoint = "https://relay.test/v1/responses";
         let config = ResolvedPromptOptimizationConfig::from_custom(&configured());
@@ -1989,11 +1975,7 @@ mod tests {
                 OptimizationUpstreamProtocol::OpenAiResponses,
             )
             .unwrap_err();
-            assert!(
-                json_error.message.contains(detail),
-                "{}",
-                json_error.message
-            );
+            assert!(json_error.contains(detail), "{json_error}");
             let sse = format!(
                 "data: {}\n\n",
                 json!({"type":event_type,"response":failure})
