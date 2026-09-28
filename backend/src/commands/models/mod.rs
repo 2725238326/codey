@@ -204,7 +204,7 @@ pub(super) async fn invoke(
                 Ok(_context_models),
                 Ok(enabled),
                 Ok(show_usage),
-                Ok(_model_contexts),
+                Ok(model_contexts),
                 Ok(upstream_proxy),
             ) => {
                 match (
@@ -219,6 +219,7 @@ pub(super) async fn invoke(
                             OfficialRouteModelSave {
                                 route_id,
                                 models,
+                                model_contexts,
                                 enabled,
                                 show_account_usage: show_usage,
                                 upstream_proxy,

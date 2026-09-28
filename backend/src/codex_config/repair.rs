@@ -698,6 +698,7 @@ mod tests {
         apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                model_contexts: None,
                 stream_max_retries: 5,
                 local_router: None,
                 use_official_catalog: false,

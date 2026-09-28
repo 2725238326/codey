@@ -22,6 +22,11 @@ fn refresh_model_catalog_or_fallback_at(
     config: &CodeyConfig,
     home: &std::path::Path,
 ) -> Result<ModelCatalogRefresh, String> {
+    crate::codex_config::validate_runtime_model_contexts(
+        home,
+        &config.runtime_enabled_model_contexts(),
+    )
+    .map_err(|error| error.to_string())?;
     let snapshot = model_catalog::snapshot(home).map_err(|error| error.to_string())?;
     let native_web_search_models = config.runtime_native_web_search_model_aliases();
     let image_detail_original_models = config.runtime_image_detail_original_model_aliases();
@@ -399,6 +404,71 @@ mod tests {
                 .as_ref()
                 .is_some_and(|refresh| refresh.fallback)
         );
+    }
+
+    #[test]
+    fn custom_context_save_validates_user_catalog_before_mutating_runtime_files() {
+        let home = tempfile::tempdir().unwrap();
+        let config = config_with_custom_context();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_catalog_json = 'custom.json'\n",
+        )
+        .unwrap();
+        let source = home.path().join("custom.json");
+        std::fs::write(&source, br#"{"models":[{"slug":"other-model"}]}"#).unwrap();
+        let runtime = home.path().join(model_catalog::relative_path());
+        std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        std::fs::write(&runtime, b"previous catalog").unwrap();
+        let error = refresh_model_catalog_or_fallback_at(&config, home.path())
+            .err()
+            .unwrap();
+        assert!(error.contains("缺少已启用的预算模型"), "{error}");
+        assert_eq!(std::fs::read(&runtime).unwrap(), b"previous catalog");
+        assert!(
+            !home
+                .path()
+                .join("model-catalogs/context-overrides")
+                .exists()
+        );
+        let custom = br#"{"models":[{"slug":"gpt-5.6-sol","context_window":1000000}]}"#;
+        std::fs::write(&source, custom).unwrap();
+        std::fs::write(home.path().join("models_cache.json"), serde_json::to_vec(&json!({
+            "models": [{"slug": "gpt-5.6-sol", "description": "Test model", "base_instructions": "Test instructions"}]
+        })).unwrap()).unwrap();
+        assert!(refresh_model_catalog_or_fallback_at(&config, home.path()).is_ok());
+        assert_eq!(std::fs::read(&source).unwrap(), custom);
+        assert!(
+            !home
+                .path()
+                .join("model-catalogs/context-overrides")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn custom_context_overlay_only_requires_enabled_models() {
+        let mut config = config_with_custom_context();
+        let policy = config.model_context_by_provider["openai"]["gpt-5.6-sol"].clone();
+        config
+            .model_context_by_provider
+            .get_mut("openai")
+            .unwrap()
+            .insert("gpt-5.5".into(), policy);
+        assert_eq!(config.runtime_model_contexts().len(), 2);
+        assert_eq!(
+            config
+                .runtime_enabled_model_contexts()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol"]
+        );
+        config.profiles[0].enabled = false;
+        assert!(config.runtime_enabled_model_contexts().is_empty());
+        config.profiles[0].enabled = true;
+        config.local_router_enabled = false;
+        assert!(config.runtime_enabled_model_contexts().is_empty());
     }
 
     #[tokio::test]

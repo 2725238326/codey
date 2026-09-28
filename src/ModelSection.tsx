@@ -24,6 +24,7 @@ import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAcco
 import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { ModelCombobox } from "./components/ModelCombobox";
+import { ModelSettingsFields } from "./components/ModelSettingsFields";
 import type { SubagentModelOption } from "./subagentModels";
 import {
   Badge,
@@ -90,7 +91,7 @@ type ModelSectionProps = {
     models: string[],
     showAccountUsageInHeader: boolean,
     enabled: boolean,
-    modelContexts: Record<string, ModelContextConfig>,
+    modelContexts: Record<string, ModelContextConfig> | undefined,
     upstreamProxy?: string,
     routeSettings?: {
       accountId: string;
@@ -260,6 +261,8 @@ function ModelSectionComponent({
   const [headerDialogProfile, setHeaderDialogProfile] = useState<Profile | null>(null);
   const [headerError, setHeaderError] = useState("");
   const [officialModelDraft, setOfficialModelDraft] = useState<string[]>([]);
+  const [officialModelContextDraft, setOfficialModelContextDraft] =
+    useState<Record<string, ModelContextConfig>>({});
   const [officialAccounts, setOfficialAccounts] = useState<OfficialAccount[] | null>(null);
   // 脱敏只作用于当前页面显示，每次进入页面默认关闭。
   const [maskSensitive, setMaskSensitive] = useState(false);
@@ -520,8 +523,12 @@ function ModelSectionComponent({
       setOfficialModelDraft(
         uniqueModelIds(enabledModels.length > 0 ? enabledModels : officialCatalog),
       );
+      setOfficialModelContextDraft(
+        config.modelContextByProvider?.[providerId] || {},
+      );
     } else {
       setOfficialModelDraft([]);
+      setOfficialModelContextDraft({});
     }
     setOfficialDialogScope(official ? officialScope : null);
     setRouteDialogOpen(true);
@@ -605,7 +612,7 @@ function ModelSectionComponent({
               officialDialogScope === "models" ? officialModelDraft : currentOfficialModels,
               showAccountUsageInHeader,
               routeDraft.enabled !== false,
-              {},
+              officialDialogScope === "models" ? officialModelContextDraft : undefined,
               upstreamProxy,
               savingOfficialSettings && accountId && officialRouteDraft
                 ? {
@@ -1423,7 +1430,26 @@ function ModelSectionComponent({
                                 </strong>
                                 <small>{model}</small>
                               </span>
-
+                              {!routeConfigReadOnly && (
+                                <ModelSettingsFields
+                                  model={model}
+                                  disabled={isBusy}
+                                  policy={Object.entries(officialModelContextDraft).find(
+                                    ([candidate]) => modelIdsEqual(candidate, model),
+                                  )?.[1]}
+                                  onChange={(policy) => {
+                                    setOfficialModelContextDraft((current) => {
+                                      const next = Object.fromEntries(
+                                        Object.entries(current).filter(
+                                          ([candidate]) => !modelIdsEqual(candidate, model),
+                                        ),
+                                      );
+                                      if (policy) next[model] = policy;
+                                      return next;
+                                    });
+                                  }}
+                                />
+                              )}
                             </div>
                           );
                         })}

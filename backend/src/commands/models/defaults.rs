@@ -53,11 +53,11 @@ pub async fn save_default_model(
     })))
 }
 
-// 入口层仍解析 reasoningEfforts / modelContexts 参数，官方线路不接受这两类
-// 变更，所以不再传入本函数。
+// 官方模型允许调整本地上下文预算，思考强度仍沿用官方目录。
 pub struct OfficialRouteModelSave {
     pub route_id: String,
     pub models: Vec<String>,
+    pub model_contexts: Option<BTreeMap<String, crate::config::ModelContextConfig>>,
     pub enabled: Option<bool>,
     pub show_account_usage: Option<bool>,
     pub upstream_proxy: Option<String>,
@@ -74,6 +74,7 @@ pub async fn save_official_route_models(
     let OfficialRouteModelSave {
         route_id,
         models: requested_models,
+        model_contexts: requested_model_contexts,
         enabled: requested_enabled,
         show_account_usage: requested_show_account_usage,
         upstream_proxy: requested_upstream_proxy,
@@ -128,8 +129,13 @@ pub async fn save_official_route_models(
         .filter(|models| !models.is_empty())
         .cloned()
         .unwrap_or_else(model_catalog::default_official_model_slugs);
-    // 官方线路不接受上下文预算或思考强度声明变更，保留已有配置。
     let selected_models = ordered_official_selection(&official_models, &requested_models)?;
+    set_model_contexts(
+        &mut config,
+        &provider_id,
+        requested_model_contexts.as_ref(),
+        &official_models,
+    )?;
     config
         .selected_models_by_provider
         .insert(provider_id, selected_models);

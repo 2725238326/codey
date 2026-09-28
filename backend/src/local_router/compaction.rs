@@ -738,8 +738,12 @@ pub(crate) fn validate_compaction_result(value: &Value, v2: bool) -> Result<()> 
     // length cannot establish token count or semantic quality; Codex rechecks
     // the target model budget before installing/sending its history.
     bounded_json_bytes(value, MAX_REQUEST_BYTES)?;
-    if v2 && value.get("status").and_then(Value::as_str) != Some("completed") {
+    let status = value.get("status");
+    if (v2 || status.is_some()) && status.and_then(Value::as_str) != Some("completed") {
         anyhow::bail!("远程压缩未成功完成");
+    }
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        anyhow::bail!("远程压缩返回错误");
     }
     let output = value
         .get("output")
@@ -1406,6 +1410,36 @@ mod tests {
         assert!(CompactionGuard::acquire(&bindings, vec!["thread:a".into()]).is_ok());
         drop(other);
         assert!(bindings.lock().unwrap().compacting.is_empty());
+    }
+
+    #[test]
+    fn compaction_rejects_explicit_failure_for_both_protocol_versions() {
+        let output = json!([
+            {"type":"message","role":"user","content":"retained history"},
+            {"type":"compaction","encrypted_content":"opaque"}
+        ]);
+        let legacy = json!({"object":"response.compaction","output":output});
+        assert!(validate_compaction_result(&legacy, false).is_ok());
+        assert!(validate_compaction_result(&legacy, true).is_err());
+        for v2 in [false, true] {
+            let completed = json!({"status":"completed","error":null,"output":output});
+            assert!(validate_compaction_result(&completed, v2).is_ok());
+            for status in ["failed", "incomplete", "in_progress", "cancelled"] {
+                let failed = json!({"status":status,"output":output});
+                assert!(
+                    validate_compaction_result(&failed, v2).is_err(),
+                    "accepted {status}, v2={v2}"
+                );
+            }
+            let failed = json!({
+                "status":"completed","output":output,
+                "error":{"code":"server_error","message":"failed"}
+            });
+            assert!(
+                validate_compaction_result(&failed, v2).is_err(),
+                "accepted error, v2={v2}"
+            );
+        }
     }
 
     #[test]

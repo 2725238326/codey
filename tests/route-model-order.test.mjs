@@ -104,6 +104,7 @@ const modelSection = createModuleGraph(new URL("../src/ModelSection.tsx", import
     "@tabler/icons-react": icons,
     "./api": { invoke: async () => ({}) },
     "./components/ModelCombobox": autoStubModule("combobox"),
+    "./components/ModelSettingsFields": autoStubModule("model-settings"),
     "./components/ui": ui,
     "./OfficialAccountsPanel": autoStubModule("official-accounts"),
     "./overlayTheme": { readHostTheme: () => "light" },
@@ -300,4 +301,44 @@ test("控制台通过带版本号的排序命令保存模型顺序", async () =>
   );
   assert.match(app, /if \(!config \|\| dirty \|\| isBusy \|\| !config\.localRouterEnabled\) return;\s*const route = config\.profiles\.find\(\(profile\) => profile\.id === routeId\);/);
   assert.match(api, /"reorder_route_models",/);
+});
+
+test("保存官方连接设置时省略上下文更新，保留已有模型预算", () => {
+  const calls = [];
+  const { props } = modelSectionProps({
+    onSaveOfficialRouteSettings: async (...args) => { calls.push(args); return false; },
+  });
+  const model = "gpt-5.6-sol";
+  const profile = {
+    ...props.config.profiles[0],
+    name: "官方账号",
+    officialAccount: true, authMode: "officialAccount",
+    sourceProviderId: "official-provider", officialAccountId: "account-a",
+    baseUrl: "",
+  };
+  props.config.profiles = [profile];
+  props.config.selectedModelsByProvider = { "official-provider": [model] };
+  props.config.modelContextByProvider = {
+    "official-provider": { [model]: { contextWindowTokens: 128_000 } },
+  };
+  props.modelState = {
+    ...props.modelState,
+    officialModelIds: [model], officialModels: [{ slug: model, supported: true }],
+  };
+  modelSection.reset();
+  let tree = modelSection.exports.ModelSection(props);
+  const edit = collectElements(tree, (element) =>
+    elementProps(element)["aria-label"] === "编辑线路 官方账号")[0];
+  assert.ok(edit);
+  elementProps(edit).onClick();
+  modelSection.restart();
+  tree = modelSection.exports.ModelSection(props);
+  const save = collectElements(tree, (element) =>
+    typeof elementProps(element).onClick === "function" && textContent(element) === "保存线路")[0];
+  assert.ok(save);
+  elementProps(save).onClick();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], profile.id);
+  assert.deepEqual(calls[0][1], [model]);
+  assert.equal(calls[0][4], undefined);
 });

@@ -60,6 +60,88 @@ fn model_context_policy_validates_budgets_membership_and_restart() {
 }
 
 #[test]
+fn official_context_budgets_remain_route_scoped_and_support_reset() {
+    use crate::config::{AUTH_MODE_OFFICIAL_ACCOUNT, ModelContextConfig};
+    let model = "gpt-5.6-sol";
+    let profiles = ["a", "b"].map(|id| {
+        let mut profile = ProviderProfile::new(id);
+        profile.id = format!("account-{id}");
+        profile.source_provider_id = Some(format!("provider-{id}"));
+        profile.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        profile.official_account = true;
+        profile.official_account_id = Some(id.into());
+        profile
+    });
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        active_profile_id: profiles[0].id.clone(),
+        profiles: profiles.to_vec(),
+        upstream_models_by_provider: ["provider-a", "provider-b"]
+            .map(|provider| (provider.into(), vec![model.into()]))
+            .into(),
+        ..CodeyConfig::default()
+    };
+    let first = ModelContextConfig {
+        context_window_tokens: 128_000,
+        auto_compact_token_limit: Some(100_000),
+        reserve_output_tokens: Some(16_000),
+    };
+    let second = ModelContextConfig {
+        context_window_tokens: 64_000,
+        auto_compact_token_limit: Some(50_000),
+        reserve_output_tokens: Some(8_000),
+    };
+    for (provider, policy) in [("provider-a", &first), ("provider-b", &second)] {
+        set_model_contexts(
+            &mut config,
+            provider,
+            Some(&BTreeMap::from([(model.to_uppercase(), policy.clone())])),
+            &[model.into()],
+        )
+        .unwrap();
+    }
+    config = config.normalize();
+    assert_eq!(config.model_context("provider-a", model), Some(&first));
+    assert_eq!(config.model_context("provider-b", model), Some(&second));
+    let runtime = config.runtime_model_contexts();
+    assert_eq!(runtime.len(), 2);
+    assert_eq!(config.runtime_enabled_model_contexts(), runtime);
+    assert_eq!(
+        runtime[&local_router::model_alias("provider-a", model)],
+        first
+    );
+    assert_eq!(
+        runtime[&local_router::model_alias("provider-b", model)],
+        second
+    );
+
+    let saved = config.model_context_by_provider.clone();
+    set_model_contexts(&mut config, "provider-a", None, &[model.into()]).unwrap();
+    assert_eq!(config.model_context_by_provider, saved);
+    let invalid = BTreeMap::from([("unknown-model".into(), first.clone())]);
+    assert!(
+        set_model_contexts(&mut config, "provider-a", Some(&invalid), &[model.into()]).is_err()
+    );
+    assert_eq!(config.model_context_by_provider, saved);
+
+    config.profiles[1].enabled = false;
+    assert_eq!(config.runtime_enabled_model_contexts().len(), 1);
+    assert_eq!(
+        config.runtime_model_contexts(),
+        BTreeMap::from([(model.into(), first)])
+    );
+    set_model_contexts(
+        &mut config,
+        "provider-a",
+        Some(&BTreeMap::new()),
+        &[model.into()],
+    )
+    .unwrap();
+    assert!(config.runtime_model_contexts().is_empty());
+    assert_eq!(config.model_context("provider-b", model), Some(&second));
+}
+
+#[test]
 fn reasoning_effort_declaration_validates_membership_and_sync_preserves_intersection() {
     use crate::config::ModelReasoningEffort;
     let home = tempfile::tempdir().unwrap();

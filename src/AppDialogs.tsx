@@ -205,7 +205,7 @@ function ModelPickerDialogComponent({
           <DialogTitle>配置当前线路支持的模型</DialogTitle>
           <DialogDescription>
             {officialOnly
-              ? "列出当前官方账号可用的全部模型。勾选后才会出现在线路模型列表中，不能添加模型或修改模型参数。"
+              ? "列出当前官方账号可用的全部模型。勾选后才会出现在线路模型列表中；启用本地路由后可调整模型上下文预算。"
               : modelState.officialModels.length > 0
                 ? "请选择本次官方账号登录可用的模型。"
               : "请选择同步到的线路模型，或手动输入当前线路支持的模型 ID。"}
@@ -323,7 +323,7 @@ function ModelPickerDialogComponent({
                     <strong className="break-words text-xs font-semibold text-[var(--codey-text,#1d1d1f)]">{model.displayName}</strong>
                     <small className="break-words text-[11px] text-[var(--codey-subtle,#86868b)]">{model.slug}</small>
                   </div>
-                  {!routeConfigReadOnly && !officialOnly && <ModelSettingsFields model={model.slug} policy={draftModelContexts[model.slug]} disabled={isBusy}
+                  {!routeConfigReadOnly && <ModelSettingsFields model={model.slug} policy={draftModelContexts[model.slug]} disabled={isBusy}
                     onChange={(policy) => onUpdateDraftModelContext(model.slug, policy)} />}
                 </div>
               ))}

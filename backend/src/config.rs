@@ -1335,6 +1335,29 @@ impl CodeyConfig {
             .collect()
     }
 
+    /// 运行时覆盖仅针对启用的模型；未勾选模型的预算仍保留在配置里。
+    pub(crate) fn runtime_enabled_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
+        if !self.local_router_enabled {
+            return BTreeMap::new();
+        }
+        let policies = self
+            .runtime_plugin_model_contexts()
+            .into_iter()
+            .chain(self.runtime_model_contexts())
+            .map(|(model, policy)| (model_id::key(&model), policy))
+            .collect::<BTreeMap<_, _>>();
+        self.runtime_catalog_models()
+            .1
+            .into_iter()
+            .filter_map(|model| {
+                policies
+                    .get(&model_id::key(&model))
+                    .cloned()
+                    .map(|policy| (model, policy))
+            })
+            .collect()
+    }
+
     /// Declared thinking levels keyed by the runtime catalog id of each model.
     pub(crate) fn runtime_model_reasoning_efforts(
         &self,

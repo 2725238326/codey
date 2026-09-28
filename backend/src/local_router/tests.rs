@@ -8272,6 +8272,9 @@ async fn invalid_compaction_result_does_not_prevent_a_later_valid_request() {
     let upstream_task = tokio::spawn(async move {
         for value in [
             json!({"output":[{"type":"message","content":"not a compaction"}]}),
+            json!({"status":"failed","output":[{"type":"compaction","encrypted_content":"failed"}]}),
+            json!({"status":"incomplete","output":[{"type":"compaction","encrypted_content":"partial"}]}),
+            json!({"status":"completed","error":{"code":"server_error"},"output":[{"type":"compaction","encrypted_content":"failed"}]}),
             json!({"output":[{"type":"compaction","encrypted_content":"valid"}]}),
         ] {
             let (mut socket, _) = upstream.accept().await.unwrap();
@@ -8282,7 +8285,7 @@ async fn invalid_compaction_result_does_not_prevent_a_later_valid_request() {
     let router = LocalRouter::start(&config).await.unwrap();
     let endpoint = router.endpoint();
     let body = json!({"model":model_alias(&provider_id, &model),"input":"full context"});
-    for status in [502, 200] {
+    for status in [502, 502, 502, 502, 200] {
         let response = reqwest::Client::new()
             .post(format!("{}/responses/compact", endpoint.base_url))
             .bearer_auth(&endpoint.token)

@@ -220,6 +220,7 @@ impl Drop for RuntimeConfigLock {
 pub(crate) struct RuntimeRouterConfigOptions<'a> {
     pub local_router: Option<&'a RuntimeRouterEndpoint>,
     pub use_official_catalog: bool,
+    pub model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
     pub default_model: Option<&'a str>,
     pub fast_context_tools: bool,
     pub subagent_optimization: bool,
@@ -248,6 +249,7 @@ struct RouterApplyOptions<'a> {
     local_router: Option<&'a RuntimeRouterEndpoint>,
     stream_max_retries: u32,
     use_official_catalog: bool,
+    model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
     subagent_optimization: bool,
@@ -307,6 +309,7 @@ pub(crate) fn apply_runtime_router_config(
             local_router: options.local_router,
             stream_max_retries: options.stream_max_retries,
             use_official_catalog,
+            model_contexts: options.model_contexts,
             default_model,
             fastctx_command: fastctx_command.as_deref(),
             subagent_optimization,
@@ -387,6 +390,7 @@ fn apply_isolated_runtime_router_config(
         local_router,
         stream_max_retries,
         use_official_catalog,
+        model_contexts,
         default_model,
         fastctx_command,
         subagent_optimization,
@@ -524,7 +528,11 @@ fn apply_isolated_runtime_router_config(
     } else {
         (None, Vec::new())
     };
-    if let Some(path) = resolved_model_catalog_path(&effective_document, home) {
+    if let Some(path) = resolved_runtime_model_catalog_path(
+        &effective_document,
+        home,
+        local_router.and(model_contexts),
+    )? {
         effective_document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
     }
     let runtime_config_overrides = build_isolated_runtime_overrides(
@@ -646,6 +654,7 @@ fn apply_isolated_test_runtime_config(
             local_router: Some(test_runtime_router_endpoint()),
             stream_max_retries: 5,
             use_official_catalog,
+            model_contexts: None,
             default_model: None,
             fastctx_command,
             subagent_optimization,
@@ -2998,6 +3007,7 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
 pub(crate) fn runtime_model_catalog_path(
     home: &Path,
     use_codey_catalog: bool,
+    contexts: Option<&BTreeMap<String, crate::config::ModelContextConfig>>,
 ) -> Result<Option<PathBuf>> {
     let config_path = home.join("config.toml");
     let source = read_optional(&config_path)?.unwrap_or_default();
@@ -3005,7 +3015,39 @@ pub(crate) fn runtime_model_catalog_path(
     let mut document = parse_document(&source)?;
     let desired = use_codey_catalog.then(|| home.join(crate::model_catalog::relative_path()));
     update_model_catalog_reference(&mut document, &config_path, desired.as_deref());
-    Ok(resolved_model_catalog_path(&document, home))
+    resolved_runtime_model_catalog_path(&document, home, contexts)
+}
+
+fn resolved_runtime_model_catalog_path(
+    document: &DocumentMut,
+    home: &Path,
+    contexts: Option<&BTreeMap<String, crate::config::ModelContextConfig>>,
+) -> Result<Option<PathBuf>> {
+    let Some(source) = resolved_model_catalog_path(document, home) else {
+        return Ok(None);
+    };
+    let Some(contexts) = contexts.filter(|contexts| !contexts.is_empty()) else {
+        return Ok(Some(source));
+    };
+    if is_codey_owned_model_catalog_path(&source.to_string_lossy(), &home.join("config.toml")) {
+        return Ok(Some(source));
+    }
+    crate::model_catalog::prepare_context_catalog_overlay(home, &source, contexts).map(Some)
+}
+
+/// 保存前只验证，不写入目录副本；失败时配置和当前运行时均保持原样。
+pub(crate) fn validate_runtime_model_contexts(
+    home: &Path,
+    contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+) -> Result<()> {
+    if contexts.is_empty() {
+        return Ok(());
+    }
+    // 关闭 Codey 目录选择后，只会剩下用户自定义的目录引用。
+    if let Some(source) = runtime_model_catalog_path(home, false, None)? {
+        crate::model_catalog::render_context_catalog_overlay(&source, contexts)?;
+    }
+    Ok(())
 }
 
 fn resolved_model_catalog_path(document: &DocumentMut, home: &Path) -> Option<PathBuf> {

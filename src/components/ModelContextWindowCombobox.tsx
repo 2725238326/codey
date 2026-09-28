@@ -45,14 +45,15 @@ export function ModelContextWindowCombobox({
 
   const commit = (raw: string) => {
     setText(raw);
-    const digits = raw.replace(/[^0-9]/g, "");
-    if (!digits) {
+    const normalized = raw.trim();
+    if (!normalized) {
       onChange(undefined);
       return;
     }
-    const parsed = Number(digits);
+    if (!/^(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)$/.test(normalized)) return;
+    const parsed = Number(normalized.replace(/,/g, ""));
     if (
-      Number.isFinite(parsed) &&
+      Number.isSafeInteger(parsed) &&
       parsed >= MIN_CONTEXT_WINDOW_TOKENS &&
       parsed <= MAX_CONTEXT_WINDOW_TOKENS
     ) {

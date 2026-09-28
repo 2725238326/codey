@@ -640,8 +640,11 @@ fn validated_router_subagent_runtime_config(
     if !config.subagent_optimization {
         return Ok(config.clone());
     }
-    let catalog_path =
-        crate::codex_config::runtime_model_catalog_path(home, route_catalog_installed)?;
+    let catalog_path = crate::codex_config::runtime_model_catalog_path(
+        home,
+        route_catalog_installed,
+        Some(&config.runtime_enabled_model_contexts()),
+    )?;
     let runtime = router_subagent_runtime_config(config, catalog_path.is_some())?;
     if let Some(path) = catalog_path {
         model_catalog::validate_runtime_subagent_models(&path, &runtime.subagent_roles)?;
@@ -916,6 +919,7 @@ async fn prepare_codex_startup_state(
     let runtime_local_router = local_router.clone();
     let stream_max_retries = config.stream_max_retries;
     let runtime_default_model = runtime_default_model(config, use_official_catalog, &model_state);
+    let runtime_model_contexts = config.runtime_enabled_model_contexts();
     let fast_context_tools = config.fast_context_tools;
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
@@ -935,6 +939,7 @@ async fn prepare_codex_startup_state(
             RuntimeRouterConfigOptions {
                 local_router: Some(&runtime_local_router),
                 use_official_catalog,
+                model_contexts: Some(&runtime_model_contexts),
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
                 subagent_optimization,
@@ -1727,6 +1732,7 @@ async fn prepare_native_runtime_state(
             RuntimeRouterConfigOptions {
                 local_router: None,
                 use_official_catalog: false,
+                model_contexts: None,
                 default_model: None,
                 fast_context_tools,
                 subagent_optimization,

@@ -47,6 +47,7 @@ const modelSection = createModuleGraph(
       "@tabler/icons-react": icons,
       "./api": { invoke: async () => ({}) },
       "./components/ModelCombobox": autoStubModule("combobox"),
+      "./components/ModelSettingsFields": autoStubModule("model-settings"),
       "./components/ui": ui,
       "./OfficialAccountsPanel": autoStubModule("official-accounts"),
       "./overlayTheme": { readHostTheme: () => "light" },

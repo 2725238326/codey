@@ -665,6 +665,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: false,
@@ -775,6 +776,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -825,6 +827,7 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -1171,6 +1174,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
             use_official_catalog: false,
@@ -1195,7 +1199,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
     assert_eq!(resolved, home.join("models/custom.json"));
     assert_eq!(
         Some(resolved),
-        runtime_model_catalog_path(&home, false).unwrap()
+        runtime_model_catalog_path(&home, false, None).unwrap()
     );
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
@@ -1214,6 +1218,7 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
             use_official_catalog: false,
@@ -1240,6 +1245,88 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
 }
 
 #[test]
+fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(home.join("models")).unwrap();
+    let config = b"model_catalog_json = 'models/custom.json'\n";
+    fs::write(home.join("config.toml"), config).unwrap();
+    let source = home.join("models/custom.json");
+    let mut catalog = codey_runtime_core::model_suffix::bundled_model_catalog().unwrap();
+    let model = catalog["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["slug"] == "gpt-5.6-sol")
+        .unwrap();
+    model["context_window"] = serde_json::json!(1000000);
+    model["base_instructions"] = serde_json::json!("User instructions");
+    let original = serde_json::to_vec(&catalog).unwrap();
+    fs::write(&source, &original).unwrap();
+    let policies = BTreeMap::from([(
+        "gpt-5.6-sol".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: Some(100_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    let empty = BTreeMap::new();
+    let marker = temp.path().join("state/lease.json");
+    let backup_root = temp.path().join("state/backups");
+    for (router, contexts) in [(true, &policies), (true, &empty), (false, &policies)] {
+        let applied = apply_isolated_runtime_router_config(
+            &home,
+            RouterApplyOptions {
+                local_router: router.then(test_runtime_router_endpoint),
+                use_official_catalog: router,
+                model_contexts: Some(contexts),
+                stream_max_retries: 5,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                subagent_roles: None,
+                marker: &marker,
+                backup_root: &backup_root,
+            },
+        )
+        .unwrap();
+        let argument = applied
+            .runtime_config_overrides
+            .iter()
+            .find(|entry| entry.starts_with("model_catalog_json="))
+            .unwrap();
+        let document = parse_document(argument).unwrap();
+        let path = PathBuf::from(document["model_catalog_json"].as_str().unwrap());
+        if router && !contexts.is_empty() {
+            assert_ne!(path, source);
+            assert_eq!(
+                Some(path.clone()),
+                runtime_model_catalog_path(&home, true, Some(contexts)).unwrap()
+            );
+            let projected: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let actual = projected["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == "gpt-5.6-sol")
+                .unwrap();
+            assert_eq!(actual["context_window"], 128_000);
+            assert_eq!(actual["auto_compact_token_limit"], 100_000);
+            assert_eq!(actual["base_instructions"], "User instructions");
+        } else {
+            assert_eq!(path, source);
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config);
+        restore_runtime_config_at(&home, &marker, false).unwrap();
+    }
+}
+
+#[test]
 fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
     // Codex 禁止在 `model_providers` 下覆盖内置 Provider，路由关闭时必须跳过
     // 这条覆盖，否则 app-server 在加载配置阶段就会退出。
@@ -1260,6 +1347,7 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
         let applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                model_contexts: None,
                 stream_max_retries: 7,
                 local_router: None,
                 use_official_catalog: false,
@@ -1305,6 +1393,7 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 7,
             local_router: None,
             use_official_catalog: false,
@@ -1360,6 +1449,7 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
             let applied = apply_isolated_runtime_router_config(
                 &home,
                 RouterApplyOptions {
+                    model_contexts: None,
                     stream_max_retries: 5,
                     local_router,
                     use_official_catalog: false,
@@ -1411,6 +1501,7 @@ wire_api = "responses"
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
             use_official_catalog: false,
@@ -2737,6 +2828,7 @@ experimental_bearer_token = "upstream-secret-token"
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -2821,6 +2913,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -2870,6 +2963,7 @@ wire_api = "responses"
     let error = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,

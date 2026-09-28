@@ -444,6 +444,13 @@ export function useModelSelection({
         declaredReasoningEfforts[model] = normalized;
       }
     }
+    const modelContexts = Object.fromEntries(
+      Object.entries(draftModelContexts).filter(([model]) =>
+        includesModelId(modelEditorState.officialModelIds, model) ||
+        (!officialOnly && includesModelId(thirdPartyModelOptions, model)),
+      ),
+    );
+    const contextUpdate = config?.localRouterEnabled === true ? { modelContexts } : {};
     const result = officialRoutePicker
       ? await invoke<{
           config: Config;
@@ -451,6 +458,7 @@ export function useModelSelection({
         } & ModelRuntimeUpdate>("save_official_route_models", {
           routeId: modelPickerRouteId,
           models: officialModels,
+          ...contextUpdate,
         })
       : await invoke<{
           config: Config;
@@ -461,12 +469,7 @@ export function useModelSelection({
           manualThirdPartyModels,
           deletedThirdPartyModels: deletedModels,
           supportsAutoReview,
-          ...(!officialOnly
-            ? {
-                modelContexts: Object.fromEntries(Object.entries(draftModelContexts).filter(([model]) =>
-                  includesModelId(modelEditorState.officialModelIds, model) || includesModelId(thirdPartyModelOptions, model))),
-              }
-            : {}),
+          ...contextUpdate,
           ...(config?.localRouterEnabled === true && !officialOnly
             ? { reasoningEfforts: declaredReasoningEfforts }
             : {}),

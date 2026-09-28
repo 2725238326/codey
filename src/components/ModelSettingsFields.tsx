@@ -117,6 +117,7 @@ export function ModelSettingsFields({
             <ModelContextWindowCombobox
               ariaLabel={`${model} 窗口 Token`}
               disabled={disabled}
+              placeholder="跟随模型目录"
               value={policy?.contextWindowTokens}
               onChange={(contextWindowTokens) => {
                 if (contextWindowTokens == null) {
@@ -140,15 +141,15 @@ export function ModelSettingsFields({
                 min={min}
                 max={MAX_CONTEXT_WINDOW_TOKENS}
                 step={1}
-                disabled={disabled}
+                disabled={disabled || !policy}
                 className="h-7 rounded-md border-[rgb(var(--codey-ink-rgb,0,0,0))]/10 bg-[var(--codey-surface,#fff)] text-xs focus:border-[var(--codey-blue,#007aff)]"
                 aria-label={`${model} ${label} Token`}
                 placeholder={placeholder}
                 value={policy?.[field] ?? ""}
                 onChange={(event) => {
+                  if (!policy) return;
                   const raw = event.target.value;
                   onChange({
-                    contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
                     ...policy,
                     [field]: raw === "" ? undefined : Number(raw),
                   });
@@ -158,7 +159,7 @@ export function ModelSettingsFields({
           ))}
         </div>
         <p className="mt-2 text-[10px] leading-relaxed text-[var(--codey-subtle,#86868b)]">
-          阈值不能超过窗口的 90% 和预留后的有效空间；预留按整百分比向下取整，不是输出长度上限。
+          请先明确设置窗口，再调整压缩阈值和输出预留。阈值不能超过窗口的 90% 和预留后的有效空间；预留按整百分比向下取整，不是输出长度上限。
         </p>
         {reasoning && (
           <div className="mt-3 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 pt-2.5">

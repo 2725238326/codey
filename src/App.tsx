@@ -861,7 +861,7 @@ export function App({
     models: string[],
     showAccountUsageInHeader: boolean,
     enabled: boolean,
-    modelContexts: Record<string, import("./App.types").ModelContextConfig>,
+    modelContexts: Record<string, import("./App.types").ModelContextConfig> | undefined,
     upstreamProxy?: string,
     routeSettings?: {
       accountId: string;
@@ -888,7 +888,7 @@ export function App({
       } & import("./App.types").OfficialAccountsResult>("save_official_route_models", {
         routeId,
         models,
-        modelContexts,
+        ...(modelContexts === undefined ? {} : { modelContexts }),
         enabled,
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
