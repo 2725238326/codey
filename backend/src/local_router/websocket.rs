@@ -399,6 +399,9 @@ impl WebSocketResponsesDownstream {
             self.upstream.take();
         }
         normalize_native_responses_context(body, discard_opaque_reasoning);
+        if route.official_account {
+            sanitize_official_upstream_history(body);
+        }
         if route.upstream_url.as_ref().is_ok_and(|url| {
             should_replay_reasoning_text(
                 route.official_account,

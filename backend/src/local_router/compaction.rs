@@ -489,58 +489,62 @@ fn is_codex_encrypted_payload(value: &str) -> bool {
 /// 换线路时保留可见推理摘要，去掉上一供应商才能校验的密文和 `reasoning_text`。
 /// 没有任何可见文本的推理项仍然删除。
 fn port_reasoning_history(body: &mut Value) -> bool {
+    rewrite_history_items(body, port_reasoning_item)
+}
+
+fn rewrite_history_items(body: &mut Value, rewrite: fn(&mut Value) -> HistoryItemRewrite) -> bool {
     let Some(input) = body.get_mut("input") else {
         return false;
     };
     match input {
         Value::Array(items) => {
             let mut changed = false;
-            items.retain_mut(|item| match port_reasoning_item(item) {
-                ReasoningPort::Keep => true,
-                ReasoningPort::Changed => {
+            items.retain_mut(|item| match rewrite(item) {
+                HistoryItemRewrite::Keep => true,
+                HistoryItemRewrite::Changed => {
                     changed = true;
                     true
                 }
-                ReasoningPort::Drop => {
+                HistoryItemRewrite::Drop => {
                     changed = true;
                     false
                 }
             });
             changed
         }
-        Value::Object(_) => match port_reasoning_item(input) {
-            ReasoningPort::Drop => {
+        Value::Object(_) => match rewrite(input) {
+            HistoryItemRewrite::Drop => {
                 *input = Value::Array(Vec::new());
                 true
             }
-            ReasoningPort::Changed => true,
-            ReasoningPort::Keep => false,
+            HistoryItemRewrite::Changed => true,
+            HistoryItemRewrite::Keep => false,
         },
         _ => false,
     }
 }
 
-enum ReasoningPort {
+enum HistoryItemRewrite {
     Keep,
     Changed,
     Drop,
 }
 
-fn port_reasoning_item(item: &mut Value) -> ReasoningPort {
+fn port_reasoning_item(item: &mut Value) -> HistoryItemRewrite {
     if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-        return ReasoningPort::Keep;
+        return HistoryItemRewrite::Keep;
     }
     let content_texts = reasoning_content_texts(item.get("content"));
     let summary_text = summary_replay_text(item);
     if summary_text.is_none() && content_texts.is_empty() {
-        return ReasoningPort::Drop;
+        return HistoryItemRewrite::Drop;
     }
     let had_encrypted = item.get("encrypted_content").is_some();
     let content_nonempty = item
         .get("content")
         .is_some_and(|content| !reasoning_content_is_empty(content));
     let Some(object) = item.as_object_mut() else {
-        return ReasoningPort::Drop;
+        return HistoryItemRewrite::Drop;
     };
     let mut changed = false;
     if had_encrypted {
@@ -564,10 +568,39 @@ fn port_reasoning_item(item: &mut Value) -> ReasoningPort {
         changed = true;
     }
     if changed {
-        ReasoningPort::Changed
+        HistoryItemRewrite::Changed
     } else {
-        ReasoningPort::Keep
+        HistoryItemRewrite::Keep
     }
+}
+
+/// 官方请求始终检查外来条目，不依赖重启后可能丢失的线路绑定。
+/// Codex 允许缺省 id，不能据此判断来源；只有前缀不符的 reasoning
+/// 才移植可见摘要并去掉旧密文，消息和工具调用只去掉外来 id。
+pub(crate) fn sanitize_official_upstream_history(body: &mut Value) -> bool {
+    rewrite_history_items(body, sanitize_official_history_item)
+}
+
+fn sanitize_official_history_item(item: &mut Value) -> HistoryItemRewrite {
+    let prefix = match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => "rs",
+        Some("message") => "msg",
+        Some("function_call") => "fc",
+        _ => return HistoryItemRewrite::Keep,
+    };
+    let Some(id) = item.get("id").and_then(Value::as_str) else {
+        return HistoryItemRewrite::Keep;
+    };
+    if id.starts_with(prefix) {
+        return HistoryItemRewrite::Keep;
+    }
+    if prefix == "rs" && matches!(port_reasoning_item(item), HistoryItemRewrite::Drop) {
+        return HistoryItemRewrite::Drop;
+    }
+    item.as_object_mut()
+        .expect("typed history item is an object")
+        .remove("id");
+    HistoryItemRewrite::Changed
 }
 
 fn reasoning_content_texts(content: Option<&Value>) -> Vec<String> {
@@ -804,6 +837,96 @@ mod tests {
         });
         assert!(normalize_native_responses_context(&mut body, true));
         assert_eq!(body["input"], json!([{"role":"user","content":"continue"}]));
+    }
+
+    #[test]
+    fn official_history_preserves_visible_reasoning_without_foreign_state() {
+        let official = json!({"type":"reasoning","id":"rs_official","summary":[],"encrypted_content":"official-state"});
+        let mut body = json!({"input":[
+            {"type":"reasoning","id":"item_summary","summary":[{"type":"summary_text","text":"保留摘要"}],"encrypted_content":"foreign-state","content":[{"type":"reasoning_text","text":"prefer summary"}]},
+            {"type":"reasoning","id":"item_text","content":[{"type":"reasoning_text","text":"first"},{"type":"text","text":"second"}]},
+            {"type":"reasoning","id":"item_opaque","summary":[],"encrypted_content":"foreign-state"},
+            official.clone(),
+            {"role":"user","content":"continue"}
+        ]});
+        assert!(sanitize_official_upstream_history(&mut body));
+        assert_eq!(
+            body["input"],
+            json!([
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"保留摘要"}],"content":[]},
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"first"},{"type":"summary_text","text":"second"}],"content":[]},
+                official,
+                {"role":"user","content":"continue"}
+            ])
+        );
+        assert!(!sanitize_official_upstream_history(&mut body));
+    }
+
+    #[test]
+    fn official_history_keeps_tool_pairing_and_message_content() {
+        let mut body = json!({"input":[
+            {"type":"message","id":"item_message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"answer","annotations":[]},{"type":"refusal","refusal":"cannot comply"}]},
+            {"type":"function_call","id":"item_tool","call_id":"call_original","name":"lookup","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_original","output":"done"}
+        ]});
+        let call_output = body["input"][2].clone();
+        assert!(sanitize_official_upstream_history(&mut body));
+        assert_eq!(
+            body["input"][0],
+            json!({
+                "type":"message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"answer","annotations":[]},{"type":"refusal","refusal":"cannot comply"}]
+            })
+        );
+        assert_eq!(
+            body["input"][1],
+            json!({"type":"function_call","call_id":"call_original","name":"lookup","arguments":"{}"})
+        );
+        assert_eq!(body["input"][2], call_output);
+        assert!(!sanitize_official_upstream_history(&mut body));
+    }
+
+    #[test]
+    fn official_history_keeps_official_ids_and_unrelated_items() {
+        let original = json!({"input":[
+            {"type":"message","id":"msg_valid","role":"assistant","content":[{"type":"output_text","text":"answer"}],"status":"completed"},
+            {"type":"function_call","id":"fc_valid","call_id":"call_valid"},
+            {"type":"function_call","call_id":"call_without_id"},
+            {"type":"web_search_call","id":"foreign_search"},
+            {"type":"compaction","id":"cmp_valid","encrypted_content":"state"},
+            {"type":"item_reference","id":"msg_valid"},
+            {"role":"user","content":"hello"},null,17
+        ]});
+        let mut body = original.clone();
+        assert!(!sanitize_official_upstream_history(&mut body));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn official_history_handles_single_items_and_missing_ids() {
+        for id in [json!(""), json!("item_foreign")] {
+            let mut body = json!({"input":{"type":"reasoning","id":id,"summary":[{"type":"summary_text","text":"visible"}]}});
+            assert!(sanitize_official_upstream_history(&mut body));
+            assert_eq!(
+                body["input"],
+                json!({"type":"reasoning","summary":[{"type":"summary_text","text":"visible"}]})
+            );
+            assert!(!sanitize_official_upstream_history(&mut body));
+        }
+        let mut opaque = json!({"input":{"type":"reasoning","id":"item_opaque","summary":[],"encrypted_content":"foreign"}});
+        assert!(sanitize_official_upstream_history(&mut opaque));
+        assert_eq!(opaque["input"], json!([]));
+        for original in [
+            json!({}),
+            json!({"input":"prompt"}),
+            json!({"input":null}),
+            json!({"input":{"type":"reasoning","summary":[],"encrypted_content":"official-state"}}),
+            json!({"input":{"type":"reasoning","id":null,"summary":[],"encrypted_content":"official-state"}}),
+            json!({"input":{"type":"reasoning","summary":[{"type":"summary_text","text":"visible"}]}}),
+        ] {
+            let mut body = original.clone();
+            assert!(!sanitize_official_upstream_history(&mut body));
+            assert_eq!(body, original);
+        }
     }
 
     #[test]

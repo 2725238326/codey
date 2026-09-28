@@ -116,6 +116,223 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
     }
 }
 
+fn official_history_server(url: String) -> (RouterServer, String) {
+    let mut profile = crate::config::ProviderProfile::new("Official test");
+    profile.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+    profile.source_provider_id = Some("openai".into());
+    profile.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    profile.base_url = url;
+    profile.supports_remote_compaction = true;
+    profile.normalize();
+    let mut config = CodeyConfig {
+        profiles: vec![profile],
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    };
+    config
+        .selected_models_by_provider
+        .insert("openai".into(), vec!["test-model".into()]);
+    (test_server(&config), model_alias("openai", "test-model"))
+}
+
+fn foreign_history_items() -> Value {
+    json!([
+        {"type":"reasoning","id":"item_summary","summary":[{"type":"summary_text","text":"preserved reasoning"}],"encrypted_content":"foreign-state"},
+        {"type":"message","id":"item_message","role":"assistant","content":[{"type":"output_text","text":"visible answer"}],"status":"completed"},
+        {"type":"function_call","id":"item_tool","call_id":"call_original","name":"lookup","arguments":"{}"},
+        {"type":"function_call_output","call_id":"call_original","output":"tool result"}
+    ])
+}
+
+fn assert_portable_official_history(items: &[Value]) {
+    assert_eq!(
+        items[0],
+        json!({"type":"reasoning","summary":[{"type":"summary_text","text":"preserved reasoning"}]})
+    );
+    assert_eq!(
+        items[1],
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible answer"}],"status":"completed"})
+    );
+    assert_eq!(
+        items[2],
+        json!({"type":"function_call","call_id":"call_original","name":"lookup","arguments":"{}"})
+    );
+    assert_eq!(items[3], foreign_history_items()[3]);
+}
+
+fn official_history_request() -> HttpRequest {
+    HttpRequest {
+        method: "POST".into(),
+        path: "/v1/responses".into(),
+        headers: vec![
+            ("authorization".into(), "Bearer test-oauth".into()),
+            ("thread-id".into(), "foreign-history".into()),
+        ],
+        body: Vec::new(),
+        _body_budget_permit: None,
+    }
+}
+
+#[tokio::test]
+async fn official_history_http_normalizes_cold_start_and_route_switch() {
+    for kind in [ResponsesRequestKind::Create, ResponsesRequestKind::Compact] {
+        for route_changed in [false, true] {
+            let (url, upstream) = fake_upstream(vec![200]).await;
+            let (server, model) = official_history_server(url);
+            let request = official_history_request();
+            if route_changed {
+                server.bindings.lock().unwrap().remember(
+                    &request_binding_keys(&request),
+                    "previous-provider",
+                    false,
+                );
+            }
+            let body = json!({"model":model,"input":foreign_history_items()});
+            let encoded = serde_json::to_vec_pretty(&body).unwrap();
+            let mut downstream = CapturedDownstream::default();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                server.proxy_parsed_responses_inner(
+                    request,
+                    body,
+                    Some(encoded),
+                    kind,
+                    &mut downstream,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                downstream.status,
+                Some(200),
+                "{kind:?}, route_changed={route_changed}: {}",
+                String::from_utf8_lossy(&downstream.body)
+            );
+            let requests = tokio::time::timeout(Duration::from_secs(5), upstream)
+                .await
+                .unwrap()
+                .unwrap();
+            let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_portable_official_history(sent["input"].as_array().unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn official_history_sanitization_does_not_change_third_party_requests() {
+    let (url, upstream) = fake_upstream(vec![200]).await;
+    let (config, provider, model) = super::tests::router_config(url);
+    let server = test_server(&config);
+    let body = json!({"model":model_alias(&provider, &model),"input":foreign_history_items()});
+    let encoded = serde_json::to_vec_pretty(&body).unwrap();
+    let mut downstream = CapturedDownstream::default();
+    server
+        .proxy_parsed_responses_inner(
+            official_history_request(),
+            body,
+            Some(encoded),
+            ResponsesRequestKind::Create,
+            &mut downstream,
+        )
+        .await
+        .unwrap();
+    assert_eq!(downstream.status, Some(200));
+    let requests = upstream.await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["input"], foreign_history_items());
+}
+
+#[tokio::test]
+async fn official_history_is_sanitized_after_websocket_reconnect_and_http_fallback() {
+    for websocket in [true, false] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (server, model) =
+            official_history_server(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let response =
+                json!({"id":"resp-second","object":"response","status":"completed","output":[]});
+            if websocket {
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let WebSocketMessage::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected response.create")
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                socket
+                    .send(WebSocketMessage::Text(
+                        json!({"type":"response.completed","response":response})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                request
+            } else {
+                // 官方线路会尝试 WebSocket；握手失败后才走 HTTP 回退。
+                let handshake = read_http_request(&mut stream).await.unwrap();
+                assert_eq!(handshake.method, "GET");
+                write_json_response(&mut stream, 404, &json!({"error":"WebSocket unsupported"}))
+                    .await
+                    .unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await.unwrap();
+                write_json_response(&mut stream, 200, &response)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&request.body).unwrap()
+            }
+        });
+        let resolved = server
+            .snapshot
+            .read()
+            .unwrap()
+            .target_for_model(&model)
+            .unwrap();
+        let request = official_history_request();
+        let headers = server
+            .prepare_upstream_request_headers(&request, &resolved.route)
+            .await
+            .unwrap();
+        let (socket, mut peer) = super::tests::local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        let mut original =
+            json!({"model":resolved.upstream_model,"stream":true,"input":"original task"});
+        downstream
+            .prepare_native_http_fallback(&resolved.route, &headers, &mut original)
+            .unwrap();
+        downstream.write_event(&json!({"type":"response.completed","response":{"id":"resp-first","status":"completed","output":foreign_history_items()}})).await.unwrap();
+        peer.next().await.unwrap().unwrap();
+        downstream.clear_stream_id();
+        let body = json!({"model":model,"stream":true,"previous_response_id":"resp-first","input":"follow up"});
+        let encoded = serde_json::to_vec(&body).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.proxy_parsed_responses_inner(
+                request,
+                body,
+                Some(encoded),
+                ResponsesRequestKind::Create,
+                &mut downstream,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let sent = tokio::time::timeout(Duration::from_secs(5), upstream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(sent.get("previous_response_id").is_none());
+        let items = sent["input"].as_array().unwrap();
+        assert_eq!(items.len(), 6);
+        assert_eq!(items[0], json!({"role":"user","content":"original task"}));
+        assert_portable_official_history(&items[1..5]);
+        assert_eq!(items[5], json!({"role":"user","content":"follow up"}));
+    }
+}
+
 async fn invoke(
     server: &RouterServer,
     model: &str,
@@ -152,6 +369,13 @@ async fn fake_upstream(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<V
             requests.push(read_http_request(&mut stream).await.unwrap());
             let body = if status == 400 {
                 json!({"error":{"message":"The `reasoning_text` in the thinking mode must be passed back to the API.","code":"invalid_request_error"}})
+            } else if requests
+                .last()
+                .unwrap()
+                .path
+                .ends_with("/responses/compact")
+            {
+                json!({"id":"test-compaction","object":"response.compaction","output":[{"type":"compaction","id":"cmp_test","encrypted_content":"test-state"}]})
             } else {
                 json!({"id":"test-response","object":"response","status":"completed","output":[]})
             };
