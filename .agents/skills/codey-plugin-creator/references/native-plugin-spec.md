@@ -45,7 +45,7 @@ codey_plugin_sdk::export_plugin!(MyPlugin);
 
 声明 `provider.route.v1` 后，宿主在启用时调用 `provider.describe`。返回对象至少包含一个模型，协议只能使用 `openaiResponses`、`openaiChatCompletions` 或 `anthropicMessages`。线路名最多 15 个字符；头部不能携带密钥，密钥由用户在线路配置中填写。
 
-需要自定义请求正文或流式协议时，同时声明 `provider.transport.v1` 与 `provider.account.v1`，在描述中提供 `transport.accountEmail`。宿主唯一匹配已保存账号并提供短期访问凭据，分块正文和帧协议沿用 ABI v1；管理方法不能调用 `provider.request.*`。实现前完整阅读仓库 `crates/codey-plugin-sdk/PROVIDER_TRANSPORT.md`，并参考 `examples/plugins/excel-bridge` 的取消、停用及后台运行时销毁方式。
+需要自定义请求正文或流式协议时，同时声明 `provider.transport.v1` 与 `provider.account.v1`，在描述中提供 `transport.accountEmail`。宿主唯一匹配已保存账号并提供短期访问凭据，分块正文和帧协议沿用 ABI v1；管理方法不能调用 `provider.request.*`。实现前完整阅读仓库 `crates/codey-plugin-sdk/PROVIDER_TRANSPORT.md`，并参考 `../../../../plugins/excel-bridge` 的取消、停用及后台运行时销毁方式。
 
 ## 配置、数据与日志
 
