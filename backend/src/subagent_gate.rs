@@ -1151,10 +1151,10 @@ fn post_tool_use_output(
     now_ms: u64,
 ) -> Result<Value> {
     if input_has_subagent_context(input) {
-        if input.tool_name.is_some() {
-            if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
-                clear_child_tool_in_flight(state_root, runtime_id, &input.session_id, agent_id)?;
-            }
+        if input.tool_name.is_some()
+            && let Some(agent_id) = nonempty(input.agent_id.as_deref())
+        {
+            clear_child_tool_in_flight(state_root, runtime_id, &input.session_id, agent_id)?;
         }
         return Ok(json!({}));
     }
