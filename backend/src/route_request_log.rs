@@ -1097,6 +1097,13 @@ impl RouteRequestLogProbe {
         });
     }
 
+    /// 客户端来源不依赖线路是否解析成功，也不记录原始请求头。
+    pub(crate) fn set_subagent(&self, subagent: bool) {
+        self.shield(|| {
+            lock_unpoisoned(&self.shared.entry).subagent = subagent;
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_route(
         &self,

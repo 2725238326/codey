@@ -1320,6 +1320,16 @@
       miscModelId || String(nativeModel ?? "").trim(),
     writable: false,
   });
+  Object.defineProperty(globalThis, "__CODEY_SELECT_MISC_MODEL_ROUTING__", {
+    configurable: false,
+    value: (routing) => miscModelId ? ({
+      ...routing,
+      ephemeralGenerationModel: miscModelId,
+      ambientSuggestionsModel: miscModelId,
+      ambientSuggestionsSafetyModel: miscModelId,
+    }) : routing,
+    writable: false,
+  });
   const appServerRuntimeConfigs = uniqueRuntimeConfigsByKey([
     appServerAnalyticsConfig,
     ...nativeRuntimeConfigOverrides.filter(
@@ -2226,16 +2236,33 @@
     },
   );
 
-  // 会话命名、Git 提交消息生成和环境建议都从 Luna 常量取值，但常量名由
-  // 打包结果决定。把每一处 Luna 常量声明改写成运行期覆盖，既不依赖具体
-  // 变量名，也不影响同一 chunk 里其它同名导出。
+  // 旧版通过 Luna 常量选择辅助模型；新版分别解析默认值和动态配置。
+  // 只覆盖辅助用途，自动化模型及主会话选择继续沿用原生配置。
   const patchCodexMiscModelConstants = (source) => {
     if (!miscModelId) return source;
+    if (
+      source.includes("codex_ephemeral_generation_model_slug") &&
+      source.includes("codex_ambient_suggestions_model_slug") &&
+      source.includes("codex_ambient_suggestions_safety_model_slug")
+    ) {
+      // 只接受赋值、条件表达式或 return 后的完整配置对象；不改写参数解构。
+      const routingObject = /([=?]\s*|\breturn\s*)(\{[^{}]{0,2000}\})/g;
+      const routingField = /(?:\{|,)\s*(?:([A-Za-z_$][\w$]*)|["']([^"']+)["'])\s*:/g;
+      const requiredFields = [
+        "automationModel", "ephemeralGenerationModel",
+        "ambientSuggestionsModel", "ambientSuggestionsSafetyModel",
+      ];
+      source = source.replace(routingObject, (match, prefix, object) => {
+        const fields = new Set([...object.matchAll(routingField)].map((field) => field[1] || field[2]));
+        if (!requiredFields.every((field) => fields.has(field))) return match;
+        return `${prefix}globalThis.__CODEY_SELECT_MISC_MODEL_ROUTING__(${object})`;
+      });
+    }
     // 按匹配位置切片；不同作用域可以复用同一个压缩变量名。
     const declarationPattern =
       /(?<![$\w.])([$A-Z_a-z][$\w]*)(\s*=\s*)(["'`])gpt-5\.6-luna\3/g;
     const declarations = [...source.matchAll(declarationPattern)];
-    // 仅含模型引用或使用新版结构的 chunk 无需改写，保留 Codex 原生行为。
+    // 仅含模型目录引用的 chunk 保留原生行为。
     if (declarations.length === 0) return source;
     let patched = "";
     let lastIndex = 0;
@@ -2748,7 +2775,8 @@
           desktopAnalyticsWorkerSourcePatched && desktopAnalyticsTransportSourcePatched;
       }
       // 常量可由 Git 或环境建议的独立 chunk 导出，不要求同文件包含标题逻辑。
-      if (miscModelId && source.includes(threadTitleModelId)) {
+      if (miscModelId && (source.includes(threadTitleModelId) ||
+          source.includes("codex_ephemeral_generation_model_slug"))) {
         const original = source;
         source = applyOptionalMainBundlePatch(
           "miscModelConstants",

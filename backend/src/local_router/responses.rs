@@ -874,6 +874,7 @@ impl RouterServer {
                 codex_session_is_parent: parent,
             })
         })
+        .inspect(|probe| probe.set_subagent(request_is_subagent(request)))
     }
 
     fn record_rejected_request(&self, request: &HttpRequest, kind: &str, status: u16, code: &str) {
@@ -1516,6 +1517,7 @@ impl RouterServer {
                 .await;
         }
         if let Some(probe) = &probe {
+            probe.set_subagent(request_is_subagent(&request));
             probe.set_requested_service_tier(body.get("service_tier").and_then(Value::as_str));
             probe.record_request_body(RequestBodySummary::from_responses_body(
                 &body,

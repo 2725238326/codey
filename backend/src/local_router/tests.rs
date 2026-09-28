@@ -11037,6 +11037,117 @@ async fn router_rejects_unknown_raw_models_instead_of_guessing_a_route() {
 }
 
 #[tokio::test]
+async fn request_log_preserves_subagent_source_before_route_resolution() {
+    for backend in [
+        RouteRequestLogBackend::Sqlite,
+        RouteRequestLogBackend::Ndjson,
+    ] {
+        let logs = tempfile::tempdir().unwrap();
+        let (mut config, _, _) = router_config("http://127.0.0.1:9/v1".to_string());
+        config.route_request_log.enabled = true;
+        config.route_request_log.backend = backend;
+        let router = LocalRouter::start_with_logger(
+            &config,
+            Arc::new(RouteRequestLogController::with_root(
+                logs.path().to_path_buf(),
+            )),
+        )
+        .await
+        .unwrap();
+        let endpoint = router.endpoint();
+        let client = reqwest::Client::new();
+        for (model, subagent, parent) in [
+            ("missing-memory-model", true, None),
+            ("missing-worker-model", true, Some("parent-thread")),
+            ("missing-main-model", false, None),
+        ] {
+            let mut request = client
+                .post(format!("{}/responses", endpoint.base_url))
+                .bearer_auth(&endpoint.token)
+                .header("thread-id", "request-thread")
+                .json(&json!({"model":model,"reasoning":{"effort":"medium"},"input":"private content"}));
+            if subagent {
+                request = request.header("x-openai-subagent", "memory_consolidation");
+            }
+            if let Some(parent) = parent {
+                request = request.header("x-codex-parent-thread-id", parent);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "model_not_enabled"
+            );
+        }
+        let response = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("x-codex-parent-thread-id", "early-parent")
+            .body("invalid json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        router.stop().await.unwrap();
+        let items: Vec<Value> = match backend {
+            RouteRequestLogBackend::Sqlite => {
+                let page = crate::route_request_log::query_route_request_logs(
+                    logs.path(),
+                    backend,
+                    RouteRequestLogQuery::default(),
+                )
+                .unwrap();
+                assert!(page.queryable);
+                page.items
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).unwrap())
+                    .collect()
+            }
+            RouteRequestLogBackend::Ndjson => {
+                std::fs::read_to_string(logs.path().join("route-requests.ndjson"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            }
+        };
+        assert_eq!(items.len(), 4, "{backend:?}");
+        for item in &items {
+            assert!(item["provider"].is_null());
+            assert!(item["upstreamTransport"].is_null());
+            assert!(item["totalTokens"].is_null());
+            assert!(item["tokenUsage"]["totalTokens"].is_null());
+            assert_eq!(item["usageReported"], false);
+            assert!(!item.to_string().contains("private content"));
+            match item["requestedModel"].as_str().unwrap() {
+                "missing-memory-model" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert!(item["codexSessionId"].is_null());
+                }
+                "missing-worker-model" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert_eq!(item["codexSessionId"], "parent-thread");
+                }
+                "missing-main-model" => {
+                    assert_eq!(item["subagent"], false);
+                    assert_eq!(item["codexSessionIsParent"], false);
+                    assert_eq!(item["codexSessionId"], "request-thread");
+                }
+                "" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert_eq!(item["codexSessionId"], "early-parent");
+                    assert_eq!(item["errorCode"], "invalid_request_body");
+                }
+                model => panic!("unexpected request model: {model}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn router_rejects_requests_without_the_launch_token() {
     let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".to_string());
     let router = LocalRouter::start(&config).await.unwrap();

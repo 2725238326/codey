@@ -1024,6 +1024,147 @@ test("misc model constants accept quote styles, whitespace, and repeated scoped 
   }
 });
 
+const miscRoutingFixture = (nativeModel = "gpt-5.6-luna") => `
+var nativeDefaults={automationModel:'gpt-5.6-terra',
+  ephemeralGenerationModel:${JSON.stringify(nativeModel)},
+  ambientSuggestionsModel:${JSON.stringify(nativeModel)},
+  ambientSuggestionsSafetyModel:${JSON.stringify(nativeModel)}};
+var schema={safeParse(value){return value == null ? {success:false} : {success:true,data:value}}};
+function resolveRouting(value){let result=schema.safeParse(value);return result.success?{
+  automationModel:result.data.codex_automation_model_slug,
+  ephemeralGenerationModel:result.data.codex_ephemeral_generation_model_slug,
+  ambientSuggestionsModel:result.data.codex_ambient_suggestions_model_slug,
+  ambientSuggestionsSafetyModel:result.data.codex_ambient_suggestions_safety_model_slug
+}:nativeDefaults}
+globalThis.nativeDefaults=nativeDefaults;globalThis.resolveRouting=resolveRouting;
+globalThis.mainConversation={model:'gpt-5.6-terra'};
+`;
+
+test("misc model overrides routing defaults and dynamic configuration only for helper tasks", async () => {
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    const patch = runtime.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__;
+    const fixture = miscRoutingFixture();
+    const patched = patch(fixture);
+    assert.notEqual(patched, fixture);
+    assert.equal(patch(patched), patched, "repeated patching must not add wrappers");
+    vm.runInNewContext(patched, runtime.context);
+    const dynamic = Object.freeze({
+      codex_automation_model_slug: "automation/user-selected",
+      codex_ephemeral_generation_model_slug: "remote/terra",
+      codex_ambient_suggestions_model_slug: "remote/suggestions",
+      codex_ambient_suggestions_safety_model_slug: "remote/safety",
+    });
+    for (const [input, automationModel] of [[null, "gpt-5.6-terra"], [dynamic, "automation/user-selected"]]) {
+      assert.deepEqual(JSON.parse(JSON.stringify(runtime.context.resolveRouting(input))), {
+        automationModel,
+        ephemeralGenerationModel: "relay/housekeeping",
+        ambientSuggestionsModel: "relay/housekeeping",
+        ambientSuggestionsSafetyModel: "relay/housekeeping",
+      });
+    }
+    assert.equal(dynamic.codex_ephemeral_generation_model_slug, "remote/terra");
+    assert.equal(runtime.context.mainConversation.model, "gpt-5.6-terra");
+  } finally {
+    runtime.restore();
+  }
+  const native = await loadPatchInIsolatedContext([], {}, false);
+  try {
+    const fixture = miscRoutingFixture();
+    assert.equal(native.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__(fixture), fixture);
+    const routing = Object.freeze({ ephemeralGenerationModel: "native/model" });
+    assert.equal(native.context.__CODEY_SELECT_MISC_MODEL_ROUTING__(routing), routing);
+  } finally {
+    native.restore();
+  }
+});
+
+test("misc model preserves destructuring and unrelated configuration", async () => {
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    const patch = runtime.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__;
+    const unrelated = `
+function consume({automationModel:a,ephemeralGenerationModel:b,ambientSuggestionsModel:c,ambientSuggestionsSafetyModel:d}){return [a,b,c,d]}
+const {automationModel:a,ephemeralGenerationModel:b,ambientSuggestionsModel:c,ambientSuggestionsSafetyModel:d}=nativeDefaults;
+globalThis.partial={ephemeralGenerationModel:'user/model'};
+globalThis.nested={automationModel:'automation',ephemeralGenerationModel:'user/model',ambientSuggestionsModel:'user/model',ambientSuggestionsSafetyModel:'user/model',options:{keep:true}};
+`;
+    const fixture = miscRoutingFixture() + unrelated;
+    const patched = patch(fixture);
+    assert.ok(patched.endsWith(unrelated));
+    vm.runInNewContext(patched, runtime.context);
+    assert.equal(runtime.context.partial.ephemeralGenerationModel, "user/model");
+    assert.equal(runtime.context.nested.ephemeralGenerationModel, "user/model");
+    const unrelatedRouting = "var routing={automationModel:'user/automation',ephemeralGenerationModel:'user/helper',ambientSuggestionsModel:'user/suggestions',ambientSuggestionsSafetyModel:'user/safety'};";
+    assert.equal(patch(unrelatedRouting), unrelatedRouting, "require native routing schema anchors");
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("misc model recognizes quoted routing fields and preserves additional settings", async () => {
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    const fixture = miscRoutingFixture() + `
+function routing(){return {
+  'automationModel': 'user/automation', "ephemeralGenerationModel": 'native/helper',
+  'ambientSuggestionsModel': 'native/suggestions', "ambientSuggestionsSafetyModel": 'native/safety',
+  preservedSetting: true
+}}
+globalThis.quotedRouting=routing();`;
+    const patched = runtime.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__(fixture);
+    vm.runInNewContext(patched, runtime.context);
+    assert.deepEqual(JSON.parse(JSON.stringify(runtime.context.quotedRouting)), {
+      automationModel: "user/automation",
+      ephemeralGenerationModel: "relay/housekeeping",
+      ambientSuggestionsModel: "relay/housekeeping",
+      ambientSuggestionsSafetyModel: "relay/housekeeping",
+      preservedSetting: true,
+    });
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("misc model patches installed native routing chunks without syntax errors", {
+  skip: !process.env.CODEY_TEST_CODEX_MODEL_ROUTING_SOURCES,
+}, async () => {
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    for (const filename of process.env.CODEY_TEST_CODEX_MODEL_ROUTING_SOURCES.split(delimiter)) {
+      const source = await readFile(filename, "utf8");
+      const patch = runtime.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__;
+      const patched = patch(source);
+      assert.notEqual(patched, source, filename);
+      assert.ok(patched.includes("globalThis.__CODEY_SELECT_MISC_MODEL_ROUTING__("), filename);
+      assert.equal(patch(patched), patched, filename);
+      new vm.Script(patched, { filename });
+    }
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("misc model covers routing chunks without a Luna constant", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codey-misc-routing-"));
+  const filename = join(directory, ".vite", "build", "src-model-routing.js");
+  await mkdir(join(directory, ".vite", "build"), { recursive: true });
+  await writeFile(filename, miscRoutingFixture("gpt-5.6-terra"));
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    process.getBuiltinModule("module")._extensions[".js"]({
+      _compile(patched) { vm.runInNewContext(patched, runtime.context); },
+    }, filename);
+    assert.equal(runtime.context.resolveRouting(null).ephemeralGenerationModel, "relay/housekeeping");
+    assert.equal(runtime.context.resolveRouting(null).automationModel, "gpt-5.6-terra");
+    assert.equal(runtime.context.__CODEY_CODEX_STARTUP_PATCH__.routeMiscModel, true);
+    assert.equal(runtime.context.__CODEY_CODEX_STARTUP_PATCH__.optionalMainBundlePatchFailures.length, 0);
+  } finally {
+    runtime.restore();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("misc model leaves chunks without supported constants unchanged", async () => {
   const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
   try {
