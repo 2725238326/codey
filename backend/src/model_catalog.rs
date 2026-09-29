@@ -63,6 +63,17 @@ struct RuntimeModelCacheUnavailable;
 pub(crate) const CUSTOM_CONTEXT_CATALOG_UNAVAILABLE: &str =
     "无法生成带有自定义上下文预算的模型目录，请恢复默认预算或重新同步模型";
 
+#[derive(Debug)]
+pub(crate) struct ContextBudgetCatalogError(pub(crate) anyhow::Error);
+
+impl fmt::Display for ContextBudgetCatalogError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for ContextBudgetCatalogError {}
+
 impl fmt::Display for RuntimeModelCacheUnavailable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(
@@ -313,16 +324,22 @@ pub(crate) fn render_context_catalog_overlay(
     for (model, policy) in contexts {
         let index = match indices.get(&model_id::key(model)) {
             Some(Some(index)) => *index,
-            Some(None) => bail!(
-                "自定义模型目录中的预算模型重复：{model}（{}）",
-                source.display()
-            ),
-            None => bail!(
-                "自定义模型目录缺少已启用的预算模型：{model}（{}）",
-                source.display()
-            ),
+            Some(None) => {
+                return Err(ContextBudgetCatalogError(anyhow::anyhow!(
+                    "自定义模型目录中的预算模型重复：{model}（{}）",
+                    source.display()
+                ))
+                .into());
+            }
+            None => {
+                return Err(ContextBudgetCatalogError(anyhow::anyhow!(
+                    "自定义模型目录缺少已启用的预算模型：{model}（{}）",
+                    source.display()
+                ))
+                .into());
+            }
         };
-        apply_model_context(&mut models[index], Some(policy))?;
+        apply_model_context(&mut models[index], Some(policy)).map_err(ContextBudgetCatalogError)?;
     }
     let mut bytes = serde_json::to_vec_pretty(&catalog).context("序列化模型预算副本失败")?;
     bytes.push(b'\n');
@@ -2578,6 +2595,11 @@ fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
         fs::write(&source, &bytes).unwrap();
         let error = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(
+            error.is::<ContextBudgetCatalogError>(),
+            message != "缺少 models 数组"
+        );
+        assert!(!anyhow::anyhow!(error.to_string()).is::<ContextBudgetCatalogError>());
         assert_eq!(fs::read(&source).unwrap(), bytes);
         assert!(
             !home
@@ -2587,7 +2609,8 @@ fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
         );
     }
     fs::write(&source, b"not json").unwrap();
-    assert!(render_context_catalog_overlay(&source, &policies).is_err());
+    let error = render_context_catalog_overlay(&source, &policies).unwrap_err();
+    assert!(!error.is::<ContextBudgetCatalogError>());
     assert!(
         render_context_catalog_overlay(&source, &BTreeMap::new())
             .unwrap()
@@ -2600,7 +2623,8 @@ fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
         .get_mut("route/model")
         .unwrap()
         .auto_compact_token_limit = Some(128_000);
-    assert!(prepare_context_catalog_overlay(home.path(), &source, &invalid).is_err());
+    let error = prepare_context_catalog_overlay(home.path(), &source, &invalid).unwrap_err();
+    assert!(error.is::<ContextBudgetCatalogError>());
     assert_eq!(fs::read(&source).unwrap(), original);
     assert!(
         !home

@@ -1013,6 +1013,7 @@ async fn shutdown_rejects_new_runtime_launches_and_restarts() {
         launch_codey_inner(&state)
             .await
             .unwrap_err()
+            .to_string()
             .contains("正在退出")
     );
     assert!(

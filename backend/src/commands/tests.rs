@@ -56,24 +56,65 @@ async fn context_recovery_preserves_other_settings_and_backs_up_the_budget() {
 #[tokio::test]
 async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
     let directory = tempfile::tempdir().unwrap();
-    let mut config = CodeyConfig::default();
-    config.model_context_by_provider.insert(
-        "route".into(),
-        BTreeMap::from([(
-            "gpt-5.6-sol".into(),
-            crate::config::ModelContextConfig {
-                context_window_tokens: 256_000,
-                auto_compact_token_limit: None,
-                reserve_output_tokens: None,
-            },
+    let mut profile = ProviderProfile::new("Custom");
+    profile.id = "custom".into();
+    profile.source_provider_id = Some("custom".into());
+    profile.base_url = "https://example.test/v1".into();
+    profile.api_key = "unused-test-key".into();
+    profile.normalize();
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        active_profile_id: profile.id.clone(),
+        profiles: vec![profile],
+        selected_models_by_provider: BTreeMap::from([(
+            "custom".into(),
+            vec!["gpt-6-astra".into(), "z-model".into()],
         )]),
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    let budget = crate::config::ModelContextConfig {
+        context_window_tokens: 256_000,
+        auto_compact_token_limit: None,
+        reserve_output_tokens: None,
+    };
+    config.model_context_by_provider.insert(
+        "custom".into(),
+        BTreeMap::from([
+            ("gpt-6-astra".into(), budget.clone()),
+            ("z-model".into(), budget.clone()),
+        ]),
     );
+    config.model_context_by_provider.insert(
+        "other-route".into(),
+        BTreeMap::from([("other-model".into(), budget)]),
+    );
+    let codex_config = b"model_catalog_json = 'custom.json'\n";
+    std::fs::write(directory.path().join("config.toml"), codex_config).unwrap();
+    let catalog = serde_json::to_vec(
+        &codey_runtime_core::model_suffix::bundled_model_catalog().unwrap(),
+    )
+    .unwrap();
+    let source = directory.path().join("custom.json");
+    std::fs::write(&source, &catalog).unwrap();
+    let error = crate::codex_config::runtime_model_catalog_path(
+        directory.path(),
+        true,
+        Some(&config.runtime_enabled_model_contexts()),
+    )
+    .unwrap_err()
+    .context("准备运行时模型目录失败");
+    assert!(error.is::<crate::model_catalog::ContextBudgetCatalogError>());
+    let reason = format!("{error:#}");
+    assert!(reason.contains("custom/gpt-6-astra"), "{reason}");
+    assert!(reason.contains(source.to_str().unwrap()), "{reason}");
     let state = Arc::new(AppState {
         store: ConfigStore::new(directory.path().join("config.json")),
         config: RwLock::new(config.clone()),
         ..AppState::default()
     });
     state.store.save(&config).unwrap();
+    let original = std::fs::read(state.store.path()).unwrap();
     let saved_budgets = |state: &Arc<AppState>| {
         let path = state.store.path().to_path_buf();
         let saved: CodeyConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -84,28 +125,35 @@ async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
     let declined = recover_default_context_budgets_with_prompt(
         &state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
+        &reason,
         |_| async { Ok(false) },
     )
     .await
     .unwrap();
     assert!(!declined);
     assert_eq!(saved_budgets(&state), config.model_context_by_provider);
+    assert_eq!(*state.config.read().await, config);
+    assert_eq!(std::fs::read(state.store.path()).unwrap(), original);
 
     // 对话框不可用时按未确认处理，同样保留预算。
     let unanswered = recover_default_context_budgets_with_prompt(
         &state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
+        &reason,
         |_| async { Err("原生提示不可用".to_string()) },
     )
     .await
     .unwrap();
     assert!(!unanswered);
     assert_eq!(saved_budgets(&state), config.model_context_by_provider);
+    assert_eq!(*state.config.read().await, config);
+    assert_eq!(std::fs::read(state.store.path()).unwrap(), original);
 
     // 确认后清空预算并写回配置，其他设置保持不变。
     let restored = recover_default_context_budgets_with_prompt(
         &state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
+        &reason,
         |purpose| async move {
             assert_eq!(
                 purpose,
@@ -126,6 +174,36 @@ async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
             .is_empty()
     );
     assert!(saved_budgets(&state).is_empty());
+    config.model_context_by_provider.clear();
+    assert_eq!(*state.config.read().await, config);
+    assert_eq!(
+        std::fs::read(directory.path().join("config.json.bak.1")).unwrap(),
+        original
+    );
+    assert_eq!(
+        crate::codex_config::runtime_model_catalog_path(
+            directory.path(),
+            true,
+            Some(&config.runtime_enabled_model_contexts()),
+        )
+        .unwrap(),
+        Some(source.clone())
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), catalog);
+    assert_eq!(
+        std::fs::read(directory.path().join("config.toml")).unwrap(),
+        codex_config
+    );
+    assert!(
+        !recover_default_context_budgets_with_prompt(
+            &state,
+            crate::native_update_ui::ContextRecoveryPurpose::Launch,
+            &reason,
+            |_| async { panic!("没有自定义预算时不应再次请求恢复") },
+        )
+        .await
+        .unwrap()
+    );
 }
 
 #[tokio::test]

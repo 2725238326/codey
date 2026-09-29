@@ -879,7 +879,10 @@ async fn prepare_startup_model_catalog(
     // Official-only launches inherit Codex metadata unless the user explicitly
     // configured a budget, in which case the generated catalog must be used.
     if custom_context && !catalog_available_for_runtime {
-        anyhow::bail!(model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE);
+        return Err(model_catalog::ContextBudgetCatalogError(anyhow::anyhow!(
+            model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE
+        ))
+        .into());
     }
     if plugin_context && !catalog_available_for_runtime {
         anyhow::bail!("插件模型需要可用的运行时模型目录，请恢复目录后重试");

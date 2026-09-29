@@ -56,12 +56,13 @@ test("context recovery prompt is shared by startup, restart and model saves", as
 
   assert.match(
     library,
-    /commands::recover_default_context_budgets_for_launch\(\s*&state,?\s*\)/,
+    /commands::recover_default_context_budgets_for_launch\(\s*&state,\s*&error\s*\)/,
   );
-  assert.match(runtime, /CUSTOM_CONTEXT_CATALOG_UNAVAILABLE/);
+  assert.match(library, /error\.is::<model_catalog::ContextBudgetCatalogError>\(\)/);
+  assert.match(runtime, /error\.is::<crate::model_catalog::ContextBudgetCatalogError>\(\)/);
   assert.match(
     runtime,
-    /super::recover_default_context_budgets_for_launch\(\s*&restart_state,?\s*\)/,
+    /super::recover_default_context_budgets_for_launch\(\s*&restart_state,\s*&reason\s*\)/,
   );
   assert.match(
     catalogRefresh,

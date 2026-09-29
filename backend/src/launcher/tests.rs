@@ -156,6 +156,7 @@ async fn custom_context_cold_start_can_retry_after_restoring_defaults() {
         error.to_string(),
         model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE
     );
+    assert!(error.is::<model_catalog::ContextBudgetCatalogError>());
     config.model_context_by_provider.clear();
     let startup =
         prepare_startup_model_catalog(&config, &config.profiles[0], home.path(), home.path())

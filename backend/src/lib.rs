@@ -227,9 +227,10 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
                 )
                 .await;
             }
-            Err(mut error) => {
+            Err(error) => {
                 eprintln!("Codey 自动启动 Codex 失败：{error:#}");
-                let context_recovery = error == model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE;
+                let context_recovery = error.is::<model_catalog::ContextBudgetCatalogError>();
+                let mut error = format!("{error:#}");
                 let cleanup = if context_recovery {
                     commands::cleanup_failed_runtime_start(&state)
                         .await
@@ -246,7 +247,7 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
                     );
                 }
                 if cleanup.is_ok() && context_recovery {
-                    match commands::recover_default_context_budgets_for_launch(&state).await {
+                    match commands::recover_default_context_budgets_for_launch(&state, &error).await {
                         Ok(true) => continue,
                         Ok(false) => {}
                         Err(recovery_error) => {
