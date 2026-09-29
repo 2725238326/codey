@@ -245,7 +245,7 @@ button,
   border-radius: 999px;
 }
 
-.settings-drawer-header {
+.settings-modal-header {
   border-bottom: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
   box-shadow: 0 3px 8px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
 }
@@ -1044,7 +1044,7 @@ button,
   z-index: 100;
 }
 
-.settings-drawer-body {
+.settings-modal-body {
   position: relative;
 }
 
@@ -1059,7 +1059,7 @@ button,
 }
 
 .toast-portal-host .toast-region,
-.settings-drawer-shell .toast-region,
+.settings-modal-shell .toast-region,
 .modal__dialog .toast-region {
   position: absolute;
   top: 10px;
