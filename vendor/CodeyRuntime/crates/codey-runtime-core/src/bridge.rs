@@ -309,7 +309,11 @@ async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedC
     let attempt_timeout = cdp_connect_attempt_timeout(candidates.len());
     let mut last_error = None;
     for candidate in &candidates {
-        match tokio::time::timeout(attempt_timeout, connect_async(candidate.as_str())).await {
+        // The TLS-capable handshake future is large even for loopback ws://.
+        // Keep it out of every enclosing startup future: their nested poll
+        // frames can otherwise exhaust the Windows main thread's 1 MiB stack.
+        let connect = Box::pin(connect_async(candidate.as_str()));
+        match tokio::time::timeout(attempt_timeout, connect).await {
             Ok(Ok((socket, _))) => return Ok(socket),
             Ok(Err(error)) => {
                 last_error =
@@ -820,6 +824,17 @@ fn next_message_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdp_connect_future_keeps_handshake_off_the_startup_stack() {
+        // Construct, but do not poll: this must not open a socket or need a runtime.
+        let connect = connect_cdp_websocket("ws://127.0.0.1:9229/devtools/page/test");
+        let bytes = std::mem::size_of_val(&connect);
+        assert!(
+            bytes <= 1024,
+            "CDP connect future embeds handshake state: {bytes} bytes"
+        );
+    }
 
     #[test]
     fn loopback_websocket_aliases_expand_to_ipv4_first() {
