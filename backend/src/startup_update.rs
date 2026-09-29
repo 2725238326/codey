@@ -145,12 +145,20 @@ async fn run_with_mode(
         return StartupUpdateOutcome::Continue;
     }
 
-    let confirmation_notes = candidate.check.rollback.as_ref().map(|r| format!("回退原因：{}\n{}", r.reason, candidate.check.release_notes.as_deref().unwrap_or("")));
+    let confirmation_notes = candidate.check.rollback.as_ref().map(|r| {
+        format!(
+            "回退原因：{}\n{}",
+            r.reason,
+            candidate.check.release_notes.as_deref().unwrap_or("")
+        )
+    });
     let should_update = ui
         .confirm_update(
             &candidate.check.current_version,
             &candidate.check.latest_version,
-            confirmation_notes.as_deref().or(candidate.check.release_notes.as_deref()),
+            confirmation_notes
+                .as_deref()
+                .or(candidate.check.release_notes.as_deref()),
         )
         .await
         .unwrap_or_default();
@@ -320,8 +328,8 @@ mod tests {
             sha256: asset.sha256.clone(),
             asset,
             publish_id: None,
-                policy_id: None,
-                rollback: None,
+            policy_id: None,
+            rollback: None,
         }
     }
 

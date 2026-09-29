@@ -69,6 +69,10 @@ const updateAvailable = (
   check: UpdateCheck | null | undefined,
 ): check is UpdateCheck => check?.updateAvailable === true;
 
+function updatePromptKey(result: Pick<UpdateCheck, "latestVersion" | "rollback">): string {
+  return result.rollback ? `rollback:${result.rollback.id}` : result.latestVersion;
+}
+
 function updateCheckText(result: UpdateCheck) {
   if (result.rollback) return `可从 v${result.currentVersion} 回退至 v${result.latestVersion}：${result.rollback.reason}`;
   const base = result.updateAvailable
@@ -230,10 +234,10 @@ export function useAppUpdates({
           const deferredVersion = readDeferredVersion();
           if (
             result.selectedAsset &&
-            promptedVersionRef.current !== result.latestVersion &&
-            deferredVersion !== result.latestVersion
+            promptedVersionRef.current !== updatePromptKey(result) &&
+            deferredVersion !== updatePromptKey(result)
           ) {
-            promptedVersionRef.current = result.latestVersion;
+            promptedVersionRef.current = updatePromptKey(result);
             askDownloadUpdate(result);
           }
           return;
@@ -289,7 +293,7 @@ export function useAppUpdates({
         text,
       });
       if (result.updateAvailable && result.selectedAsset) {
-        promptedVersionRef.current = result.latestVersion;
+        promptedVersionRef.current = updatePromptKey(result);
         if (
           downloadedUpdate?.latestVersion === result.latestVersion &&
           downloadedUpdate.publishId === result.publishId &&
@@ -331,7 +335,7 @@ export function useAppUpdates({
       confirmLabel: target.rollback ? "下载回退版本" : "立即更新",
       run: () => void downloadUpdate(target),
       // 用户已经在这次运行里明确推迟过这个版本，自动检查就不再反复弹窗。
-      onDismiss: () => writeDeferredVersion(target.latestVersion),
+      onDismiss: () => writeDeferredVersion(updatePromptKey(target)),
     });
   }
 
@@ -377,7 +381,7 @@ export function useAppUpdates({
       confirmLabel: target.rollback ? "回退并重启" : "安装并重启",
       run: () => void installDownloadedUpdate(target),
       // 安装包已经下载好，"稍后"只影响自动提示，不影响用户从版本入口手动安装。
-      onDismiss: () => writeDeferredVersion(target.latestVersion),
+      onDismiss: () => writeDeferredVersion(updatePromptKey(target)),
     });
   }
 

@@ -40,7 +40,10 @@ impl NativeUpdateUi {
         latest_version: &str,
         release_notes: Option<&str>,
     ) -> Result<bool, String> {
-        let rollback = semver::Version::parse(latest_version).ok().zip(semver::Version::parse(current_version).ok()).is_some_and(|(target, current)| target < current);
+        let rollback = semver::Version::parse(latest_version)
+            .ok()
+            .zip(semver::Version::parse(current_version).ok())
+            .is_some_and(|(target, current)| target < current);
         let notes = release_notes
             .map(str::trim)
             .filter(|notes| !notes.is_empty())

@@ -213,8 +213,11 @@ async fn get_device_machine_no(state: &AppState) -> Result<Value, String> {
 
 pub async fn download_update(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
     let candidate = update_candidate_with_ttl(state, UPDATE_DOWNLOAD_CACHE_TTL).await?;
-    if args.get("expectedVersion").and_then(Value::as_str) != Some(candidate.check.latest_version.as_str())
-        || args.get("expectedPolicyId").and_then(Value::as_str) != candidate.check.policy_id.as_deref() {
+    if args.get("expectedVersion").and_then(Value::as_str)
+        != Some(candidate.check.latest_version.as_str())
+        || args.get("expectedPolicyId").and_then(Value::as_str)
+            != candidate.check.policy_id.as_deref()
+    {
         return Err("更新目标已变化，请重新检查并确认更新".to_string());
     }
     let download = download_update_candidate(state, &candidate).await?;
@@ -523,7 +526,12 @@ async fn fetch_release_admin_update(
     check.release_notes = candidate.release_notes.or(manifest.release_notes);
     check.policy_id = candidate.publish_id.clone();
     if let Some(directive) = candidate.rollback {
-        authorize_rollback(&mut check, directive, candidate.publish_id.as_deref(), identity.is_some())?;
+        authorize_rollback(
+            &mut check,
+            directive,
+            candidate.publish_id.as_deref(),
+            identity.is_some(),
+        )?;
     }
     check.publish_id = if candidate.track_delivery == Some(false) {
         None
@@ -534,12 +542,21 @@ async fn fetch_release_admin_update(
 }
 
 // 只有管理服务明确授权的源版本客户端才允许降级。
-fn authorize_rollback(check: &mut UpdateCheck, directive: RollbackDirective, publish_id: Option<&str>, authenticated: bool) -> Result<(), String> {
+fn authorize_rollback(
+    check: &mut UpdateCheck,
+    directive: RollbackDirective,
+    publish_id: Option<&str>,
+    authenticated: bool,
+) -> Result<(), String> {
     let source = Version::parse(&check.current_version).map_err(|e| e.to_string())?;
     let target = Version::parse(&check.latest_version).map_err(|e| e.to_string())?;
-    if !authenticated || directive.id.is_empty() || Some(directive.id.as_str()) != publish_id
+    if !authenticated
+        || directive.id.is_empty()
+        || Some(directive.id.as_str()) != publish_id
         || directive.source_version != check.current_version
-        || directive.target_version != check.latest_version || target >= source {
+        || directive.target_version != check.latest_version
+        || target >= source
+    {
         return Err("回退授权与当前客户端或目标版本不一致，请重新检查更新".to_string());
     }
     check.update_available = true;
@@ -548,9 +565,12 @@ fn authorize_rollback(check: &mut UpdateCheck, directive: RollbackDirective, pub
 }
 
 fn validate_same_update(approved: &UpdateCheck, current: &UpdateCheck) -> Result<(), String> {
-    if !current.update_available || approved.latest_version != current.latest_version
-        || approved.policy_id != current.policy_id || approved.rollback != current.rollback
-        || approved.selected_asset != current.selected_asset {
+    if !current.update_available
+        || approved.latest_version != current.latest_version
+        || approved.policy_id != current.policy_id
+        || approved.rollback != current.rollback
+        || approved.selected_asset != current.selected_asset
+    {
         return Err("发布策略已变化或回退授权已失效，请重新检查并确认更新".to_string());
     }
     Ok(())
@@ -605,7 +625,8 @@ pub(crate) async fn download_update_candidate(
     };
     // 保存用户确认的批次，进程重启后也要检查同一份授权。
     let approval = serde_json::to_vec(&candidate.check).map_err(|e| e.to_string())?;
-    tokio::fs::write(file_path.with_extension("approval.json"), approval).await
+    tokio::fs::write(file_path.with_extension("approval.json"), approval)
+        .await
         .map_err(|e| format!("保存更新确认信息失败：{e}"))?;
     if let Some(publish_id) = candidate.check.publish_id.as_deref() {
         let _ = report_publish_event(state, publish_id, "downloaded", None).await;
@@ -732,7 +753,8 @@ pub(crate) async fn start_downloaded_update(
     let expected_update = resolve_expected_update(state).await?;
     let verified = verify_downloaded_update(&state.store, file_path, &expected_update).await?;
     if configured_release_admin_url(state).await?.is_some() {
-        let bytes = tokio::fs::read(verified.path.with_extension("approval.json")).await
+        let bytes = tokio::fs::read(verified.path.with_extension("approval.json"))
+            .await
             .map_err(|_| "缺少更新确认信息，请重新下载并确认更新".to_string())?;
         let approved: UpdateCheck = serde_json::from_slice(&bytes)
             .map_err(|_| "更新确认信息无效，请重新下载".to_string())?;
@@ -851,8 +873,8 @@ pub(super) fn assess_update_manifest(
         selected_asset: selected_update_asset(&manifest.assets).map(|asset| asset_info(&asset)),
         release_notes: manifest.release_notes.clone(),
         publish_id: None,
-            policy_id: None,
-            rollback: None,
+        policy_id: None,
+        rollback: None,
     })
 }
 
@@ -1577,16 +1599,39 @@ mod tests {
         let manifest = valid_manifest("1.0.0");
         let base = assess_update_manifest("2.0.0", &manifest).unwrap();
         assert!(!base.update_available);
-        let directive = RollbackDirective { id: "rollback-1".into(), source_version: "2.0.0".into(), target_version: "1.0.0".into(), reason: "启动故障".into() };
+        let directive = RollbackDirective {
+            id: "rollback-1".into(),
+            source_version: "2.0.0".into(),
+            target_version: "1.0.0".into(),
+            reason: "启动故障".into(),
+        };
         let mut authorized = base.clone();
         authorize_rollback(&mut authorized, directive.clone(), Some("rollback-1"), true).unwrap();
         assert!(authorized.update_available);
         assert!(authorized.rollback.is_some());
-        assert!(authorize_rollback(&mut base.clone(), directive.clone(), Some("rollback-2"), true).is_err());
-        assert!(authorize_rollback(&mut base.clone(), directive.clone(), Some("rollback-1"), false).is_err());
-        let mut wrong = directive.clone(); wrong.source_version = "3.0.0".into();
+        assert!(
+            authorize_rollback(
+                &mut base.clone(),
+                directive.clone(),
+                Some("rollback-2"),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_rollback(
+                &mut base.clone(),
+                directive.clone(),
+                Some("rollback-1"),
+                false
+            )
+            .is_err()
+        );
+        let mut wrong = directive.clone();
+        wrong.source_version = "3.0.0".into();
         assert!(authorize_rollback(&mut base.clone(), wrong, Some("rollback-1"), true).is_err());
-        let mut wrong = directive; wrong.target_version = "0.9.0".into();
+        let mut wrong = directive;
+        wrong.target_version = "0.9.0".into();
         assert!(authorize_rollback(&mut base.clone(), wrong, Some("rollback-1"), true).is_err());
     }
 
@@ -1595,17 +1640,29 @@ mod tests {
         let mut approved = install_check("1.0.0", "Codey.zip", b"package");
         approved.current_version = "2.0.0".into();
         approved.policy_id = Some("rollback-1".into());
-        approved.rollback = Some(RollbackDirective { id: "rollback-1".into(), source_version: "2.0.0".into(), target_version: "1.0.0".into(), reason: "故障".into() });
+        approved.rollback = Some(RollbackDirective {
+            id: "rollback-1".into(),
+            source_version: "2.0.0".into(),
+            target_version: "1.0.0".into(),
+            reason: "故障".into(),
+        });
         assert!(validate_same_update(&approved, &approved).is_ok());
-        let mut changed = approved.clone(); changed.update_available = false;
+        let mut changed = approved.clone();
+        changed.update_available = false;
         assert!(validate_same_update(&approved, &changed).is_err());
-        let mut changed = approved.clone(); changed.policy_id = Some("publish-next".into());
+        let mut changed = approved.clone();
+        changed.policy_id = Some("publish-next".into());
         assert!(validate_same_update(&approved, &changed).is_err());
-        let mut changed = approved.clone(); changed.rollback = None;
+        let mut changed = approved.clone();
+        changed.rollback = None;
         assert!(validate_same_update(&approved, &changed).is_err());
         let next = install_check("3.0.0", "Codey.zip", b"next");
         assert!(validate_same_update(&approved, &next).is_err());
-        assert!(assess_update_manifest("2.0.0", &valid_manifest("3.0.0")).unwrap().update_available);
+        assert!(
+            assess_update_manifest("2.0.0", &valid_manifest("3.0.0"))
+                .unwrap()
+                .update_available
+        );
     }
 
     #[test]
