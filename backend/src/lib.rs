@@ -247,7 +247,8 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
                     );
                 }
                 if cleanup.is_ok() && context_recovery {
-                    match commands::recover_default_context_budgets_for_launch(&state, &error).await {
+                    match commands::recover_default_context_budgets_for_launch(&state, &error).await
+                    {
                         Ok(true) => continue,
                         Ok(false) => {}
                         Err(recovery_error) => {
