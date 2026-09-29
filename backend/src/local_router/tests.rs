@@ -11936,16 +11936,15 @@ async fn chat_stream_keeps_distinct_tools_separate_across_both_shapes() {
 }
 
 #[tokio::test]
-async fn router_listener_stays_inside_the_high_port_range_and_never_repeats() {
+async fn router_listener_binds_loopback_and_never_repeats_live_ports() {
     // 绑定成功即独占端口，所以并发/连续启动不会把同一个端口分配两次。
     let mut listeners: Vec<TcpListener> = Vec::new();
     for _ in 0..16 {
         let listener = bind_router_listener().await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert!(
-            (ROUTER_PORT_RANGE_START..=ROUTER_PORT_RANGE_END).contains(&port),
-            "端口 {port} 落在高位区间之外"
-        );
+        let address = listener.local_addr().unwrap();
+        assert_eq!(address.ip(), std::net::Ipv4Addr::LOCALHOST);
+        let port = address.port();
+        assert_ne!(port, 0);
         for existing in &listeners {
             assert_ne!(
                 existing.local_addr().unwrap().port(),
@@ -11959,19 +11958,90 @@ async fn router_listener_stays_inside_the_high_port_range_and_never_repeats() {
 
 #[tokio::test]
 async fn an_occupied_candidate_port_is_skipped() {
-    // 占住区间内第一个可用端口，再让探测从它开始，验证会换到下一个候选。
-    let mut first_free = None;
-    for step in 0..u32::from(ROUTER_PORT_PROBES) {
-        let port = ROUTER_PORT_RANGE_START + step as u16;
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
-            first_free = Some((step, listener));
-            break;
-        }
+    // 模拟区间末尾被占用，确认探测回到起点，不依赖本机端口状态。
+    let mut attempted = Vec::new();
+    let offset = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START);
+    let port = bind_router_listener_with(offset, |address| {
+        attempted.push(address.port());
+        std::future::ready(if address.port() == ROUTER_PORT_RANGE_END {
+            Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+        } else {
+            Ok(address.port())
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(port, ROUTER_PORT_RANGE_START);
+    assert_eq!(
+        attempted,
+        vec![ROUTER_PORT_RANGE_END, ROUTER_PORT_RANGE_START]
+    );
+}
+
+#[tokio::test]
+async fn router_listener_uses_the_first_available_high_port() {
+    for offset in [
+        0,
+        123,
+        u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START),
+    ] {
+        let mut attempted = Vec::new();
+        let port = bind_router_listener_with(offset, |address| {
+            assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
+            attempted.push(address.port());
+            std::future::ready(Ok(address.port()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(port, ROUTER_PORT_RANGE_START + offset as u16);
+        assert_eq!(attempted, vec![port]);
     }
-    let (offset, blocked) = first_free.expect("高位端口区间内没有可用端口，无法构造跳过占用的场景");
-    let blocked_port = blocked.local_addr().unwrap().port();
-    let listener = bind_router_listener_from(offset).await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    assert_ne!(port, blocked_port, "被占用的端口 {blocked_port} 仍被分配");
-    assert!((ROUTER_PORT_RANGE_START..=ROUTER_PORT_RANGE_END).contains(&port));
+}
+
+#[tokio::test]
+async fn router_listener_falls_back_after_all_candidates_fail() {
+    for kind in [
+        std::io::ErrorKind::AddrInUse,
+        std::io::ErrorKind::PermissionDenied,
+    ] {
+        let mut attempted = Vec::new();
+        let port = bind_router_listener_with(0, |address| {
+            assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
+            attempted.push(address.port());
+            std::future::ready(if address.port() == 0 {
+                Ok(59_775)
+            } else {
+                Err(std::io::Error::from(kind))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(port, 59_775);
+        let expected: Vec<_> = (ROUTER_PORT_RANGE_START
+            ..ROUTER_PORT_RANGE_START + ROUTER_PORT_PROBES)
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(attempted, expected);
+    }
+}
+
+#[tokio::test]
+async fn router_listener_reports_kernel_allocation_failure() {
+    let mut attempts = 0;
+    let error = bind_router_listener_with::<u16, _, _>(0, |address| {
+        attempts += 1;
+        std::future::ready(Err(std::io::Error::from(if address.port() == 0 {
+            std::io::ErrorKind::PermissionDenied
+        } else {
+            std::io::ErrorKind::AddrInUse
+        })))
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(attempts, usize::from(ROUTER_PORT_PROBES) + 1);
+    assert_eq!(error.to_string(), "启动 Codey 本地路由失败");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
 }

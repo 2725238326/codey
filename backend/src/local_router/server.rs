@@ -91,8 +91,8 @@ impl RequestLogCatalog {
     }
 }
 
-/// 本地路由监听的端口区间。落在这个高位区间可以避开常见开发服务的低位端口，
-/// 也避开系统临时端口区间里被出站连接随手拿走的那部分端口。
+/// 本地路由优先尝试的高位端口区间，用于避开常见开发服务的低位端口。
+/// 连续候选均不可用时由内核分配，实际端口可能在区间之外。
 pub(crate) const ROUTER_PORT_RANGE_START: u16 = 45_000;
 pub(crate) const ROUTER_PORT_RANGE_END: u16 = 55_000;
 /// 从随机起点最多连续探测多少个候选端口，全都不可用时回退由内核分配。
@@ -101,11 +101,24 @@ pub(crate) const ROUTER_PORT_PROBES: u16 = 64;
 /// 在区间内从 `offset` 指定的端口开始顺序探测可用端口，候选被占用就换下一个。
 /// `bind` 成功即独占该端口，所以并发启动的多个实例不会拿到同一个端口。
 pub(crate) async fn bind_router_listener_from(offset: u32) -> Result<TcpListener> {
+    bind_router_listener_with(offset, |address| TcpListener::bind(address)).await
+}
+
+pub(super) async fn bind_router_listener_with<T, F, Fut>(offset: u32, mut bind: F) -> Result<T>
+where
+    F: FnMut(std::net::SocketAddrV4) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
     let span = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START) + 1;
     let mut occupied = Vec::new();
     for step in 0..u32::from(ROUTER_PORT_PROBES) {
         let port = ROUTER_PORT_RANGE_START + ((offset + step) % span) as u16;
-        match TcpListener::bind(("127.0.0.1", port)).await {
+        match bind(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        ))
+        .await
+        {
             Ok(listener) => return Ok(listener),
             Err(error) => occupied.push((port, error)),
         }
@@ -128,9 +141,12 @@ pub(crate) async fn bind_router_listener_from(offset: u32) -> Result<TcpListener
                 .collect::<Vec<_>>(),
         }),
     );
-    TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .context("启动 Codey 本地路由失败")
+    bind(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        0,
+    ))
+    .await
+    .context("启动 Codey 本地路由失败")
 }
 
 /// 随机起点避免同一台机器上并发启动的实例都从同一个端口开始竞争。
