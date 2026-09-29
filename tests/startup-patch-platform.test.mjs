@@ -189,20 +189,29 @@ test("Windows startup patch requires app-server runtime override validation", as
   assert.ok(environmentBranch.includes("return Ok((spawned, true))"));
 });
 
-test("Store environment launch verifies the suspended process before resuming", async () => {
+test("Store environment launch supplies package identity before creation and verifies before resume", async () => {
   const source = await readSource("backend/src/launcher/windows_packaged.rs");
   assert.doesNotMatch(source, /EnableDebugging|DisableDebugging|WindowsPackageDebugSession/);
   assert.ok(source.includes("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW"));
+  assert.match(source, /const PACKAGE_NAME_ATTRIBUTE: usize = 0x0002_0008;/);
+  assert.match(source, /UpdateProcThreadAttribute\([\s\S]*?PACKAGE_NAME_ATTRIBUTE,[\s\S]*?attributes\.package\.as_ptr\(\)/);
+  assert.match(source, /startup\.StartupInfo\.cb = std::mem::size_of::<STARTUPINFOEXW>\(\) as u32/);
+  assert.match(source, /startup\.lpAttributeList = attributes\.as_mut_ptr\(\)/);
+  assert.match(source, /flags \|= EXTENDED_STARTUPINFO_PRESENT/);
+  assert.match(source, /CreateProcessW\([\s\S]*?flags,[\s\S]*?&startup\.StartupInfo/);
+  assert.match(source, /impl Drop for PackageAttributes[\s\S]*?DeleteProcThreadAttributeList/);
   assert.ok(source.includes("process.package_full_name()") || source.includes(".package_full_name()"));
   assert.ok(source.includes("QueryFullProcessImageNameW"));
+  const creation = source.indexOf("SuspendedProcess::create(command, Some(&expected_package))");
   const verification = source.indexOf(".verify(&expected_package, &executable)");
   const resume = source.indexOf("pending.resume()", verification);
   const cleanup = source.indexOf("let stopped = pending.stop()", resume);
   const handoff = source.indexOf("startup_process: pending.process.take()", cleanup);
-  assert.ok(verification >= 0 && resume > verification && cleanup > resume && handoff > cleanup);
+  assert.ok(creation >= 0 && verification > creation && resume > verification && cleanup > resume && handoff > cleanup);
   assert.ok(source.includes("startup_activation_error_after_cleanup"));
   assert.ok(source.includes("TerminateProcess(handle, 1)"));
   assert.ok(source.includes("WaitForSingleObject(handle, 8000)"));
+  assert.ok(source.includes("fn registered_store_package_creates_with_environment_and_identity()"));
 });
 
 test("macOS startup patch requires app-server runtime override validation", async () => {

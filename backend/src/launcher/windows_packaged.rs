@@ -9,12 +9,14 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal};
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    PROCESS_INFORMATION, PROCESS_NAME_WIN32, QueryFullProcessImageNameW, ResumeThread,
-    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+    QueryFullProcessImageNameW, ResumeThread, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -23,6 +25,77 @@ use super::platform::{
     startup_activation_error_after_cleanup,
 };
 use super::{SpawnedCodex, recovery};
+
+// ProcThreadAttributePackageName (8), input attribute (0x20000). This Windows
+// AppModel attribute is not exposed by the public SDK or windows-rs. Its ABI
+// is also used by NtCoreLib's Win32ProcessConfig.PackageName. Keep failures
+// recoverable; never silently retry a required environment without identity.
+// https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools/blob/main/NtCoreLib/Win32/Process/Interop/Win32ProcessAttributes.cs
+const PACKAGE_NAME_ATTRIBUTE: usize = 0x0002_0008;
+
+struct PackageAttributes {
+    // Attribute storage must be pointer-aligned and remain at the same address.
+    storage: Vec<usize>,
+    // UpdateProcThreadAttribute borrows this UTF-16 buffer until CreateProcessW.
+    package: Vec<u16>,
+}
+
+impl PackageAttributes {
+    fn new(package: &str) -> Result<Self> {
+        let package = wide(OsStr::new(package))?;
+        anyhow::ensure!(!package.is_empty(), "Windows 启动包身份为空");
+        let mut bytes = 0;
+        let probe = unsafe {
+            InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST::default(),
+                1,
+                0,
+                &mut bytes,
+            )
+        };
+        match probe {
+            Err(error) if error.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() && bytes > 0 => {}
+            Err(error) => return Err(error).context("查询 Windows 包身份启动属性大小失败"),
+            Ok(()) => anyhow::bail!("Windows 包身份启动属性大小查询返回异常"),
+        }
+        let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+        unsafe {
+            InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast()),
+                1,
+                0,
+                &mut bytes,
+            )
+        }
+        .context("初始化 Windows 包身份启动属性失败")?;
+        // Only construct the owner after initialization succeeds. It also frees
+        // the initialized list if setting the package attribute fails.
+        let mut attributes = Self { storage, package };
+        unsafe {
+            UpdateProcThreadAttribute(
+                attributes.as_mut_ptr(),
+                0,
+                PACKAGE_NAME_ATTRIBUTE,
+                Some(attributes.package.as_ptr().cast()),
+                std::mem::size_of_val(attributes.package.as_slice()),
+                None,
+                None,
+            )
+        }
+        .context("Windows 不支持本次包身份启动属性，已停止集成启动")?;
+        Ok(attributes)
+    }
+
+    fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        LPPROC_THREAD_ATTRIBUTE_LIST(self.storage.as_mut_ptr().cast())
+    }
+}
+
+impl Drop for PackageAttributes {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+    }
+}
 
 fn wide(value: &OsStr) -> Result<Vec<u16>> {
     let value: Vec<_> = value.encode_wide().collect();
@@ -116,7 +189,7 @@ struct SuspendedProcess {
 }
 
 impl SuspendedProcess {
-    fn create(command: &Command) -> Result<Self> {
+    fn create(command: &Command, package: Option<&str>) -> Result<Self> {
         let mut executable = wide(command.get_program())?;
         executable.push(0);
         let mut arguments = command_line(command)?;
@@ -129,10 +202,20 @@ impl SuspendedProcess {
                 Ok::<_, anyhow::Error>(value)
             })
             .transpose()?;
-        let startup = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        let mut attributes = package.map(PackageAttributes::new).transpose()?;
+        let mut startup = STARTUPINFOEXW {
+            StartupInfo: STARTUPINFOW {
+                cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+                ..Default::default()
+            },
             ..Default::default()
         };
+        let mut flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+        if let Some(attributes) = &mut attributes {
+            startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            startup.lpAttributeList = attributes.as_mut_ptr();
+            flags |= EXTENDED_STARTUPINFO_PRESENT;
+        }
         let mut info = PROCESS_INFORMATION::default();
         unsafe {
             CreateProcessW(
@@ -141,12 +224,12 @@ impl SuspendedProcess {
                 None,
                 None,
                 false,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                flags,
                 Some(environment.as_ptr().cast()),
                 directory
                     .as_ref()
                     .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr())),
-                &startup,
+                &startup.StartupInfo,
                 &mut info,
             )
         }
@@ -252,7 +335,11 @@ pub(super) fn spawn_with_environment(app_dir: &Path, command: &Command) -> Resul
         std::fs::canonicalize(command.get_program())? == executable,
         "Windows Store Codex 启动命令与所选安装不一致"
     );
-    let mut pending = SuspendedProcess::create(command).map_err(recovery::recoverable)?;
+    // A path under WindowsApps does not itself grant a package activation
+    // context. Supply the verified identity before process creation, then still
+    // verify the exact process handle before allowing any application code.
+    let mut pending = SuspendedProcess::create(command, Some(&expected_package))
+        .map_err(recovery::recoverable)?;
     if let Err(error) = pending
         .verify(&expected_package, &executable)
         .and_then(|_| pending.resume())
@@ -319,7 +406,7 @@ mod tests {
     fn suspended_child_receives_environment_only_after_resume() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("probe.json");
-        let mut pending = SuspendedProcess::create(&probe_command(&output)).unwrap();
+        let mut pending = SuspendedProcess::create(&probe_command(&output), None).unwrap();
         assert!(!output.exists());
         assert_eq!(pending.process.as_ref().unwrap().exit_code().unwrap(), None);
         pending.resume().unwrap();
@@ -340,7 +427,7 @@ mod tests {
     fn rejected_package_is_stopped_without_executing_its_entrypoint() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("must-not-exist");
-        let mut pending = SuspendedProcess::create(&probe_command(&output)).unwrap();
+        let mut pending = SuspendedProcess::create(&probe_command(&output), None).unwrap();
         let observer = WindowsStartupProcess::open(pending.process_id).unwrap();
         assert!(
             pending
@@ -359,11 +446,63 @@ mod tests {
     fn abandoned_suspended_child_is_terminated_on_drop() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("must-not-exist");
-        let pending = SuspendedProcess::create(&probe_command(&output)).unwrap();
+        let pending = SuspendedProcess::create(&probe_command(&output), None).unwrap();
         let observer = WindowsStartupProcess::open(pending.process_id).unwrap();
         drop(pending);
         assert!(observer.exit_code().unwrap().is_some());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn package_attributes_reject_empty_or_embedded_nul_identity() {
+        assert!(PackageAttributes::new("").is_err());
+        assert!(PackageAttributes::new("OpenAI.Codex\0other").is_err());
+    }
+
+    #[test]
+    fn unregistered_package_cannot_run_the_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("must-not-exist");
+        let result = SuspendedProcess::create(
+            &probe_command(&output),
+            Some("Codey.UnregisteredLaunchProbe_0.0.0.0_x64__2p2nqsd0c76g0"),
+        );
+        assert!(
+            result.is_err(),
+            "Windows accepted an unregistered package identity"
+        );
+        assert!(!output.exists());
+    }
+
+    // Unlike the ordinary test executable above, this exercises the protected
+    // WindowsApps image and actual registered package token. Never resume it:
+    // the smoke test must not start a GUI or read the user's Codex account.
+    #[test]
+    #[ignore = "Requires Windows with Store Codex installed; set CODEY_TEST_STORE_APP_DIR"]
+    fn registered_store_package_creates_with_environment_and_identity() {
+        let configured = std::env::var_os("CODEY_TEST_STORE_APP_DIR")
+            .expect("set CODEY_TEST_STORE_APP_DIR to the selected Store Codex app directory");
+        let app_dir =
+            super::super::platform::refresh_windows_packaged_app_dir(Path::new(&configured))
+                .unwrap();
+        codey_runtime_core::app_paths::validate_codex_app_dir(&app_dir).unwrap();
+        let package = codey_runtime_core::app_paths::packaged_app_full_name(&app_dir).unwrap();
+        let executable = std::fs::canonicalize(
+            codey_runtime_core::app_paths::build_codex_executable(&app_dir),
+        )
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .env("CODEX_HOME", home.path())
+            .env(PROBE_VALUE, "Store environment");
+        let mut pending = SuspendedProcess::create(&command, Some(&package)).unwrap();
+        pending.verify(&package, &executable).unwrap();
+        let observer = WindowsStartupProcess::open(pending.process_id).unwrap();
+        assert_eq!(observer.exit_code().unwrap(), None);
+        pending.stop().unwrap();
+        assert!(observer.exit_code().unwrap().is_some());
+        assert!(home.path().read_dir().unwrap().next().is_none());
     }
 
     #[test]

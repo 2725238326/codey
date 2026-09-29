@@ -317,8 +317,8 @@ pub(super) async fn spawn_windows_codex(
         } = activation
     {
         // Ordinary activation cannot carry this launch's CLI wrapper or home.
-        // Create the registered desktop executable suspended and verify its
-        // package identity before resuming; never install a package debugger.
+        // Supply the registered package identity when creating the suspended
+        // desktop process, then verify it before resuming; never install a debugger.
         if needs_packaged_environment {
             let command = build_codex_command(app_dir, debug_port, extra_args);
             let mut child_command = std::process::Command::new(&command[0]);
