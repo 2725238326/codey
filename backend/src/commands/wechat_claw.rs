@@ -1657,13 +1657,24 @@ mod tests {
             }],
         })
         .to_string();
+        let (poll_started, poll_started_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let mut paths = Vec::new();
-            for body in ["{}".to_string(), next_update, "{}".to_string()] {
+            for body in ["{}".to_string(), next_update] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 paths.push(read_test_request_path(&mut stream).await);
                 write_test_json_response(&mut stream, &body).await;
             }
+
+            // 保持第二次长轮询未响应，明确同步停止时机，避免依赖任务调度速度。
+            let (mut pending_poll, _) = listener.accept().await.unwrap();
+            paths.push(read_test_request_path(&mut pending_poll).await);
+            poll_started.send(()).unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            paths.push(read_test_request_path(&mut stream).await);
+            write_test_json_response(&mut stream, "{}").await;
+            drop(pending_poll);
             paths
         });
 
@@ -1684,19 +1695,13 @@ mod tests {
         });
 
         sync_wechat_claw_service(&state).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if state.config.read().await.webhook.channels[0].get_updates_buf
-                    == "cursor-after-restart"
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("sync progress should be persisted");
-        stop_wechat_claw_service(&state).await;
+        tokio::time::timeout(Duration::from_secs(5), poll_started_rx)
+            .await
+            .expect("sync should persist progress and start the next poll")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stop_wechat_claw_service(&state))
+            .await
+            .expect("sync should stop without waiting for the pending poll");
         let paths = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("sync start, poll, and stop requests should complete")
@@ -1707,6 +1712,7 @@ mod tests {
             [
                 "/ilink/bot/msg/notifystart",
                 "/ilink/bot/getupdates",
+                "/ilink/bot/getupdates",
                 "/ilink/bot/msg/notifystop"
             ]
         );
@@ -1715,6 +1721,10 @@ mod tests {
         assert_eq!(memory.settings_revision, 12);
         assert_eq!(disk.settings_revision, 12);
         assert_eq!(
+            memory.webhook.channels[0].get_updates_buf,
+            "cursor-after-restart"
+        );
+        assert_eq!(
             memory.webhook.channels[0].context_token,
             "context-after-restart"
         );
@@ -1722,6 +1732,7 @@ mod tests {
             disk.webhook.channels[0].get_updates_buf,
             "cursor-after-restart"
         );
+        assert_eq!(disk.webhook.channels[0].context_token, "context-after-restart");
     }
 
     #[tokio::test]
