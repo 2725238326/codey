@@ -40,7 +40,8 @@ test("Windows startup update UI uses a dedicated message loop and custom task-di
     ui,
     /rfd::MessageButtons::OkCancelCustom\(primary_label, secondary_label\)/,
   );
-  assert.match(ui, /"更新并重启"\.to_string\(\),\s*Some\("稍后"\.to_string\(\)\)/);
+  assert.match(ui, /if rollback[\s\S]*?"回退并重启"[\s\S]*?"更新并重启"/);
+  assert.match(ui, /Some\("稍后"\.to_string\(\)\)/);
   assert.match(manifest, /Microsoft\.Windows\.Common-Controls/);
   assert.match(manifest, /version="6\.0\.0\.0"/);
   assert.match(cargo, /features = \["common-controls-v6"\]/);

@@ -20,6 +20,18 @@ const UPDATE_DOWNLOAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_UPDATE_MANIFEST_BYTES: usize = 1024 * 1024;
 static DEVICE_IDENTITY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(test)]
+struct TestDeviceVersions {
+    codex: Option<String>,
+    os: Option<String>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    // 仅替换当前测试任务的环境探测，不改动其他并行测试使用的版本缓存。
+    static TEST_DEVICE_VERSIONS: TestDeviceVersions;
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct UpdateManifest {
     schema_version: u32,
@@ -41,7 +53,7 @@ struct UpdateManifestAsset {
     size: u64,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateCheck {
     pub(crate) current_version: String,
@@ -52,9 +64,13 @@ pub(crate) struct UpdateCheck {
     pub(crate) release_notes: Option<String>,
     #[serde(default)]
     pub(crate) publish_id: Option<String>,
+    #[serde(default)]
+    pub(crate) policy_id: Option<String>,
+    #[serde(default)]
+    pub(crate) rollback: Option<RollbackDirective>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateAssetInfo {
     pub(crate) platform: String,
@@ -66,7 +82,7 @@ pub(crate) struct UpdateAssetInfo {
     pub(crate) size: u64,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateDownload {
     pub(crate) latest_version: String,
@@ -77,6 +93,10 @@ pub(crate) struct UpdateDownload {
     pub(crate) asset: UpdateAssetInfo,
     #[serde(default)]
     pub(crate) publish_id: Option<String>,
+    #[serde(default)]
+    pub(crate) policy_id: Option<String>,
+    #[serde(default)]
+    pub(crate) rollback: Option<RollbackDirective>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,8 +106,19 @@ struct DeviceIdentity {
     machine_no: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RollbackDirective {
+    pub(crate) id: String,
+    pub(crate) source_version: String,
+    pub(crate) target_version: String,
+    pub(crate) reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct DeviceUpdateResponse {
+    #[serde(default)]
+    rollback: Option<RollbackDirective>,
     #[serde(rename = "trackDelivery", default)]
     track_delivery: Option<bool>,
     #[serde(rename = "updateAvailable", default)]
@@ -144,7 +175,7 @@ pub(super) async fn invoke(
             check_for_updates(state, force_refresh).await
         }
         "get_device_machine_no" => get_device_machine_no(state).await,
-        "download_update" => download_update(state).await,
+        "download_update" => download_update(state, args).await,
         "update_install_report" => update_install_report(state).await,
         "install_downloaded_update" => {
             install_downloaded_update(state, super::string_argument(args, "filePath")?).await
@@ -180,8 +211,12 @@ async fn get_device_machine_no(state: &AppState) -> Result<Value, String> {
     Ok(json!(identity.machine_no))
 }
 
-pub async fn download_update(state: &Arc<AppState>) -> Result<Value, String> {
+pub async fn download_update(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
     let candidate = update_candidate_with_ttl(state, UPDATE_DOWNLOAD_CACHE_TTL).await?;
+    if args.get("expectedVersion").and_then(Value::as_str) != Some(candidate.check.latest_version.as_str())
+        || args.get("expectedPolicyId").and_then(Value::as_str) != candidate.check.policy_id.as_deref() {
+        return Err("更新目标已变化，请重新检查并确认更新".to_string());
+    }
     let download = download_update_candidate(state, &candidate).await?;
     serde_json::to_value(download).map_err(|error| error.to_string())
 }
@@ -362,6 +397,7 @@ async fn load_or_register_device(
     let install_key = format!("{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let body = json!({
         "installKey": install_key,
+        "rollbackProtocol": 1,
         "platform": current_update_platform(),
         "arch": current_update_arch(),
         "currentVersion": env!("CARGO_PKG_VERSION"),
@@ -434,6 +470,7 @@ async fn fetch_release_admin_update(
     // Codex 与系统版本随每次检查更新上报，服务端据此判断版本是否适配本机。
     let mut query = vec![
         ("currentVersion", env!("CARGO_PKG_VERSION").to_string()),
+        ("rollbackProtocol", "1".to_string()),
         ("osName", current_os_name().to_string()),
     ];
     if let Some(codex_version) = current_codex_version().await {
@@ -474,6 +511,8 @@ async fn fetch_release_admin_update(
             selected_asset: None,
             release_notes: None,
             publish_id: None,
+            policy_id: None,
+            rollback: None,
         });
     }
     let manifest_url = candidate
@@ -482,12 +521,39 @@ async fn fetch_release_admin_update(
     let manifest = fetch_configured_update_manifest(state, &manifest_url).await?;
     let mut check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?;
     check.release_notes = candidate.release_notes.or(manifest.release_notes);
+    check.policy_id = candidate.publish_id.clone();
+    if let Some(directive) = candidate.rollback {
+        authorize_rollback(&mut check, directive, candidate.publish_id.as_deref(), identity.is_some())?;
+    }
     check.publish_id = if candidate.track_delivery == Some(false) {
         None
     } else {
         candidate.publish_id
     };
     Ok(check)
+}
+
+// 只有管理服务明确授权的源版本客户端才允许降级。
+fn authorize_rollback(check: &mut UpdateCheck, directive: RollbackDirective, publish_id: Option<&str>, authenticated: bool) -> Result<(), String> {
+    let source = Version::parse(&check.current_version).map_err(|e| e.to_string())?;
+    let target = Version::parse(&check.latest_version).map_err(|e| e.to_string())?;
+    if !authenticated || directive.id.is_empty() || Some(directive.id.as_str()) != publish_id
+        || directive.source_version != check.current_version
+        || directive.target_version != check.latest_version || target >= source {
+        return Err("回退授权与当前客户端或目标版本不一致，请重新检查更新".to_string());
+    }
+    check.update_available = true;
+    check.rollback = Some(directive);
+    Ok(())
+}
+
+fn validate_same_update(approved: &UpdateCheck, current: &UpdateCheck) -> Result<(), String> {
+    if !current.update_available || approved.latest_version != current.latest_version
+        || approved.policy_id != current.policy_id || approved.rollback != current.rollback
+        || approved.selected_asset != current.selected_asset {
+        return Err("发布策略已变化或回退授权已失效，请重新检查并确认更新".to_string());
+    }
+    Ok(())
 }
 
 fn reusable_update_candidate(
@@ -506,6 +572,10 @@ pub(crate) async fn download_update_candidate(
     state: &Arc<AppState>,
     candidate: &UpdateCandidate,
 ) -> Result<UpdateDownload, String> {
+    if let Some(base_url) = configured_release_admin_url(state).await? {
+        let fresh = fetch_release_admin_update(state, &base_url).await?;
+        validate_same_update(&candidate.check, &fresh)?;
+    }
     if !candidate.check.update_available {
         return Err(format!(
             "当前已是最新版本 v{}",
@@ -533,6 +603,10 @@ pub(crate) async fn download_update_candidate(
             return Err(error);
         }
     };
+    // 保存用户确认的批次，进程重启后也要检查同一份授权。
+    let approval = serde_json::to_vec(&candidate.check).map_err(|e| e.to_string())?;
+    tokio::fs::write(file_path.with_extension("approval.json"), approval).await
+        .map_err(|e| format!("保存更新确认信息失败：{e}"))?;
     if let Some(publish_id) = candidate.check.publish_id.as_deref() {
         let _ = report_publish_event(state, publish_id, "downloaded", None).await;
         let pending = PendingDeviceUpdate {
@@ -551,6 +625,8 @@ pub(crate) async fn download_update_candidate(
         sha256: asset.sha256.clone(),
         asset: asset.clone(),
         publish_id: candidate.check.publish_id.clone(),
+        policy_id: candidate.check.policy_id.clone(),
+        rollback: candidate.check.rollback.clone(),
     })
 }
 
@@ -567,6 +643,7 @@ async fn report_publish_event(
     let body = json!({
         "machineNo": identity.machine_no,
         "status": status,
+        "currentVersion": env!("CARGO_PKG_VERSION"),
         "errorMessage": error_message,
     });
     let mut last_error = String::from("上报更新状态失败");
@@ -654,26 +731,39 @@ pub(crate) async fn start_downloaded_update(
 ) -> Result<(), String> {
     let expected_update = resolve_expected_update(state).await?;
     let verified = verify_downloaded_update(&state.store, file_path, &expected_update).await?;
+    if configured_release_admin_url(state).await?.is_some() {
+        let bytes = tokio::fs::read(verified.path.with_extension("approval.json")).await
+            .map_err(|_| "缺少更新确认信息，请重新下载并确认更新".to_string())?;
+        let approved: UpdateCheck = serde_json::from_slice(&bytes)
+            .map_err(|_| "更新确认信息无效，请重新下载".to_string())?;
+        validate_same_update(&approved, &expected_update)?;
+        // 哈希校验可能耗时，启动安装器前再确认当前策略。
+        let fresh = resolve_expected_update(state).await?;
+        validate_same_update(&approved, &fresh)?;
+    }
     spawn_update_installer(&verified.path, &verified.asset)
 }
 
-/// 取用于安装前比对的更新信息。优先用后台检查留下的结果；那份结果可能因为
-/// 进程重启或缓存过期而缺失，此时重新取一次清单，而不是直接拒绝安装——用户
-/// 明明已经下载好了安装包。
+/// 管理端更新每次安装前重新校验，连接失败时停止安装。
 async fn resolve_expected_update(state: &AppState) -> Result<UpdateCheck, String> {
+    if let Some(base_url) = configured_release_admin_url(state).await? {
+        let check = fetch_release_admin_update(state, &base_url).await?;
+        if !check.update_available {
+            return Err("当前发布或回退授权已失效，请重新检查更新".to_string());
+        }
+        return Ok(check);
+    }
     if let Some(check) = state.available_update.read().await.clone()
         && check.update_available
+        && check.rollback.is_none()
+        && check.policy_id.is_none()
         && check.selected_asset.is_some()
     {
         return Ok(check);
     }
-    let check = if let Some(base_url) = configured_release_admin_url(state).await? {
-        fetch_release_admin_update(state, &base_url).await?
-    } else {
-        let manifest_url = configured_update_manifest_url(state).await?;
-        let manifest = fetch_configured_update_manifest(state, &manifest_url).await?;
-        assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?
-    };
+    let manifest_url = configured_update_manifest_url(state).await?;
+    let manifest = fetch_configured_update_manifest(state, &manifest_url).await?;
+    let check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?;
     if !check.update_available {
         return Err("当前已是最新版本，无需安装更新".to_string());
     }
@@ -761,6 +851,8 @@ pub(super) fn assess_update_manifest(
         selected_asset: selected_update_asset(&manifest.assets).map(|asset| asset_info(&asset)),
         release_notes: manifest.release_notes.clone(),
         publish_id: None,
+            policy_id: None,
+            rollback: None,
     })
 }
 
@@ -810,6 +902,10 @@ fn current_os_name() -> &'static str {
 
 /// 系统版本只用于发布管理展示，探测一次后缓存，失败时返回 None 而不是阻断检查更新。
 fn current_os_version() -> Option<String> {
+    #[cfg(test)]
+    if let Ok(version) = TEST_DEVICE_VERSIONS.try_with(|versions| versions.os.clone()) {
+        return version;
+    }
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
     CACHE.get_or_init(platform_os_version).clone()
 }
@@ -868,6 +964,10 @@ fn platform_os_version() -> Option<String> {
 
 /// Codex 版本在启动阶段已被探测并缓存；缓存缺失时补一次探测。
 async fn current_codex_version() -> Option<String> {
+    #[cfg(test)]
+    if let Ok(version) = TEST_DEVICE_VERSIONS.try_with(|versions| versions.codex.clone()) {
+        return version;
+    }
     if let Some(version) = crate::error_log::cached_codex_version() {
         return Some(version);
     }
@@ -1341,6 +1441,23 @@ mod tests {
                     assert!(read > 0);
                     request.extend_from_slice(&buffer[..read]);
                 }
+                let header_end = request
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let content_length = std::str::from_utf8(&request[..header_end])
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "request body ended before Content-Length");
+                    request.extend_from_slice(&buffer[..read]);
+                }
                 let request = String::from_utf8(request).unwrap();
                 let body = if request.starts_with("POST /api/devices/register ") {
                     r#"{"machineNo":"m_registered-AbC_123"}"#
@@ -1355,7 +1472,7 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let registration = async {
             let (first, second) = tokio::join!(
                 load_or_register_device(&state, &base_url),
                 load_or_register_device(&state, &base_url),
@@ -1368,7 +1485,17 @@ mod tests {
             assert_eq!(displayed, json!(first.machine_no));
             fetch_release_admin_update(&state, &base_url).await.unwrap();
             first
-        })
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            TEST_DEVICE_VERSIONS.scope(
+                TestDeviceVersions {
+                    codex: Some("1.2.3-test".into()),
+                    os: Some("test-os-version".into()),
+                },
+                registration,
+            ),
+        )
         .await;
         server.abort();
         let identity = result.unwrap();
@@ -1380,12 +1507,23 @@ mod tests {
                 .count(),
             1
         );
+        let registration = requests
+            .iter()
+            .find(|request| request.starts_with("POST /api/devices/register "))
+            .unwrap();
+        let (_, body) = registration.split_once("\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["installKey"], identity.install_key);
+        assert_eq!(body["codexVersion"], "1.2.3-test");
+        assert_eq!(body["osVersion"], "test-os-version");
         let report = requests
             .iter()
             .find(|request| request.starts_with("GET /api/updates/check?"))
             .unwrap();
         assert!(report.contains(&format!("x-machine-no: {}\r\n", identity.machine_no)));
         assert!(report.contains(&format!("x-device-key: {}\r\n", identity.install_key)));
+        assert!(report.contains("codexVersion=1.2.3-test"));
+        assert!(report.contains("osVersion=test-os-version"));
     }
 
     fn valid_asset() -> UpdateManifestAsset {
@@ -1429,7 +1567,45 @@ mod tests {
             selected_asset: Some(asset),
             release_notes: None,
             publish_id: None,
+            policy_id: None,
+            rollback: None,
         }
+    }
+
+    #[test]
+    fn rollback_requires_exact_source_target_batch_and_identity() {
+        let manifest = valid_manifest("1.0.0");
+        let base = assess_update_manifest("2.0.0", &manifest).unwrap();
+        assert!(!base.update_available);
+        let directive = RollbackDirective { id: "rollback-1".into(), source_version: "2.0.0".into(), target_version: "1.0.0".into(), reason: "启动故障".into() };
+        let mut authorized = base.clone();
+        authorize_rollback(&mut authorized, directive.clone(), Some("rollback-1"), true).unwrap();
+        assert!(authorized.update_available);
+        assert!(authorized.rollback.is_some());
+        assert!(authorize_rollback(&mut base.clone(), directive.clone(), Some("rollback-2"), true).is_err());
+        assert!(authorize_rollback(&mut base.clone(), directive.clone(), Some("rollback-1"), false).is_err());
+        let mut wrong = directive.clone(); wrong.source_version = "3.0.0".into();
+        assert!(authorize_rollback(&mut base.clone(), wrong, Some("rollback-1"), true).is_err());
+        let mut wrong = directive; wrong.target_version = "0.9.0".into();
+        assert!(authorize_rollback(&mut base.clone(), wrong, Some("rollback-1"), true).is_err());
+    }
+
+    #[test]
+    fn install_approval_rejects_superseded_or_revoked_policy() {
+        let mut approved = install_check("1.0.0", "Codey.zip", b"package");
+        approved.current_version = "2.0.0".into();
+        approved.policy_id = Some("rollback-1".into());
+        approved.rollback = Some(RollbackDirective { id: "rollback-1".into(), source_version: "2.0.0".into(), target_version: "1.0.0".into(), reason: "故障".into() });
+        assert!(validate_same_update(&approved, &approved).is_ok());
+        let mut changed = approved.clone(); changed.update_available = false;
+        assert!(validate_same_update(&approved, &changed).is_err());
+        let mut changed = approved.clone(); changed.policy_id = Some("publish-next".into());
+        assert!(validate_same_update(&approved, &changed).is_err());
+        let mut changed = approved.clone(); changed.rollback = None;
+        assert!(validate_same_update(&approved, &changed).is_err());
+        let next = install_check("3.0.0", "Codey.zip", b"next");
+        assert!(validate_same_update(&approved, &next).is_err());
+        assert!(assess_update_manifest("2.0.0", &valid_manifest("3.0.0")).unwrap().update_available);
     }
 
     #[test]

@@ -40,18 +40,19 @@ impl NativeUpdateUi {
         latest_version: &str,
         release_notes: Option<&str>,
     ) -> Result<bool, String> {
+        let rollback = semver::Version::parse(latest_version).ok().zip(semver::Version::parse(current_version).ok()).is_some_and(|(target, current)| target < current);
         let notes = release_notes
             .map(str::trim)
             .filter(|notes| !notes.is_empty())
             .map(|notes| format!("\n\n更新日志：\n{notes}"))
             .unwrap_or_default();
         show_dialog(
-            format!("发现 Codey v{latest_version} 更新"),
-            format!(
+            if rollback { format!("回退 Codey 至 v{latest_version}") } else { format!("发现 Codey v{latest_version} 更新") },
+            if rollback { format!("管理员已授权将 v{current_version} 降级至 v{latest_version}。请保存工作；确认后下载安装旧版本并重启，安装前将再次校验授权。{notes}") } else { format!(
                 "当前版本为 v{current_version}。是否现在下载、校验并安装更新？安装时会退出 Codex 和 Codey，并尝试启动新版。{notes}"
-            ),
+            ) },
             DialogKind::Confirm,
-            "更新并重启".to_string(),
+            if rollback { "回退并重启" } else { "更新并重启" }.to_string(),
             Some("稍后".to_string()),
         )
         .await

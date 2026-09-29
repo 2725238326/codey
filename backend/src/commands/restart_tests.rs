@@ -1069,6 +1069,8 @@ async fn runtime_status_exposes_cached_available_update() {
         selected_asset: None,
         release_notes: None,
         publish_id: None,
+        policy_id: None,
+        rollback: None,
     });
 
     let status = runtime_status(&state).await.unwrap();
