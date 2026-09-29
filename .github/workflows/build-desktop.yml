@@ -45,6 +45,13 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
+      - name: Setup Go for native desktop tools
+        if: runner.os == 'Windows'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -93,6 +100,7 @@ jobs:
           test -f "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
           test -f "$APP/Contents/Resources/licenses/FastCtx/LICENSE-APACHE"
           test -f "$APP/Contents/Resources/licenses/FastCtx/NOTICE"
+          test -f "$APP/Contents/Resources/licenses/ComputerUse/LICENSE"
           plutil -lint "$APP/Contents/Info.plist"
           if codesign --verify "$APP" >/dev/null 2>&1; then
             echo "Expected an unsigned macOS bundle, but codesign verification succeeded." >&2
@@ -146,6 +154,13 @@ jobs:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Go for native desktop tools
+        if: runner.os == 'Windows'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -219,6 +234,13 @@ jobs:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Go for native desktop tools
+        if: runner.os == 'Windows'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -375,6 +397,13 @@ jobs:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Go for native desktop tools
+        if: runner.os == 'Windows'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

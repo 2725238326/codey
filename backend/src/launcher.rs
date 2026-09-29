@@ -2123,6 +2123,23 @@ impl CodeyRuntime {
         )
         .await?;
         stage_timings.mark("storageAndCatalogMs");
+        let computer_use_home = home.to_path_buf();
+        let computer_use = tokio::task::spawn_blocking(move || {
+            crate::computer_use::ensure_available(&computer_use_home)
+        })
+        .await;
+        if let Err(error) = computer_use
+            .context("准备桌面操作插件失败")
+            .and_then(|result| result)
+        {
+            crate::error_log::record_failure(
+                "plugin_prepare_failed",
+                "prepare_computer_use",
+                error.to_string(),
+                serde_json::json!({}),
+            );
+        }
+        stage_timings.mark("computerUseMs");
         let local_router = if config.local_router_enabled {
             Some(LocalRouter::start_with_usage(config, account_usage_cache).await?)
         } else {

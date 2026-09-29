@@ -12,6 +12,8 @@ use crate::error_log;
 /// config format and embedded marketplace snapshot; Codey only exposes a small,
 /// renderer-friendly status/list API around it.
 pub fn ensure_marketplaces(home: &Path) -> Result<Value> {
+    let computer_use_changed = crate::computer_use::ensure_available(home)
+        .context("初始化 Codey Computer Use 插件失败")?;
     let remote =
         codey_runtime_core::plugin_marketplace::ensure_openai_curated_remote_marketplace_available(
             home,
@@ -37,7 +39,7 @@ pub fn ensure_marketplaces(home: &Path) -> Result<Value> {
         "managedConfigCompatible": official.config_registered,
         "initializedRemote": remote.initialized,
         "configuredRemote": remote.configured,
-        "configChanged": remote.configured || curated_changed || role_changed,
+        "configChanged": remote.configured || curated_changed || role_changed || computer_use_changed,
     }))
 }
 
@@ -51,8 +53,10 @@ pub fn marketplaces_status(home: &Path) -> Value {
     let official_marketplace = official.marketplace_root.is_some();
     let remote_marketplace = remote.marketplace_root.is_some();
     let managed_config_compatible = official.config_registered;
-    let needs_repair =
-        !remote_marketplace || !remote.config_registered || !managed_config_compatible;
+    let needs_repair = !remote_marketplace
+        || !remote.config_registered
+        || !managed_config_compatible
+        || !crate::computer_use::is_available(home);
     json!({
         "officialMarketplace": official_marketplace,
         "officialPath": official.marketplace_root,
@@ -163,12 +167,13 @@ pub fn list_plugins(home: &Path) -> Result<Value> {
     Ok(json!({"plugins": plugins, "count": count}))
 }
 
-fn marketplace_paths(home: &Path) -> [PathBuf; 4] {
+fn marketplace_paths(home: &Path) -> [PathBuf; 5] {
     [
         home.join(".tmp/plugins/.agents/plugins/marketplace.json"),
         home.join(".tmp/plugins/.agents/plugins/api_marketplace.json"),
         home.join(".tmp/plugins-remote/.agents/plugins/marketplace.json"),
         home.join(".tmp/marketplaces/role-specific-plugins/.agents/plugins/marketplace.json"),
+        crate::computer_use::marketplace_path(home),
     ]
 }
 
@@ -316,6 +321,20 @@ mod tests {
         assert_eq!(status["remoteRegistered"], true);
         assert_eq!(status["managedConfigCompatible"], true);
         assert_eq!(status["needsRepair"], false);
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let listed = list_plugins(home).unwrap();
+            let plugin = listed["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == "codey-computer-use@codey-local")
+                .unwrap();
+            assert_eq!(plugin["installed"], false);
+            assert_eq!(plugin["enabled"], false);
+            assert_eq!(plugin["interface"]["displayName"], "Codey Computer Use");
+            assert_eq!(plugin["policy"]["installation"], "AVAILABLE");
+        }
     }
 
     #[test]

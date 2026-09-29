@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::process::Command;
+mod build_computer_use;
 
 fn main() {
+    build_computer_use::build();
     for path in [
         "../src",
         "../vite.overlay.config.ts",

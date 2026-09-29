@@ -8,6 +8,7 @@ mod codex_provider;
 mod codex_startup_patch;
 mod codey_plugins;
 mod commands;
+mod computer_use;
 mod config;
 mod crashpad_pending_guard;
 #[cfg(windows)]

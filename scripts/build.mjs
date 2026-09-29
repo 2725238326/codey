@@ -68,6 +68,7 @@ for (const [source, destination] of [
   ["licenses/FastCtx/NOTICE", "licenses/FastCtx/NOTICE"],
   ["licenses/PetDragRecovery/LICENSE", "licenses/PetDragRecovery/LICENSE"],
   ["licenses/ChatGPTOverlayFix/LICENSE", "licenses/ChatGPTOverlayFix/LICENSE"],
+  ["vendor/ComputerUse/LICENSE", "licenses/ComputerUse/LICENSE"],
 ]) {
   const bundledDestination = join(resources, ...destination.split("/"));
   mkdirSync(dirname(bundledDestination), { recursive: true });
