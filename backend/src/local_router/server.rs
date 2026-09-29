@@ -101,7 +101,7 @@ pub(crate) const ROUTER_PORT_PROBES: u16 = 64;
 /// 在区间内从 `offset` 指定的端口开始顺序探测可用端口，候选被占用就换下一个。
 /// `bind` 成功即独占该端口，所以并发启动的多个实例不会拿到同一个端口。
 pub(crate) async fn bind_router_listener_from(offset: u32) -> Result<TcpListener> {
-    bind_router_listener_with(offset, |address| TcpListener::bind(address)).await
+    bind_router_listener_with(offset, TcpListener::bind).await
 }
 
 pub(super) async fn bind_router_listener_with<T, F, Fut>(offset: u32, mut bind: F) -> Result<T>
