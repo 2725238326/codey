@@ -44,8 +44,12 @@ use crate::trace_log_guard;
 mod platform;
 mod process;
 mod recovery;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+mod windows_activation;
+#[cfg(any(windows, test))]
 mod windows_packaged;
+#[cfg(windows)]
+pub(crate) use windows_packaged::resume_windows_packaged_thread;
 
 use platform::*;
 #[cfg(windows)]

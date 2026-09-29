@@ -17,6 +17,18 @@ pub(super) fn recoverable(error: impl std::fmt::Display) -> anyhow::Error {
     IntegrationFailure(format!("{error:#}")).into()
 }
 
+/// Preserve typed retry causes while allowing native recovery after cleanup.
+#[cfg(any(windows, test))]
+pub(super) fn recoverable_after_cleanup(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<IntegrationFailure>() {
+        error
+    } else {
+        error.context(IntegrationFailure(
+            "Windows Store 启动失败，已完成清理".into(),
+        ))
+    }
+}
+
 async fn restore_then_launch<R, L>(restore: R, launch: impl FnOnce() -> L) -> Result<()>
 where
     R: Future<Output = Result<()>>,
@@ -108,21 +120,27 @@ async fn launch_native(app_dir: &Path, home: &Path) -> Result<()> {
     codey_runtime_core::app_paths::validate_codex_app_dir(app_dir)?;
     #[cfg(windows)]
     if let Some(app_id) = codey_runtime_core::app_paths::packaged_app_user_model_id(app_dir) {
-        if requires_codex_home_environment(std::env::var_os("CODEX_HOME").as_deref()) {
-            let spawned =
-                windows_packaged::spawn_with_environment(app_dir, &native_command(app_dir, home))?;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if let Some(status) = spawned
-                .startup_process
-                .as_ref()
-                .context("原生启动进程句柄缺失")?
-                .exit_code()?
-            {
-                anyhow::ensure!(status == 0, "Codex 原生启动后退出：{status}");
-            }
-            return Ok(());
+        let environment = windows_codex_launch_environment(&[], home)?;
+        let required = requires_codex_home_environment(std::env::var_os("CODEX_HOME").as_deref());
+        // Native Store activation does not inherit Codey's instrumentation.
+        // Only pass the selected home, through the same scoped activation path.
+        let (spawned, _) = activate_windows_codex(
+            app_dir,
+            &app_id,
+            "",
+            required.then_some(environment.as_slice()),
+            required,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Some(status) = spawned
+            .startup_process
+            .as_ref()
+            .context("原生启动进程句柄缺失")?
+            .exit_code()?
+        {
+            anyhow::ensure!(status == 0, "Codex 原生启动后退出：{status}");
         }
-        codey_runtime_core::launcher::activate_packaged_app(&app_id, "").await?;
         return Ok(());
     }
     run_native_command(native_command(app_dir, home)).await

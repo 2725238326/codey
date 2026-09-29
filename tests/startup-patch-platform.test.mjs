@@ -178,40 +178,59 @@ test("Windows startup patch requires app-server runtime override validation", as
     windowsSpawn,
     /match startup_result \{\s*Ok\(mode\) => \{\s*spawned\.startup_injection_mode = mode\.as_str\(\)\.to_string\(\);\s*spawned\.performance_status = "ready"/,
   );
-  assert.doesNotMatch(launcherPlatform, /WindowsPackageDebugSession|EnableDebugging|DisableDebugging/);
   assert.match(launcherPlatform, /child_command\.envs\(environment/);
-  const packageSetup = launcherPlatform.indexOf("if needs_packaged_environment");
-  assert.ok(packageSetup >= 0);
-  const activation = launcherPlatform.indexOf("codey_runtime_core::launcher::activate_packaged_app", packageSetup);
-  assert.ok(activation > packageSetup);
-  const environmentBranch = launcherPlatform.slice(packageSetup, activation);
-  assert.ok(environmentBranch.includes("windows_packaged::spawn_with_environment"));
-  assert.ok(environmentBranch.includes("return Ok((spawned, true))"));
+  assert.match(launcherPlatform, /needs_packaged_environment\.then_some\(environment\.as_slice\(\)\)/);
 });
 
-test("Store environment launch supplies package identity before creation and verifies before resume", async () => {
+test("Store environment uses supervised native activation with scoped cleanup", async () => {
+  const { launcherPlatform } = await loadSpawnCodexSections();
   const source = await readSource("backend/src/launcher/windows_packaged.rs");
-  assert.doesNotMatch(source, /EnableDebugging|DisableDebugging|WindowsPackageDebugSession/);
-  assert.ok(source.includes("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW"));
-  assert.match(source, /const PACKAGE_NAME_ATTRIBUTE: usize = 0x0002_0008;/);
-  assert.match(source, /UpdateProcThreadAttribute\([\s\S]*?PACKAGE_NAME_ATTRIBUTE,[\s\S]*?attributes\.package\.as_ptr\(\)/);
-  assert.match(source, /startup\.StartupInfo\.cb = std::mem::size_of::<STARTUPINFOEXW>\(\) as u32/);
-  assert.match(source, /startup\.lpAttributeList = attributes\.as_mut_ptr\(\)/);
-  assert.match(source, /flags \|= EXTENDED_STARTUPINFO_PRESENT/);
-  assert.match(source, /CreateProcessW\([\s\S]*?flags,[\s\S]*?&startup\.StartupInfo/);
-  assert.match(source, /impl Drop for PackageAttributes[\s\S]*?DeleteProcThreadAttributeList/);
-  assert.ok(source.includes("process.package_full_name()") || source.includes(".package_full_name()"));
-  assert.ok(source.includes("QueryFullProcessImageNameW"));
-  const creation = source.indexOf("SuspendedProcess::create(command, Some(&expected_package))");
-  const verification = source.indexOf(".verify(&expected_package, &executable)");
-  const resume = source.indexOf("pending.resume()", verification);
-  const cleanup = source.indexOf("let stopped = pending.stop()", resume);
-  const handoff = source.indexOf("startup_process: pending.process.take()", cleanup);
-  assert.ok(creation >= 0 && verification > creation && resume > verification && cleanup > resume && handoff > cleanup);
-  assert.ok(source.includes("startup_activation_error_after_cleanup"));
-  assert.ok(source.includes("TerminateProcess(handle, 1)"));
-  assert.ok(source.includes("WaitForSingleObject(handle, 8000)"));
-  assert.ok(source.includes("fn registered_store_package_creates_with_environment_and_identity()"));
+  const supervisor = await readSource("backend/src/launcher/windows_activation.rs");
+  assert.doesNotMatch(source, /PACKAGE_NAME_ATTRIBUTE|STARTUPINFOEXW|CreateProcessW|UpdateProcThreadAttribute/);
+  assert.match(source, /settings\.EnableDebugging\(/);
+  assert.match(source, /settings\.DisableDebugging\(/);
+  assert.match(source, /impl Drop for WindowsPackageDebugSession[\s\S]*?journal\.recover\(disable_windows_packaged_environment\)/);
+  const prepare = source.indexOf("session.journal.arm(&package_full_name)?");
+  const enable = source.indexOf("enable_windows_packaged_environment(", prepare);
+  assert.ok(prepare >= 0 && enable > prepare);
+  const setup = launcherPlatform.indexOf("WindowsPackageDebugSession::start(");
+  const supervision = launcherPlatform.indexOf("tokio::spawn(async move", setup);
+  const activation = launcherPlatform.indexOf("codey_runtime_core::launcher::activate_packaged_app(", supervision);
+  const verification = launcherPlatform.indexOf("let package_check", activation);
+  const cleanup = launcherPlatform.indexOf("package_debug_session.finish()", verification);
+  assert.ok(setup >= 0 && supervision > setup && activation > supervision && verification > activation && cleanup > verification);
+  assert.match(source, /if self\.activation_pending/);
+  assert.match(launcherPlatform, /wait_for_resume_failure\(feedback\.clone\(\)\)/);
+  assert.match(launcherPlatform, /cancel_resume_feedback\(feedback\.as_deref\(\)\)/);
+  assert.match(supervisor, /timeout\(self\.timeout, &mut activation\)/);
+  assert.match(supervisor, /timeout\(self\.settle_timeout, &mut activation\)/);
+  assert.match(supervisor, /result = &mut activation => break result/);
+  assert.match(supervisor, /let stopped = stop\(\)\.await;[\s\S]*?let cleared = finish\(\);/);
+  assert.match(launcherPlatform, /!environment_required && error\.is::<recovery::IntegrationFailure>\(\)/);
+});
+
+test("Store debugger resumes only a verified Codex process and its own thread", async () => {
+  const source = await readSource("backend/src/launcher/windows_packaged.rs");
+  const { startupPatch } = await loadSpawnCodexSections();
+  const ownership = source.indexOf("owner != 0 && owner == process_id");
+  const packageCheck = source.indexOf("validate_package_record(&package)?", ownership);
+  const registered = source.indexOf("refresh_windows_packaged_app_dir", packageCheck);
+  const image = source.indexOf("QueryFullProcessImageNameW(", registered);
+  const verifiedImage = source.indexOf("normalized_windows_path(&image)", image);
+  const resumed = source.indexOf("ResumeThread(thread_handle)", verifiedImage);
+  assert.ok(ownership >= 0 && packageCheck > ownership && registered > packageCheck && image > registered && verifiedImage > image && resumed > verifiedImage);
+  assert.match(startupPatch, /run_windows_package_resume_helper_if_requested\(\)\?/);
+  assert.match(startupPatch, /resume_windows_packaged_thread\(\s*process_id,\s*thread_id,\s*launch_id,\s*&feedback_path,?\s*\)/);
+  assert.match(source.slice(verifiedImage, resumed), /require_pending_resume\(feedback\)\?/);
+  assert.match(source, /--launch-state/);
+  assert.match(startupPatch, /target\.is_none\(\)/);
+});
+
+test("native recovery shares Store activation and preserves the configured home", async () => {
+  const source = await readSource("backend/src/launcher/recovery.rs");
+  assert.doesNotMatch(source, /spawn_with_environment|CreateProcessW/);
+  assert.match(source, /windows_codex_launch_environment\(&\[\], home\)/);
+  assert.match(source, /activate_windows_codex\(\s*app_dir,\s*&app_id,\s*"",\s*required\.then_some\(environment\.as_slice\(\)\),\s*required/);
 });
 
 test("macOS startup patch requires app-server runtime override validation", async () => {

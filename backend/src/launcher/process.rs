@@ -268,9 +268,9 @@ pub(super) async fn spawn_codex(
             *app_dir = refresh_windows_packaged_app_dir(app_dir)?;
             codey_runtime_core::app_paths::validate_codex_app_dir(app_dir)?;
             error_log::refresh_codex_app_version(Some(app_dir), None);
-            // Store uses a verified desktop process when it needs CLI environment.
-            // Inspector still requires the shipped fuse; never use a package
-            // debugger or rely on NODE_OPTIONS in a packaged Electron runtime.
+            // Store uses native activation with a scoped CLI environment.
+            // Inspector still requires the shipped fuse; do not rely on
+            // NODE_OPTIONS in a packaged Electron runtime.
             let packaged_activation = windows_app_dir_supports_packaged_activation(app_dir);
             let fuses = crate::electron_fuses::detect_electron_fuses(app_dir.to_path_buf()).await;
             let inspect_fuse = fuses.node_cli_inspect;
@@ -359,12 +359,13 @@ pub(super) async fn spawn_codex(
             // Inspector the wrapper is otherwise the only entry, so a constrained
             // launch must not proceed unless Store accepts it.
             let constrained = !runtime_config_overrides.is_empty() || subagent_gate_active;
+            let wrapper_environment_required = use_require || (!use_inspector && constrained);
             let launch = spawn_windows_codex(
                 app_dir,
                 debug_port,
                 &launch_arguments,
                 &launch_environment,
-                use_require || (!use_inspector && constrained),
+                wrapper_environment_required,
             )
             .await;
             let (mut spawned, wrapper_environment_applied) = match launch {
@@ -375,7 +376,25 @@ pub(super) async fn spawn_codex(
                         "launch_failed",
                         "spawn_windows_codex",
                         format!("启动尝试 {attempt}/2：{error:#}"),
-                        serde_json::json!({ "startupAttempt": attempt, "retryable": retry }),
+                        serde_json::json!({
+                            "startupAttempt": attempt,
+                            "retryable": retry,
+                            "packagedActivation": packaged_activation,
+                            "useInspector": use_inspector,
+                            "useRequire": use_require,
+                            "inspectorFuse": inspect_fuse.as_str(),
+                            "nodeOptionsFuse": fuses.node_options.as_str(),
+                            "wrapperPrepared": wrapper.is_some(),
+                            "wrapperEnvironmentRequired": wrapper_environment_required,
+                            // The other half of the Store launch decision: a
+                            // configured home forces the environment even when
+                            // an injection channel needs none.
+                            "codexHomeEnvironmentRequired": requires_codex_home_environment(
+                                std::env::var_os("CODEX_HOME").as_deref(),
+                            ),
+                            "runtimeOverrideCount": runtime_config_overrides.len(),
+                            "subagentGateActive": subagent_gate_active,
+                        }),
                     );
                     if retry {
                         if !error.is::<WindowsPackageChanged>() {
@@ -2529,6 +2548,10 @@ mod cli_wrapper_tests {
         let updated = || anyhow::Error::new(WindowsPackageChanged);
         assert!(should_retry_startup(&updated(), 1));
         assert!(!should_retry_startup(&updated(), 2));
+        let cleaned = startup_activation_error_after_cleanup(updated(), Ok(()), Ok(()));
+        assert!(should_retry_startup(&cleaned, 1));
+        assert!(!should_retry_startup(&cleaned, 2));
+        assert!(cleaned.is::<recovery::IntegrationFailure>());
         for (stopped, cleared) in [
             (Err(anyhow::anyhow!("process still running")), Ok(())),
             (Ok(()), Err(anyhow::anyhow!("cleanup failed"))),

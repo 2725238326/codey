@@ -800,16 +800,104 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
 #[cfg(windows)]
 fn run_windows_package_resume_helper_if_requested() -> Result<bool> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    windows_package_resume_thread_id(&arguments).map(|_| false)
+    let Some(WindowsPackageResumeTarget {
+        process_id,
+        thread_id,
+        launch_id,
+        feedback_path,
+    }) = windows_package_resume_target(&arguments)?
+    else {
+        return Ok(false);
+    };
+    let result = crate::launcher::resume_windows_packaged_thread(
+        process_id,
+        thread_id,
+        launch_id,
+        &feedback_path,
+    );
+    if let Err(error) = &result {
+        crate::error_log::record_failure(
+            "package_thread_resume_failed",
+            "resume_windows_packaged_thread",
+            format!("{error:#}"),
+            serde_json::json!({"processId": process_id, "threadId": thread_id}),
+        );
+    }
+    let _ = codey_runtime_core::diagnostic_log::flush_diagnostic_log();
+    result.map(|_| true)
 }
 
 #[cfg(any(windows, test))]
-fn windows_package_resume_thread_id(arguments: &[OsString]) -> Result<Option<u32>> {
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsPackageResumeTarget {
+    process_id: u32,
+    thread_id: u32,
+    launch_id: uuid::Uuid,
+    feedback_path: std::path::PathBuf,
+}
+
+#[cfg(any(windows, test))]
+fn windows_package_resume_target(
+    arguments: &[OsString],
+) -> Result<Option<WindowsPackageResumeTarget>> {
+    if arguments.first().and_then(|value| value.to_str()) != Some(WINDOWS_PACKAGE_RESUME_ARGUMENT) {
+        return Ok(None);
+    }
+    let mut process_id = None;
+    let mut thread_id = None;
+    let mut launch_id = None;
+    let mut feedback_path = None;
+    let mut pairs = arguments[1..].chunks_exact(2);
+    for pair in &mut pairs {
+        let name = pair[0].to_str().context("Windows Store 启动参数名称无效")?;
+        if name.eq_ignore_ascii_case("--launch-state") {
+            anyhow::ensure!(feedback_path.is_none(), "Windows Store 启动通知路径重复");
+            feedback_path = Some(std::path::PathBuf::from(&pair[1]));
+            continue;
+        }
+        if name.eq_ignore_ascii_case("--launch-id") {
+            anyhow::ensure!(launch_id.is_none(), "Windows Store 启动标识重复");
+            let value = pair[1].to_str().context("Windows Store 启动标识无效")?;
+            let id = uuid::Uuid::parse_str(value).context("Windows Store 启动标识无效")?;
+            anyhow::ensure!(!id.is_nil(), "Windows Store 启动标识为空");
+            launch_id = Some(id);
+            continue;
+        }
+        let target = if name.eq_ignore_ascii_case("-p") {
+            &mut process_id
+        } else if name.eq_ignore_ascii_case("-tid") {
+            &mut thread_id
+        } else {
+            anyhow::bail!("Windows Store 启动参数不受支持");
+        };
+        anyhow::ensure!(target.is_none(), "Windows Store 启动参数重复");
+        let value = pair[1]
+            .to_str()
+            .context("Windows Store 进程或线程 ID 无效")?;
+        anyhow::ensure!(
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+            "Windows Store 进程或线程 ID 无效"
+        );
+        let value = value
+            .parse::<u32>()
+            .context("Windows Store 进程或线程 ID 无效")?;
+        anyhow::ensure!(value != 0, "Windows Store 进程或线程 ID 为空");
+        *target = Some(value);
+    }
+    anyhow::ensure!(pairs.remainder().is_empty(), "Windows Store 启动参数缺少值");
+    let launch_id = launch_id.context("Windows Store 未传递启动标识")?;
+    let feedback_path = feedback_path.context("Windows Store 未传递启动通知路径")?;
     anyhow::ensure!(
-        arguments.first().and_then(|value| value.to_str()) != Some(WINDOWS_PACKAGE_RESUME_ARGUMENT),
-        "旧版 Windows 包调试助手已停用；请通过官方安装程序修复残留的包调试设置"
+        feedback_path.is_absolute()
+            && feedback_path.file_name() == Some(OsStr::new(&format!("resume-{launch_id}.json"))),
+        "Windows Store 启动通知路径与本次启动不匹配"
     );
-    Ok(None)
+    Ok(Some(WindowsPackageResumeTarget {
+        process_id: process_id.context("Windows Store 未传递待恢复的进程 ID")?,
+        thread_id: thread_id.context("Windows Store 未传递待恢复的线程 ID")?,
+        launch_id,
+        feedback_path,
+    }))
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1619,20 +1707,129 @@ mod tests {
     }
 
     #[test]
-    fn windows_package_resume_helper_rejects_legacy_invocations() {
-        assert_eq!(windows_package_resume_thread_id(&[]).unwrap(), None);
-        assert!(
-            windows_package_resume_thread_id(
-                &[WINDOWS_PACKAGE_RESUME_ARGUMENT, "-p", "42", "-tid", "73"].map(OsString::from)
-            )
-            .is_err()
+    fn windows_package_resume_helper_requires_both_process_and_thread() {
+        let launch_id = "37f4f759-55f1-4b66-a45d-160644fe20d4";
+        let feedback_path = std::env::temp_dir()
+            .join("自定义 Codey 状态")
+            .join(format!("resume-{launch_id}.json"));
+        assert_eq!(windows_package_resume_target(&[]).unwrap(), None);
+        assert_eq!(
+            windows_package_resume_target(&["--debug-port".into()]).unwrap(),
+            None
         );
-        assert!(
-            windows_package_resume_thread_id(
-                &[WINDOWS_PACKAGE_RESUME_ARGUMENT, "-tid", "invalid"].map(OsString::from)
-            )
-            .is_err()
-        );
+        for args in [["-p", "42", "-tid", "73"], ["-TID", "73", "-P", "42"]] {
+            let args = std::iter::once(WINDOWS_PACKAGE_RESUME_ARGUMENT)
+                .chain(["--launch-id", launch_id])
+                .chain(args)
+                .map(OsString::from)
+                .chain([
+                    OsString::from("--launch-state"),
+                    feedback_path.clone().into_os_string(),
+                ])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                windows_package_resume_target(&args).unwrap(),
+                Some(WindowsPackageResumeTarget {
+                    process_id: 42,
+                    thread_id: 73,
+                    launch_id: uuid::Uuid::parse_str(launch_id).unwrap(),
+                    feedback_path: feedback_path.clone()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn windows_package_resume_helper_rejects_malformed_targets() {
+        let feedback_path =
+            std::env::temp_dir().join("resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json");
+        for args in [
+            vec![],
+            vec!["-tid", "73"],
+            vec!["-p", "42"],
+            vec!["-p", "42", "-tid"],
+            vec!["-p", "0", "-tid", "73"],
+            vec!["-p", "42", "-tid", "0"],
+            vec!["-p", "invalid", "-tid", "73"],
+            vec!["-p", "42", "-tid", "4294967296"],
+            vec!["-p", "42", "-tid", "+73"],
+            vec!["-p", "42", "-tid", "-73"],
+            vec!["-p", "42", "-tid", "73", "-P", "42"],
+            vec!["-p", "42", "-tid", "73", "-tid", "74"],
+            vec!["-p", "42", "-tid", "73", "--extra", "1"],
+        ] {
+            let args = std::iter::once(WINDOWS_PACKAGE_RESUME_ARGUMENT)
+                .chain(["--launch-id", "37f4f759-55f1-4b66-a45d-160644fe20d4"])
+                .chain(args)
+                .map(OsString::from)
+                .chain([
+                    OsString::from("--launch-state"),
+                    feedback_path.clone().into_os_string(),
+                ])
+                .collect::<Vec<_>>();
+            assert!(windows_package_resume_target(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn windows_package_resume_helper_requires_valid_unique_launch_id() {
+        let feedback_path =
+            std::env::temp_dir().join("resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json");
+        for extra in [
+            vec![],
+            vec!["--launch-id", "../other-launch"],
+            vec!["--launch-id", "00000000-0000-0000-0000-000000000000"],
+            vec![
+                "--launch-id",
+                "37f4f759-55f1-4b66-a45d-160644fe20d4",
+                "--launch-id",
+                "37f4f759-55f1-4b66-a45d-160644fe20d4",
+            ],
+        ] {
+            let args = [WINDOWS_PACKAGE_RESUME_ARGUMENT, "-p", "42", "-tid", "73"]
+                .into_iter()
+                .chain(extra)
+                .map(OsString::from)
+                .chain([
+                    OsString::from("--launch-state"),
+                    feedback_path.clone().into_os_string(),
+                ])
+                .collect::<Vec<_>>();
+            assert!(windows_package_resume_target(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn windows_package_resume_helper_rejects_missing_or_unrelated_state_path() {
+        let base = [
+            WINDOWS_PACKAGE_RESUME_ARGUMENT,
+            "-p",
+            "42",
+            "-tid",
+            "73",
+            "--launch-id",
+            "37f4f759-55f1-4b66-a45d-160644fe20d4",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        assert!(windows_package_resume_target(&base).is_err());
+        for path in [
+            std::path::PathBuf::from("relative/resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json"),
+            std::env::temp_dir().join("unrelated.json"),
+        ] {
+            let mut args = base.clone();
+            args.extend([OsString::from("--launch-state"), path.into_os_string()]);
+            assert!(windows_package_resume_target(&args).is_err());
+        }
+        let path = std::env::temp_dir().join("resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json");
+        let mut args = base;
+        args.extend([
+            OsString::from("--launch-state"),
+            path.clone().into_os_string(),
+        ]);
+        assert!(windows_package_resume_target(&args).is_ok());
+        args.extend([OsString::from("--launch-state"), path.into_os_string()]);
+        assert!(windows_package_resume_target(&args).is_err());
     }
 
     #[test]
