@@ -159,6 +159,10 @@ for (const scenario of [
       size: asset.size, sha256: asset.sha256, asset,
     };
     const download = h.render().downloadUpdate();
+    assert.equal(h.requests[1].command, "download_update");
+    assert.deepEqual(h.requests[1].args, {
+      expectedVersion: update.latestVersion, expectedPolicyId: update.policyId,
+    });
     h.requests[1].resolve(downloaded);
     await download;
     assert.deepEqual(h.render().downloadedUpdate, downloaded);
@@ -181,6 +185,26 @@ for (const scenario of [
       h.render().downloadedUpdate,
       scenario.action === "install-update" ? downloaded : null,
     );
+  });
+}
+
+for (const policyId of [undefined, null]) {
+  test(`下载更新时将 ${policyId} 授权标识转换为 null`, async () => {
+    const h = harness(false);
+    const asset = { fileName: "Codey-1.2.0.dmg", size: 1048576, url: "https://example.com/update.dmg" };
+    const update = { ...available, selectedAsset: asset, policyId };
+    const checking = h.render().checkForUpdates();
+    h.requests[0].resolve(update);
+    await checking;
+    const download = h.render().downloadUpdate();
+    assert.equal(h.requests[1].command, "download_update");
+    assert.deepEqual(h.requests[1].args, {
+      expectedVersion: update.latestVersion, expectedPolicyId: null,
+    });
+    const downloaded = { latestVersion: update.latestVersion, filePath: "/updates/Codey-1.2.0.dmg", ...asset };
+    h.requests[1].resolve(downloaded);
+    await download;
+    assert.deepEqual(h.render().downloadedUpdate, downloaded);
   });
 }
 

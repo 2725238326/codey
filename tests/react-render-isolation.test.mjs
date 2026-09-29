@@ -54,7 +54,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
     app,
     /const handleFooterUpdateClick = useStableEvent\(\(\) => void checkForUpdates\(\)\)/,
   );
-  assert.match(appUpdates, /invoke<UpdateDownload>\("download_update"\)/);
+  assert.match(appUpdates, /invoke<UpdateDownload>\(\s*"download_update",/);
   assert.match(appUpdates, /invoke\("install_downloaded_update"/);
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
   assert.match(app, /onAnalyzeDiagnosticStorage=\{handleAnalyzeDiagnosticStorage\}/);
