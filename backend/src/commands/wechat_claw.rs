@@ -1732,7 +1732,10 @@ mod tests {
             disk.webhook.channels[0].get_updates_buf,
             "cursor-after-restart"
         );
-        assert_eq!(disk.webhook.channels[0].context_token, "context-after-restart");
+        assert_eq!(
+            disk.webhook.channels[0].context_token,
+            "context-after-restart"
+        );
     }
 
     #[tokio::test]
