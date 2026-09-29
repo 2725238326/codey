@@ -22,7 +22,7 @@ test("plugin marketplace repair is explicit and status checks stay read-only", a
     /pub\(super\) async fn plugin_marketplace_status\(\)[\s\S]*?\n}\n\npub\(super\) async fn repair_plugin_marketplace/,
   )?.[0] || "";
   const repairFunction = pluginCommands.match(
-    /pub\(super\) async fn repair_plugin_marketplace\(\)[\s\S]*?\n}\n\nfn decorate_plugin_marketplace_status/,
+    /pub\(super\) async fn repair_plugin_marketplace\(\)[\s\S]*?\n}\n\npub\(super\) async fn prepare_computer_use/,
   )?.[0] || "";
 
   assert.match(marketplaceSource, /pub fn marketplaces_status\(home: &Path\) -> Value/);
@@ -47,6 +47,11 @@ test("plugin marketplace repair is explicit and status checks stay read-only", a
   assert.match(repairFunction, /\.await/);
   assert.doesNotMatch(launcherSource, /plugin_marketplace::ensure_marketplaces/);
   assert.doesNotMatch(launcherSource, /plugin_marketplace::marketplaces_status/);
+  assert.doesNotMatch(launcherSource, /computer_use::|computerUseMs/);
+  assert.doesNotMatch(marketplaceSource, /computer_use::(?:prepare|ensure_available)\(home\)[\s\S]*?pub fn marketplaces_status/);
+  assert.doesNotMatch(statusFunction, /computer_use::(?:prepare|ensure_available)/);
+  assert.doesNotMatch(repairFunction, /computer_use::(?:prepare|ensure_available)/);
+  assert.match(pluginCommands, /async fn prepare_computer_use\(\)[\s\S]*?computer_use::prepare\(home\)/);
 
   assert.match(
     appSource,
@@ -64,4 +69,7 @@ test("plugin marketplace repair is explicit and status checks stay read-only", a
   assert.match(sectionsSource, /remoteRegistered/);
   assert.match(sectionsSource, /onRepairPluginMarketplace/);
   assert.match(sectionsSource, /手动修复/);
+  assert.match(appSource, /invoke<PluginMarketplaceStatus>\("prepare_computer_use"\)/);
+  assert.match(sectionsSource, /onClick=\{onPrepareComputerUse\}/);
+  assert.match(sectionsSource, /准备桌面插件/);
 });

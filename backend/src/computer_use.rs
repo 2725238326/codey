@@ -1,10 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
 use codey_runtime_core::config_manager::ConfigManager;
 use fs2::FileExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item};
 
 const MARKETPLACE: &str = "codey-local";
@@ -18,6 +19,7 @@ const NATIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/computer-use-nat
 const NATIVE: &[u8] = &[];
 #[cfg(target_os = "macos")]
 const SIGNATURE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/computer-use-signature"));
+static NATIVE_VERSION: LazyLock<String> = LazyLock::new(|| plugin_version(NATIVE));
 
 pub(crate) fn marketplace_path(home: &Path) -> PathBuf {
     marketplace_root(home).join(".agents/plugins/marketplace.json")
@@ -27,33 +29,53 @@ fn marketplace_root(home: &Path) -> PathBuf {
     home.join(".tmp/marketplaces/codey-local")
 }
 
-/// Only registers availability; installation and enablement stay with the user.
-pub(crate) fn ensure_available(home: &Path) -> Result<bool> {
-    if NATIVE.is_empty() {
-        return Ok(false);
-    }
+/// Called only by explicit user preparation; Codex owns installation and enablement.
+pub(crate) fn prepare(home: &Path) -> Result<bool> {
+    ensure!(!NATIVE.is_empty(), "当前平台不支持桌面工具");
     install(home, NATIVE)
+}
+
+pub(crate) fn status(home: &Path) -> Value {
+    json!({
+        "supported": !NATIVE.is_empty(),
+        "ready": is_available(home),
+    })
 }
 
 pub(crate) fn is_available(home: &Path) -> bool {
     if NATIVE.is_empty() {
-        return true;
+        return false;
     }
     let Ok(home) = home.canonicalize() else {
         return false;
     };
     let root = marketplace_root(&home);
     let plugin = root.join("plugins").join(PLUGIN);
-    let Ok(snapshot) = ConfigManager::for_home(&home).load() else {
+    let Some(document) = fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| {
+            text.trim_start_matches('\u{feff}')
+                .parse::<DocumentMut>()
+                .ok()
+        })
+    else {
         return false;
     };
-    matches!(registration(snapshot.document(), &root), Ok(true))
+    matches!(registration(&document, &root), Ok(true))
         && marketplace_path(&home).is_file()
         && [".mcp.json", ".codex-plugin/plugin.json", "LICENSE"]
             .iter()
             .all(|path| plugin.join(path).is_file())
         && fs::read(root.join(".codey-owner")).is_ok_and(|bytes| bytes == OWNER)
         && executable_path(&root, NATIVE).is_file()
+        && fs::read(plugin.join(".codex-plugin/plugin.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|manifest| manifest["version"].as_str() == Some(NATIVE_VERSION.as_str()))
+}
+
+fn plugin_version(native: &[u8]) -> String {
+    format!("1.0.0+{}", &crate::fs_util::sha256_hex(native)[..16])
 }
 
 fn executable_path(root: &Path, native: &[u8]) -> PathBuf {
@@ -146,9 +168,8 @@ fn install(home: &Path, native: &[u8]) -> Result<bool> {
         }
     }
     changed |= write_managed(&root, &plugin.join("LICENSE"), LICENSE)?;
-    let hash = crate::fs_util::sha256_hex(native);
     let manifest = json!({
-        "name": PLUGIN, "version": format!("1.0.0+{}", &hash[..16]),
+        "name": PLUGIN, "version": plugin_version(native),
         "description": "读取桌面应用状态，通过辅助功能完成点击、输入和滚动。",
         "author": {"name": "Codey"}, "license": "MIT",
         "mcpServers": "./.mcp.json",
@@ -254,13 +275,64 @@ fn write_managed(root: &Path, path: &Path, bytes: &[u8]) -> Result<bool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn status_does_not_create_resources_or_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert_eq!(status(&missing)["ready"], false);
+        assert!(!missing.exists());
+        assert_eq!(status(temp.path())["ready"], false);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn explicit_preparation_updates_version_without_enabling_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        fs::write(
+            home.join("config.toml"),
+            "[plugins.\"codey-computer-use@codey-local\"]\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(status(home), json!({"supported": true, "ready": false}));
+        assert!(prepare(home).unwrap());
+        let config = fs::read(home.join("config.toml")).unwrap();
+        let manifest =
+            marketplace_root(home).join("plugins/codey-computer-use/.codex-plugin/plugin.json");
+        let mut previous: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        previous["version"] = json!("1.0.0+previous");
+        fs::write(&manifest, serde_json::to_vec(&previous).unwrap()).unwrap();
+        assert_eq!(status(home)["ready"], false);
+        assert!(prepare(home).unwrap());
+        assert_eq!(status(home)["ready"], true);
+        assert!(!prepare(home).unwrap());
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config);
+        assert_eq!(
+            ConfigManager::for_home(home).load().unwrap().document()["plugins"]["codey-computer-use@codey-local"]["enabled"].as_bool(),
+            Some(false),
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn unsupported_platform_does_not_report_preparation_success() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            status(temp.path()),
+            json!({"supported": false, "ready": false})
+        );
+        assert!(prepare(temp.path()).is_err());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
     #[cfg(any(target_os = "macos", windows))]
     #[tokio::test]
     async fn native_mcp_handles_invalid_requests_without_desktop_actions() {
         use std::process::Stdio;
         use tokio::io::AsyncWriteExt;
         let temp = tempfile::tempdir().unwrap();
-        ensure_available(temp.path()).unwrap();
+        prepare(temp.path()).unwrap();
         assert!(is_available(temp.path()));
         let root = marketplace_root(&temp.path().canonicalize().unwrap());
         let executable = executable_path(&root, NATIVE);
@@ -359,7 +431,7 @@ mod tests {
             .join(".codex-plugin/plugin.json");
         fs::remove_file(manifest).unwrap();
         assert!(!is_available(temp.path()));
-        assert!(ensure_available(temp.path()).unwrap());
+        assert!(prepare(temp.path()).unwrap());
         assert!(is_available(temp.path()));
     }
 

@@ -28,6 +28,8 @@ export type SettingsSectionInput = {
   isBusy: boolean;
   pluginMarketplaceStatus: OperationsProps["pluginMarketplaceStatus"];
   onRepairPluginMarketplace: OperationsProps["onRepairPluginMarketplace"];
+  onPrepareComputerUse: OperationsProps["onPrepareComputerUse"];
+  computerUseNotice: OperationsProps["computerUseNotice"];
   onRepairMainProcessInjection: OperationsProps["onRepairMainProcessInjection"];
   onRepairCodexConfig: () => void;
   configRepairNotice: OperationsProps["configRepairNotice"];
@@ -74,6 +76,8 @@ export function buildSettingsSections({
   isBusy,
   pluginMarketplaceStatus,
   onRepairPluginMarketplace,
+  onPrepareComputerUse,
+  computerUseNotice,
   onRepairMainProcessInjection,
   onRepairCodexConfig,
   configRepairNotice,
@@ -128,6 +132,8 @@ export function buildSettingsSections({
           isBusy={isBusy}
           pluginMarketplaceStatus={pluginMarketplaceStatus}
           onRepairPluginMarketplace={onRepairPluginMarketplace}
+          onPrepareComputerUse={onPrepareComputerUse}
+          computerUseNotice={computerUseNotice}
           onRepairMainProcessInjection={onRepairMainProcessInjection}
           onRepairCodexConfig={onRepairCodexConfig}
           configRepairNotice={configRepairNotice}

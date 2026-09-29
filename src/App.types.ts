@@ -226,6 +226,7 @@ export type RuntimeStatus = {
 
 export type PluginMarketplaceStatus = {
   status: "ready" | "needs_repair" | "error";
+  computerUse?: { supported: boolean; ready: boolean };
   needsRepair?: boolean;
   officialMarketplace?: boolean;
   officialPath?: string | null;

@@ -46,7 +46,7 @@ use models::{
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
     sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
-use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
+use plugins::{plugin_marketplace_status, prepare_computer_use, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     test_prompt_optimization_command,
@@ -1198,6 +1198,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "plugin_marketplace_status" => plugin_marketplace_status().await,
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
+        "prepare_computer_use" => prepare_computer_use().await,
         "list_codey_plugins"
         | "get_codey_plugin_config_file"
         | "select_codey_plugin_package"

@@ -19,6 +19,7 @@ import {
 
 import type {
   FastContextToolsStatus,
+  Notice,
   PluginMarketplaceStatus,
   RuntimeStatus,
 } from "./App.types";
@@ -79,6 +80,8 @@ type OperationsPanelProps = {
   isBusy: boolean;
   pluginMarketplaceStatus: PluginMarketplaceStatus | null;
   onRepairPluginMarketplace: () => void;
+  onPrepareComputerUse: () => void;
+  computerUseNotice?: Notice | null;
   onRepairMainProcessInjection: () => void;
   onRepairCodexConfig?: () => void;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
@@ -95,6 +98,8 @@ function OperationsPanelComponent({
   isBusy,
   pluginMarketplaceStatus,
   onRepairPluginMarketplace,
+  onPrepareComputerUse,
+  computerUseNotice,
   onRepairMainProcessInjection,
   configRepairNotice,
   injectionRepairing = false,
@@ -120,6 +125,8 @@ function OperationsPanelComponent({
   const pluginOk = pluginMarketplaceStatus?.status === "ready";
   const pluginStatusError = pluginMarketplaceStatus?.status === "error";
   const pluginRepairing = busy === "repair-plugin-marketplace";
+  const computerUse = pluginMarketplaceStatus?.computerUse;
+  const computerUsePreparing = busy === "prepare-computer-use";
   const pluginStatusKnown = Boolean(
     pluginMarketplaceStatus && !pluginStatusError,
   );
@@ -527,6 +534,44 @@ function OperationsPanelComponent({
                         );
                       })}
                     </div>
+                  )}
+
+                  {expandedStatusCard.title === "插件市场" && computerUse?.supported && (
+                    <section
+                      className="injection-status-section injection-mode-panel"
+                      aria-labelledby="computer-use-title"
+                    >
+                      <div className="injection-mode-copy">
+                        <div className="injection-mode-heading">
+                          <h4 id="computer-use-title">桌面操作插件</h4>
+                          <Badge variant={computerUse.ready ? "success" : "secondary"}>
+                            {computerUsePreparing ? "准备中" : computerUse.ready ? "已准备" : "待准备"}
+                          </Badge>
+                        </div>
+                        <p className="injection-mode-description">
+                          点击后准备本地资源，再到 Codex 插件页面安装或更新 Codey Computer Use；启停也在该页面管理。
+                        </p>
+                        {computerUseNotice && (
+                          <p
+                            role={computerUseNotice.tone === "error" ? "alert" : "status"}
+                            className={`mt-2 break-words text-xs ${computerUseNotice.tone === "error" ? "text-danger" : "text-success"}`}
+                          >
+                            {computerUseNotice.text}
+                          </p>
+                        )}
+                      </div>
+                      <div className="injection-mode-action">
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          disabled={isBusy}
+                          onClick={onPrepareComputerUse}
+                        >
+                          {computerUsePreparing && <LoaderCircle className="animate-spin" aria-hidden="true" />}
+                          {computerUsePreparing ? "准备中" : computerUse.ready ? "重新准备" : "准备桌面插件"}
+                        </Button>
+                      </div>
+                    </section>
                   )}
 
                   {expandedStatusCard.showInjectionScripts && (
