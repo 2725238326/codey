@@ -6,8 +6,7 @@ use serde_json::{Value, json};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-fastctx-route-hook";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
-pub(crate) const HOOK_MATCHER: &str =
-    "^(Bash|list_mcp_resources|list_mcp_resource_templates|read_mcp_resource)$";
+pub(crate) const HOOK_MATCHER: &str = r"^(Bash|exec_command|functions\.exec_command|list_mcp_resources|list_mcp_resource_templates|read_mcp_resource)$";
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const FALLBACK_MARKER: &str = "# codey-fastctx-fallback";
 
@@ -102,11 +101,14 @@ pub(crate) fn hook_output(
         return json!({});
     };
 
-    if !tool_name.eq_ignore_ascii_case("Bash") {
+    if !matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "bash" | "exec_command" | "functions.exec_command"
+    ) {
         return handle_resource_tool(tool_name, tool_input);
     }
     let Some(command) = tool_input
-        .and_then(|tool_input| tool_input.get("command"))
+        .and_then(|tool_input| tool_input.get("command").or_else(|| tool_input.get("cmd")))
         .and_then(Value::as_str)
     else {
         return json!({});
@@ -214,7 +216,7 @@ fn invalid_resource_read_reason() -> String {
 }
 
 fn fastctx_resource_reason() -> String {
-    "Codey FastCtx 只提供直接调用的文件工具，不能作为资源服务器使用。本地文件请调用 `mcp__codey_fastctx__inspect_local_file`，搜索与发现请分别调用 `mcp__codey_fastctx__grep` 和 `mcp__codey_fastctx__glob`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位。".to_string()
+    "Codey FastCtx 提供文件工具，不能作为资源服务器使用。本地文件请调用 `mcp__codey_fastctx__inspect_local_file`，搜索与发现请分别调用 `mcp__codey_fastctx__grep` 和 `mcp__codey_fastctx__glob`；使用当前客户端声明的准确工具名称和调用入口，延迟工具可在 `tool_search` 可用时发现。".to_string()
 }
 
 fn local_resource_bypass_reason() -> String {
@@ -659,6 +661,33 @@ mod tests {
             reason,
             "Codey FastCtx：请改用 `mcp__codey_fastctx__grep`；仅当该工具不可用时，才以 `# codey-fastctx-fallback` 作为命令首行重试。"
         );
+    }
+
+    #[test]
+    fn routes_native_exec_command_aliases_and_preserves_terminal_fallbacks() {
+        for tool_name in ["exec_command", "functions.exec_command"] {
+            for arguments in [
+                json!({"cmd": "rg -n needle src"}),
+                json!({"command": "cat src/main.rs"}),
+            ] {
+                let output = handle_hook(&tool_hook_input(tool_name, arguments));
+                assert!(assert_denied(&output).contains("mcp__codey_fastctx__"));
+            }
+            for command in [
+                "cargo test",
+                "git diff",
+                "# codey-fastctx-fallback\nrg needle src",
+            ] {
+                assert_eq!(
+                    handle_hook(&tool_hook_input(tool_name, json!({"cmd": command}))),
+                    json!({})
+                );
+            }
+            assert_eq!(
+                handle_hook(&tool_hook_input(tool_name, json!({"cmd": ["cat", "file"]}))),
+                json!({})
+            );
+        }
     }
 
     #[test]

@@ -14,11 +14,12 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, NO_WRITABLE_SUBAGENT_GUIDANCE, READ_ONLY_AGENT_WRITE_GUARD,
-    ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-    ROOT_AGENT_MULTI_AGENT_MODE_HINT, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS,
-    SUBAGENT_TASK_BOUNDARY_GUARD, append_root_agent_collaboration_usage_hint,
-    remove_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
+    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, NO_WRITABLE_SUBAGENT_GUIDANCE,
+    READ_ONLY_AGENT_WRITE_GUARD, ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
+    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
+    append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
+    remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -453,9 +454,10 @@ fn apply_isolated_runtime_router_config(
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     create_private_dir_all(&constraints_dir)?;
     let fastctx_instructions = if fastctx_namespace.is_some() {
-        Some(read_or_create_constraint_file(
+        Some(read_or_create_versioned_constraint_file(
             &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
             CODEY_FASTCTX_GUIDANCE,
+            CODEY_FASTCTX_GUIDANCE_VERSIONS,
         )?)
     } else {
         None

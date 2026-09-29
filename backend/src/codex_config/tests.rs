@@ -1000,6 +1000,7 @@ fn runtime_guidance_upgrades_owned_defaults_without_overwriting_custom_sources()
     let path = temp.path().join("instructions.md");
     for (current, versions) in [
         (SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
+        (CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS),
         (
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
             ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
@@ -1023,6 +1024,90 @@ fn runtime_guidance_upgrades_owned_defaults_without_overwriting_custom_sources()
             assert_eq!(fs::read_to_string(&path).unwrap(), customized);
         }
     }
+}
+
+#[test]
+fn isolated_prompt_sources_migrate_historical_defaults_and_preserve_user_guidance() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    for (name, current, versions) in [
+        ("root.md", SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
+        (
+            "fastctx.md",
+            CODEY_FASTCTX_GUIDANCE,
+            CODEY_FASTCTX_GUIDANCE_VERSIONS,
+        ),
+        (
+            "collaboration.md",
+            ROOT_AGENT_COLLABORATION_USAGE_HINT,
+            ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
+        ),
+    ] {
+        let path = temp.path().join(name);
+        fs::write(&path, versions.last().unwrap()).unwrap();
+        sources.push(read_or_create_versioned_constraint_file(&path, current, versions).unwrap());
+    }
+    let mut document = parse_document(
+        r#"[features.multi_agent_v2]
+enabled = true
+"#,
+    )
+    .unwrap();
+    document["developer_instructions"] = value(format!(
+        "User root guidance.\n\n{}\n\n{}",
+        SUBAGENT_GUIDANCE_VERSIONS.last().unwrap(),
+        CODEY_FASTCTX_GUIDANCE_VERSIONS[1..].join("\n\n"),
+    ));
+    document["features"]["multi_agent_v2"]["subagent_developer_instructions"] = value(format!(
+        "User child guidance.\n\n{}",
+        CODEY_FASTCTX_GUIDANCE_VERSIONS[1..].join("\n\n"),
+    ));
+    document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"] = value(format!(
+        "User collaboration policy.\n\n{}",
+        ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS[1..].join("\n\n"),
+    ));
+    apply_isolated_prompt_sources(
+        &mut document,
+        Some(&sources[0]),
+        Some(&sources[1]),
+        Some(&sources[2]),
+    )
+    .unwrap();
+    let first = document_string(&document).unwrap();
+    let root = document["developer_instructions"].as_str().unwrap();
+    assert!(root.contains("User root guidance."));
+    assert_eq!(root.matches(SUBAGENT_GUIDANCE.trim()).count(), 1);
+    assert_eq!(root.matches(CODEY_FASTCTX_GUIDANCE).count(), 1);
+    let child = document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        child,
+        format!("User child guidance.\n\n{CODEY_FASTCTX_GUIDANCE}")
+    );
+    let collaboration = document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        collaboration,
+        format!("User collaboration policy.\n\n{ROOT_AGENT_COLLABORATION_USAGE_HINT}")
+    );
+    for stale in [
+        "CODEY_DELEGATION_V2",
+        "resolve_batch",
+        "成本点预算",
+        "filter_mode=project",
+    ] {
+        assert!(!first.contains(stale), "{stale}");
+    }
+    apply_isolated_prompt_sources(
+        &mut document,
+        Some(&sources[0]),
+        Some(&sources[1]),
+        Some(&sources[2]),
+    )
+    .unwrap();
+    assert_eq!(document_string(&document).unwrap(), first);
 }
 
 #[test]
