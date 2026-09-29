@@ -859,22 +859,23 @@ impl RouterServer {
         request: &HttpRequest,
         kind: &str,
     ) -> Option<RouteRequestLogProbe> {
-        self.request_log.begin(|producer| {
-            let request_id = current_router_request_id().unwrap_or_default();
-            let (session, parent) = request_log_codex_session(request);
-            producer.begin(RouteRequestLogStart {
-                request_id: &request_id,
-                started_at: current_router_request_started_at().unwrap_or_else(Instant::now),
-                request_protocol: RequestProtocol::Http,
-                request_kind: kind,
-                requested_model: "",
-                reasoning_effort: None,
-                thinking_budget_tokens: None,
-                codex_session_id: session,
-                codex_session_is_parent: parent,
+        self.request_log
+            .begin(|producer| {
+                let request_id = current_router_request_id().unwrap_or_default();
+                let (session, parent) = request_log_codex_session(request);
+                producer.begin(RouteRequestLogStart {
+                    request_id: &request_id,
+                    started_at: current_router_request_started_at().unwrap_or_else(Instant::now),
+                    request_protocol: RequestProtocol::Http,
+                    request_kind: kind,
+                    requested_model: "",
+                    reasoning_effort: None,
+                    thinking_budget_tokens: None,
+                    codex_session_id: session,
+                    codex_session_is_parent: parent,
+                })
             })
-        })
-        .inspect(|probe| probe.set_subagent(request_is_subagent(request)))
+            .inspect(|probe| probe.set_subagent(request_is_subagent(request)))
     }
 
     fn record_rejected_request(&self, request: &HttpRequest, kind: &str, status: u16, code: &str) {
