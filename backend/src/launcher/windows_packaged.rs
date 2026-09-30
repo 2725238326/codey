@@ -416,9 +416,7 @@ impl Drop for WindowsPackageDebugSession {
 
 #[cfg(windows)]
 fn with_windows_package_debug_settings<T>(
-    operation: impl FnOnce(
-        &windows::Win32::UI::Shell::IPackageDebugSettings,
-    ) -> Result<T>,
+    operation: impl FnOnce(&windows::Win32::UI::Shell::IPackageDebugSettings) -> Result<T>,
 ) -> Result<T> {
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -429,15 +427,17 @@ fn with_windows_package_debug_settings<T>(
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let should_uninitialize = initialized.is_ok();
-        initialized.ok().or_else(|error| {
-            const RPC_E_CHANGED_MODE: i32 = -2147417850;
-            if error.code().0 == RPC_E_CHANGED_MODE {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .context("初始化 Windows 包调试 COM 环境失败（CoInitializeEx）")?;
+        initialized
+            .ok()
+            .or_else(|error| {
+                const RPC_E_CHANGED_MODE: i32 = -2147417850;
+                if error.code().0 == RPC_E_CHANGED_MODE {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .context("初始化 Windows 包调试 COM 环境失败（CoInitializeEx）")?;
         let result = (|| {
             let settings: IPackageDebugSettings =
                 CoCreateInstance(&PackageDebugSettings, None, CLSCTX_INPROC_SERVER)
