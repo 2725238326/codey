@@ -59,7 +59,7 @@ class FakeElement extends FakeElementCore {
   }
 
   getClientRects() {
-    return [1];
+    return this.layoutHidden ? [] : [1];
   }
 
   appendChild() {}
@@ -125,10 +125,14 @@ function loadInjection({
   codexSessionController = null,
   codexSignalDispatcher = null,
   discoveredAppServerManager = null,
+  localAppServerManager = null,
   selectedTurnIds = [],
+  hiddenTurnIds = [],
+  sessionElements = {},
 } = {}) {
   const rows = turnIds.map((turnId) => new FakeElement({ "data-turn-key": turnId }));
   rows.forEach((row) => {
+    row.layoutHidden = hiddenTurnIds.includes(row.getAttribute("data-turn-key"));
     row.dataset.codeyMessageId = row.getAttribute("data-turn-key");
     if (selectedTurnIds.includes(row.dataset.codeyMessageId)) {
       row.classList.add("codey-message-selected");
@@ -151,10 +155,10 @@ function loadInjection({
   const documentBody = new FakeElement();
   const managerAssetUrl = "app://-/assets/app-initial-completion-reconcile.js";
   let managerModule = null;
-  if (discoveredAppServerManager) {
+  if (discoveredAppServerManager || localAppServerManager) {
     const scope = {
       query: null,
-      get() {},
+      get(_key, hostId) { return hostId === "local" ? localAppServerManager : null; },
       set() {},
       watch() {},
       when() {},
@@ -174,6 +178,13 @@ function loadInjection({
       return discoveredAppServerManager;
     }
     managerModule = { resolveManager };
+    if (localAppServerManager) {
+      managerModule.LocalRegistry = class {
+        constructor() { throw new Error("registry constructors must not run during discovery"); }
+        getAll() { return this.scope.get("managers"); }
+        getForHostId(hostId) { return this.scope.get("manager", hostId); }
+      };
+    }
   }
   const document = {
     documentElement,
@@ -186,12 +197,14 @@ function loadInjection({
       return null;
     },
     querySelector(selector) {
+      if (selector in sessionElements) return sessionElements[selector][0] || null;
       if (selector === "[data-session-id]") {
         return new FakeElement({ "data-session-id": sessionId });
       }
       return null;
     },
     querySelectorAll(selector) {
+      if (selector in sessionElements) return sessionElements[selector];
       if (selector === "[data-turn-key]") {
         return rows.filter((row) => !row.removed && row.hasAttribute("data-turn-key"));
       }
@@ -200,6 +213,13 @@ function loadInjection({
       }
       if (selector === "[data-codey-message-id]") {
         return rows.filter((row) => !row.removed && row.dataset.codeyMessageId);
+      }
+      if (
+        selector === "[data-message-id]"
+        || selector === "[data-testid=conversation-turn]"
+        || selector === "[data-testid=\"conversation-turn\"]"
+      ) {
+        return rows.filter((row) => !row.removed && row.matches(selector));
       }
       if (selector === ".codey-message-selected[data-codey-message-id]") {
         return rows.filter((row) => (
@@ -254,6 +274,21 @@ function loadInjection({
     window.__codeyImportCodexAsset = async (url) => {
       assert.equal(url, managerAssetUrl);
       return managerModule;
+    };
+  }
+  const renderDeletion = (targetSessionId, messageIds) => {
+    if (targetSessionId !== window.__codeyGetSessionId()) return;
+    for (const row of rows) {
+      if (!row.layoutHidden && messageIds.includes(window.__codeyGetMessageId(row))) row.remove();
+    }
+  };
+  const controller = window.__codeyCodexSessionController;
+  if (typeof controller?.finishMessageDeletion === "function") {
+    const finish = controller.finishMessageDeletion;
+    controller.finishMessageDeletion = async (targetSessionId, messageIds) => {
+      const result = await finish(targetSessionId, messageIds);
+      renderDeletion(targetSessionId, messageIds);
+      return result;
     };
   }
   window.window = window;
@@ -337,16 +372,25 @@ function loadInjection({
   };
 }
 
+const createLocalDeletionManager = (overrides = {}) => ({
+  getHostId() { return "local"; },
+  getConversation() { return { turns: [], resumeState: "resumed" }; },
+  getStreamRole() { return { role: "owner" }; },
+  async sendRequest() {},
+  updateConversationState() {},
+  inactiveThreadUnsubscriber: { clearConversationStreamOwnership() {} },
+  ...overrides,
+});
+
 const createRecoveryController = (events, overrides = {}) => ({
   kind: "manager",
-  async discardConversation() {},
-  async notifyConversationDeleted() {},
+  async prepareMessageDeletion() {},
+  async finishMessageDeletion() {},
   async refreshRecentConversations() {},
   async reconcileCompletedConversation(payload) {
     events.push({ payload, type: "reconcile" });
     return true;
   },
-  async resumeConversation() {},
   ...overrides,
 });
 
@@ -508,22 +552,108 @@ test("MCP reload discovery is not capped by the native session timeout", async (
   assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
 });
 
-test("message deletion preflights resume and refresh before releasing or persisting", async () => {
-  for (const missing of ["resumeConversation", "refreshRecentConversations", "discardConversationFromCache"]) {
+test("message deletion requires the complete local manager before releasing or persisting", async () => {
+  for (const missing of ["getHostId", "getConversation", "getStreamRole", "sendRequest",
+    "updateConversationState", "inactiveThreadUnsubscriber"]) {
     let releases = 0;
-    const manager = {
-      discardConversationFromCache() { releases += 1; },
-      resumeConversation() {},
-      refreshRecentConversations() {},
-      sendRequest() {},
-    };
+    const manager = createLocalDeletionManager({ sendRequest() { releases += 1; } });
     delete manager[missing];
-    const runtime = loadInjection({ discoveredAppServerManager: manager, selectedTurnIds: ["turn-1"] });
+    const runtime = loadInjection({ localAppServerManager: manager, selectedTurnIds: ["turn-1"] });
     await flushMicrotasks();
     await runtime.window.__codeyDeleteSelectedMessages();
     assert.equal(releases, 0, missing);
     assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false, missing);
   }
+});
+
+test("RPC function stubs do not advertise unavailable in-place deletion methods", async () => {
+  const calls = [];
+  const rpc = new Proxy({}, {
+    get(_target, method) {
+      return async () => {
+        calls.push(method);
+        throw new TypeError(`'${String(method)}' is not a function.`);
+      };
+    },
+  });
+  const runtime = loadInjection({
+    initialSessionId: "",
+    discoveredAppServerManager: rpc,
+    selectedTurnIds: ["turn-1"],
+  });
+  await assert.rejects(
+    runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }),
+    { code: "codey_capability_unavailable" },
+  );
+  runtime.setSessionId("session-1");
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.deepEqual(calls, []);
+  assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
+});
+
+test("deletion uses the local registry instead of RPC stubs without custom native methods", async () => {
+  const rpcCalls = [];
+  const rpc = new Proxy({}, {
+    get(_target, method) {
+      return async () => {
+        rpcCalls.push(method);
+        throw new TypeError(`'${String(method)}' is not a function.`);
+      };
+    },
+  });
+  const retainedTurn = { turnId: "turn-2", status: "completed" };
+  const conversation = {
+    turns: [{ turnId: "turn-1", status: "completed" }, retainedTurn],
+    resumeState: "resumed",
+  };
+  const events = [];
+  let runtime;
+  const manager = {
+    getHostId() { return "local"; },
+    getConversation() { return conversation; },
+    getStreamRole() { return { role: "owner" }; },
+    async sendRequest(method, params) {
+      assert.equal(method, "thread/unsubscribe");
+      assert.equal(params.threadId, "session-1");
+      events.push("unsubscribe");
+    },
+    updateConversationState(sessionId, update) {
+      assert.equal(sessionId, "session-1");
+      update(conversation);
+      for (let index = 0; index < 2; index += 1) {
+        const row = runtime.getTurnRow(index);
+        if (!conversation.turns.some((turn) => turn.turnId === row.getAttribute("data-turn-key"))) row.remove();
+      }
+      events.push("update");
+    },
+    inactiveThreadUnsubscriber: {
+      clearConversationStreamOwnership() { events.push("clear"); },
+    },
+    discardConversationFromCache() { assert.fail("must not evict the conversation"); },
+    resumeConversation() { assert.fail("must not resume the conversation"); },
+  };
+  runtime = loadInjection({
+    initialSessionId: "",
+    turnIds: ["turn-1", "turn-2"],
+    selectedTurnIds: ["turn-1"],
+    codexSessionController: { kind: "manager", manager: rpc },
+    discoveredAppServerManager: rpc,
+    localAppServerManager: manager,
+    bridgeHandler: async (path) => {
+      if (path !== "/session/delete-messages") return { status: "ok" };
+      events.push("persist");
+      return { status: "ok", deleted: 1 };
+    },
+  });
+  runtime.setSessionId("session-1");
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.equal(runtime.window.__codeyCodexSessionController.manager, manager);
+  assert.deepEqual(events, ["unsubscribe", "persist", "update", "clear"]);
+  assert.deepEqual(rpcCalls, []);
+  assert.equal(conversation.turns[0], retainedTurn);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
+  assert.deepEqual(runtime.alerts, []);
+  assert.equal(runtime.getReloadCount(), 0);
 });
 
 test("failed discovery backs off independently and recovers when a manager appears", async () => {
@@ -544,7 +674,7 @@ test("failed discovery backs off independently and recovers when a manager appea
   discovered.advanceTime(1_000);
   await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }));
   assert.equal(imports, secondImports, "second failure waits two seconds");
-  Object.assign(manager, { discardConversationFromCache() {}, resumeConversation() {}, refreshRecentConversations() {} });
+  Object.assign(manager, createLocalDeletionManager({ sendRequest: manager.sendRequest }));
   const controller = await discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
   assert.equal(controller.manager, manager);
   assert.equal(discovered.window.__codeyPageCapabilities.deleteMessages.status, "available");
@@ -552,7 +682,7 @@ test("failed discovery backs off independently and recovers when a manager appea
 });
 
 test("timed out discovery cannot later issue a message deletion", async () => {
-  const manager = { discardConversationFromCache() {}, resumeConversation() {}, refreshRecentConversations() {} };
+  const manager = createLocalDeletionManager();
   const runtime = loadInjection({ discoveredAppServerManager: manager, initialSessionId: "", selectedTurnIds: ["turn-1"] });
   const originalImport = runtime.window.__codeyImportCodexAsset;
   let release;
@@ -705,136 +835,51 @@ test("retries AppServerManager discovery when a signals controller was cached fi
   assert.equal(runtime.window.__codeyCodexSessionController.kind, "manager");
 });
 
-test("unloads Codex memory without discarding the active conversation", async () => {
-  const dispatcherCalls = [];
+test("deletes selected turns in place without evicting or resuming the conversation", async () => {
   const events = [];
-  const runtime = loadInjection({
-    codexSignalDispatcher: async (signal, payload) => {
-      dispatcherCalls.push({ signal, payload });
-      events.push(`signal:${signal}`);
-    },
+  let runtime;
+  runtime = loadInjection({
+    turnIds: ["turn-1", "turn-2"],
+    selectedTurnIds: ["turn-1"],
+    codexSessionController: createRecoveryController([], {
+      async prepareMessageDeletion(sessionId) {
+        assert.equal(sessionId, "session-1");
+        events.push("prepare");
+        assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1", "turn-2"]);
+      },
+      async finishMessageDeletion(sessionId, messageIds) {
+        assert.equal(sessionId, "session-1");
+        assert.deepEqual([...messageIds], ["turn-1"]);
+        events.push("finish");
+      },
+      async discardConversation() { assert.fail("must not evict the conversation"); },
+      async resumeConversation() { assert.fail("must not resume the conversation"); },
+      async refreshRecentConversations() { assert.fail("must not reload the sidebar"); },
+    }),
     bridgeHandler: async (path) => {
-      events.push(`bridge:${path}`);
-      return path === "/session/delete-messages"
-        ? { status: "ok", deleted: 0 }
-        : { status: "ok" };
+      if (path !== "/session/delete-messages") return { status: "ok" };
+      events.push("persist");
+      assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1", "turn-2"]);
+      return { status: "ok", deleted: 1 };
     },
   });
-  events.length = 0;
-
-  await runtime.window.__codeyReloadConversationAfterHardDelete(
-    "local:session-1",
-    ["turn-deleted"],
-  );
-
-  assert.deepEqual(JSON.parse(JSON.stringify(dispatcherCalls)), [{
-    signal: "unsubscribe-thread-for-host",
-    payload: {
-      hostId: "local",
-      threadId: "session-1",
-    },
-  }, {
-    signal: "maybe-resume-conversation",
-    payload: {
-      hostId: "local",
-      conversationId: "session-1",
-      model: null,
-      serviceTier: null,
-      reasoningEffort: null,
-      workspaceRoots: [],
-      collaborationMode: null,
-    },
-  }, {
-    signal: "refresh-recent-conversations-for-host",
-    payload: { hostId: "local" },
-  }]);
-  assert.equal(
-    dispatcherCalls.some(({ signal }) => signal === "discard-conversation-from-cache"),
-    false,
-  );
-  assert.deepEqual(events, [
-    "signal:unsubscribe-thread-for-host",
-    "bridge:/session/delete-messages",
-    "signal:maybe-resume-conversation",
-    "signal:refresh-recent-conversations-for-host",
-  ]);
-  const cleanup = runtime.bridgeCalls.find(
-    (call) => call.path === "/session/delete-messages",
-  );
-  assert.deepEqual(JSON.parse(JSON.stringify(cleanup?.payload)), {
-    sessionId: "session-1",
-    messageIds: ["turn-deleted"],
-  });
+  const remainingRow = runtime.getTurnRow(1);
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.deepEqual(events, ["prepare", "persist", "finish"]);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
+  assert.equal(runtime.getTurnRow(1), remainingRow);
+  assert.equal(runtime.getReloadCount(), 0);
+  assert.deepEqual(runtime.alerts, []);
 });
 
-test("uses the current AppServerManager flow to evict, clean, resume, and refresh", async () => {
-  const events = [];
-  const managerCalls = [];
-  const runtime = loadInjection({
-    codexSessionController: {
-      kind: "manager",
-      async discardConversation(sessionId) {
-        managerCalls.push({ method: "discardConversation", sessionId });
-        events.push("manager:discard");
-      },
-      async notifyConversationDeleted(sessionId) {
-        managerCalls.push({ method: "notifyConversationDeleted", sessionId });
-      },
-      async refreshRecentConversations() {
-        managerCalls.push({ method: "refreshRecentConversations" });
-        events.push("manager:refresh");
-      },
-      async resumeConversation(payload) {
-        managerCalls.push({ method: "resumeConversation", payload });
-        events.push("manager:resume");
-      },
-    },
-    bridgeHandler: async (path) => {
-      events.push(`bridge:${path}`);
-      return path === "/session/delete-messages"
-        ? { status: "ok", deleted: 0 }
-        : { status: "ok" };
-    },
-  });
-  events.length = 0;
-
-  await runtime.window.__codeyReloadConversationAfterHardDelete(
-    "local:session-1",
-    ["turn-deleted"],
-  );
-
-  assert.deepEqual(events, [
-    "manager:discard",
-    "bridge:/session/delete-messages",
-    "manager:resume",
-    "manager:refresh",
-  ]);
-  assert.deepEqual(JSON.parse(JSON.stringify(managerCalls)), [{
-    method: "discardConversation",
-    sessionId: "session-1",
-  }, {
-    method: "resumeConversation",
-    payload: {
-      collaborationMode: null,
-      conversationId: "session-1",
-      model: null,
-      reasoningEffort: null,
-      serviceTier: null,
-      showThreadGoalResumeConfirmation: false,
-      workspaceRoots: [],
-    },
-  }, {
-    method: "refreshRecentConversations",
-  }]);
-});
-
-test("persistent deletion waits for the host to release the conversation", async () => {
+test("persistent deletion waits for the native subscription to be released", async () => {
   let release;
   let deleteCalls = 0;
   const runtime = loadInjection({
-    turnIds: ["turn-1"], selectedTurnIds: ["turn-1"],
-    codexSignalDispatcher: (signal) => signal === "unsubscribe-thread-for-host"
-      ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(),
+    selectedTurnIds: ["turn-1"],
+    codexSessionController: createRecoveryController([], {
+      prepareMessageDeletion() { return new Promise((resolve) => { release = resolve; }); },
+    }),
     bridgeHandler: async (path) => {
       if (path === "/session/delete-messages") deleteCalls += 1;
       return { status: "ok", deleted: 1 };
@@ -843,10 +888,93 @@ test("persistent deletion waits for the host to release the conversation", async
   const pending = runtime.window.__codeyDeleteSelectedMessages();
   await flushMicrotasks();
   assert.equal(deleteCalls, 0);
-  assert.equal(typeof release, "function");
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1"]);
   release();
   await pending;
-  assert.equal(deleteCalls, 2);
+  assert.equal(deleteCalls, 1);
+});
+
+test("reports a failed in-place update without reloading the conversation", async () => {
+  const runtime = loadInjection({
+    selectedTurnIds: ["turn-1"],
+    codexSessionController: createRecoveryController([], {
+      async finishMessageDeletion() { throw new Error("state update failed"); },
+      async resumeConversation() { assert.fail("must not resume after failure"); },
+    }),
+    bridgeHandler: async () => ({ status: "ok", deleted: 1 }),
+  });
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.equal(runtime.alerts.length, 1);
+  assert.match(runtime.alerts[0], /页面状态更新失败/);
+  assert.equal(runtime.getReloadCount(), 0);
+});
+
+test("deletion uses the visible composer and excludes selected rows in cached conversations", async () => {
+  const hiddenComposer = new FakeElement({ "data-above-composer-conversation-id": "old-session" });
+  hiddenComposer.layoutHidden = true;
+  const visibleComposer = new FakeElement({ "data-above-composer-conversation-id": "local:current-session" });
+  const hiddenAnnotation = new FakeElement({ "data-response-annotation-conversation": "old-session" });
+  hiddenAnnotation.layoutHidden = true;
+  const discarded = [];
+  const runtime = loadInjection({
+    initialSessionId: "stale-session",
+    turnIds: ["old-turn", "current-turn"],
+    hiddenTurnIds: ["old-turn"],
+    selectedTurnIds: ["old-turn", "current-turn"],
+    sessionElements: {
+      "[data-above-composer-conversation-id]": [hiddenComposer, visibleComposer],
+      "[data-response-annotation-conversation]": [hiddenAnnotation],
+    },
+    codexSessionController: createRecoveryController([], {
+      async prepareMessageDeletion(sessionId) { discarded.push(sessionId); },
+    }),
+    bridgeHandler: async () => ({ status: "ok", deleted: 1 }),
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  assert.equal(runtime.window.__codeyGetSessionId(), "current-session");
+  assert.deepEqual(discarded, ["current-session"]);
+  const requests = runtime.bridgeCalls.filter((call) => call.path === "/session/delete-messages");
+  assert.equal(requests.length, 1);
+  for (const request of requests) {
+    assert.deepEqual(JSON.parse(JSON.stringify(request.payload)), {
+      sessionId: "current-session", messageIds: ["current-turn"],
+    });
+  }
+  assert.equal(runtime.getTurnRow(0).removed, false);
+  assert.equal(runtime.getTurnRow(1).removed, true);
+  assert.deepEqual(runtime.alerts, []);
+});
+
+test("switching retained conversations never copies selections into another session", async () => {
+  const first = new FakeElement({ "data-above-composer-conversation-id": "first-session" });
+  const second = new FakeElement({ "data-above-composer-conversation-id": "second-session" });
+  second.layoutHidden = true;
+  const runtime = loadInjection({
+    turnIds: ["first-turn", "second-turn"],
+    hiddenTurnIds: ["second-turn"],
+    selectedTurnIds: ["first-turn"],
+    sessionElements: { "[data-above-composer-conversation-id]": [first, second] },
+    codexSessionController: createRecoveryController([]),
+    bridgeHandler: async () => ({ status: "ok", deleted: 1 }),
+  });
+  first.layoutHidden = true;
+  second.layoutHidden = false;
+  runtime.getTurnRow(0).layoutHidden = true;
+  runtime.getTurnRow(1).layoutHidden = false;
+  runtime.window.__codeyInstallMessageSelection();
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
+
+  runtime.getTurnRow(1).classList.add("codey-message-selected");
+  runtime.window.__codeyInstallMessageSelection();
+  await runtime.window.__codeyDeleteSelectedMessages();
+  const request = runtime.bridgeCalls.find((call) => call.path === "/session/delete-messages");
+  assert.deepEqual(JSON.parse(JSON.stringify(request.payload)), {
+    sessionId: "second-session", messageIds: ["second-turn"],
+  });
+  assert.equal(runtime.getTurnRow(0).removed, false);
 });
 
 test("serializes concurrent partial deletion requests", async () => {
@@ -855,13 +983,12 @@ test("serializes concurrent partial deletion requests", async () => {
   let deleteCalls = 0;
   const runtime = loadInjection({
     turnIds: ["turn-1"], selectedTurnIds: ["turn-1"],
-    codexSignalDispatcher: (signal) => {
-      dispatchCalls += 1;
-      if (signal === "unsubscribe-thread-for-host" && dispatchCalls === 1) {
+    codexSessionController: createRecoveryController([], {
+      prepareMessageDeletion() {
+        dispatchCalls += 1;
         return new Promise((resolve) => { release = resolve; });
-      }
-      return Promise.resolve();
-    },
+      },
+    }),
     bridgeHandler: async (path) => {
       if (path === "/session/delete-messages") deleteCalls += 1;
       return { status: "ok", deleted: 1 };
@@ -877,14 +1004,14 @@ test("serializes concurrent partial deletion requests", async () => {
   assert.equal(deleteCalls, 0);
   release();
   await Promise.all([first, second]);
-  assert.equal(deleteCalls, 2);
+  assert.equal(deleteCalls, 1);
 });
 
 test("does not hide a row when an index database remains unsupported", async () => {
   const runtime = loadInjection({
     turnIds: ["turn-unsupported"],
     selectedTurnIds: ["turn-unsupported"],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -905,7 +1032,9 @@ test("does not hide a row when an index database remains unsupported", async () 
 test("failed host release never sends a destructive delete request", async () => {
   const runtime = loadInjection({
     turnIds: ["turn-1"], selectedTurnIds: ["turn-1"],
-    codexSignalDispatcher: async () => { throw new Error("unsubscribe failed"); },
+    codexSessionController: createRecoveryController([], {
+      async prepareMessageDeletion() { throw new Error("unsubscribe failed"); },
+    }),
   });
   await runtime.window.__codeyDeleteSelectedMessages();
   assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
@@ -918,7 +1047,7 @@ test("removes a hard-deleted turn and rejects a stale React rerender", async () 
   const runtime = loadInjection({
     turnIds: ["turn-1", "turn-2"],
     selectedTurnIds: ["turn-1"],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => {
       if (path !== "/session/delete-messages") return { status: "ok" };
       deleteCalls += 1;
@@ -936,13 +1065,70 @@ test("removes a hard-deleted turn and rejects a stale React rerender", async () 
   assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
 });
 
-test("reuses the resolved turn id when cleaning up a deleted tail turn", async () => {
+test("removes a hard-deleted turn remounted during the in-place update", async () => {
+  let runtime;
+  const controller = createRecoveryController([], {
+    async finishMessageDeletion() {
+      runtime.appendTurn("turn-1");
+    },
+  });
+  runtime = loadInjection({
+    turnIds: ["turn-1", "turn-2"],
+    selectedTurnIds: ["turn-1"],
+    codexSessionController: controller,
+    bridgeHandler: async (path) => (
+      path === "/session/delete-messages"
+        ? { status: "ok", deleted: 1 }
+        : { status: "ok" }
+    ),
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
+  runtime.flushTimers();
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
+});
+
+test("removes a hard-deleted fallback row before showing success", async () => {
+  let runtime;
+  let remountedRow;
+  const controller = createRecoveryController([], {
+    async finishMessageDeletion() {
+      remountedRow = new FakeElement({
+        "data-message-id": "turn-1",
+        "data-testid": "conversation-turn",
+      });
+      runtime.appendExistingRow(remountedRow);
+    },
+  });
+  runtime = loadInjection({
+    turnIds: ["turn-1", "turn-2"],
+    selectedTurnIds: ["turn-1"],
+    codexSessionController: controller,
+    bridgeHandler: async (path) => (
+      path === "/session/delete-messages"
+        ? { status: "ok", deleted: 1 }
+        : { status: "ok" }
+    ),
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  assert.equal(remountedRow.removed, true);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
+});
+
+test("updates both the resolved turn id and original tail selector without another deletion request", async () => {
   const tailKey = "history-content:tail:0:local:temporary-id";
   let deleteCalls = 0;
+  let updatedIds;
   const runtime = loadInjection({
     turnIds: [tailKey],
     selectedTurnIds: [tailKey],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([], {
+      finishMessageDeletion(_sessionId, messageIds) { updatedIds = [...messageIds]; },
+    }),
     bridgeHandler: async (path) => {
       if (path !== "/session/delete-messages") return { status: "ok" };
       deleteCalls += 1;
@@ -959,11 +1145,9 @@ test("reuses the resolved turn id when cleaning up a deleted tail turn", async (
   const deletions = runtime.bridgeCalls.filter(
     (call) => call.path === "/session/delete-messages",
   );
-  assert.equal(deletions.length, 2);
+  assert.equal(deletions.length, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(deletions[0].payload.messageIds)), [tailKey]);
-  assert.deepEqual(JSON.parse(JSON.stringify(deletions[1].payload.messageIds)), [
-    "stable-last-turn",
-  ]);
+  assert.deepEqual(updatedIds, [tailKey, "stable-last-turn"]);
   assert.deepEqual(runtime.getVisibleTurnIds(), []);
   assert.deepEqual(runtime.alerts, []);
 });
@@ -974,9 +1158,10 @@ test("keeps a turn visible when no persisted turn was deleted", async () => {
   const runtime = loadInjection({
     turnIds: ["failed-turn"],
     selectedTurnIds: ["failed-turn"],
-    codexSignalDispatcher: async () => {
-      dispatcherCalls += 1;
-    },
+    codexSessionController: createRecoveryController([], {
+      prepareMessageDeletion() { dispatcherCalls += 1; },
+      finishMessageDeletion(_sessionId, messageIds) { assert.deepEqual([...messageIds], []); },
+    }),
     bridgeHandler: async (path) => {
       if (path !== "/session/delete-messages") return { status: "ok" };
       deleteCalls += 1;
@@ -1001,7 +1186,7 @@ test("reports a rejected delete bridge call without hiding the selected turn", a
   const runtime = loadInjection({
     turnIds: ["bridge-failed-turn"],
     selectedTurnIds: ["bridge-failed-turn"],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => {
       if (path === "/session/delete-messages") throw new Error("bridge stopped");
       return { status: "ok" };
@@ -1019,7 +1204,7 @@ test("keeps all selected rows visible when only part of a delete is confirmed", 
   const runtime = loadInjection({
     turnIds: ["turn-1", "turn-2"],
     selectedTurnIds: ["turn-1", "turn-2"],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? { status: "ok", deleted: 1 }
@@ -1049,7 +1234,7 @@ test("normalizes Codex history-content turn keys to rollout turn ids", () => {
 test("deletes an interrupted turn and its userless continuation as one logical round", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1180,7 +1365,7 @@ test("regroups a selected interrupted request when its tail continuation hydrate
 test("replaces a grouped tail placeholder with its hydrated stable turn id", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1281,7 +1466,7 @@ test("waits for non-user continuation content before grouping an empty hydrated 
 test("normalizes a selected standalone tail when hydration merges it into the origin", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1337,7 +1522,7 @@ test("normalizes a selected standalone tail when hydration merges it into the or
 test("deselecting a hydrated logical group clears the earlier standalone selection", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
   });
   const wrapper = new TreeElement();
   wrapper.isConnected = true;
@@ -1415,7 +1600,7 @@ test("retains every logical turn id when a continuation is virtualized away", ()
 test("restores a complete logical group when only its continuation remounts", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1514,7 +1699,7 @@ test("promotes a mounted continuation when removal mutation detaches its anchor"
 test("restores selection when a logical group remounts through a new continuation node", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1581,7 +1766,7 @@ test("restores selection when a logical group remounts through a new continuatio
 test("uses the selected group as topology after the ordinary logical cache is evicted", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1667,7 +1852,7 @@ test("uses the selected group as topology after the ordinary logical cache is ev
 test("keeps the origin selected when a continuation row is reused for a new user turn", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1731,7 +1916,7 @@ test("keeps the origin selected when a continuation row is reused for a new user
 test("keeps an explicitly mismatched continuation reference in a separate group", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1832,7 +2017,7 @@ test("invalidates a cached group when a non-member turn appears between its rows
 test("keeps only the old anchor selected when a cached continuation becomes a user turn", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1893,7 +2078,7 @@ test("keeps only the old anchor selected when a cached continuation becomes a us
 test("shrinks an offscreen selected group when its visible continuation becomes a user turn", async () => {
   const runtime = loadInjection({
     turnIds: [],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? {
@@ -1969,7 +2154,7 @@ test("sends the normalized rollout turn id to the delete bridge", async () => {
   const runtime = loadInjection({
     turnIds: [uiTurnKey],
     selectedTurnIds: [uiTurnKey],
-    codexSignalDispatcher: async () => {},
+    codexSessionController: createRecoveryController([]),
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? { status: "ok", deleted: 1 }

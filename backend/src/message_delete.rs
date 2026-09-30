@@ -86,20 +86,156 @@ pub fn delete_messages_persistently(
     record_delete_tombstones_unlocked(home, &session_id, &message_ids)?;
     record_resolved_tail_aliases_unlocked(home, &session_id, &resolved_tail_aliases)?;
     let message_ids = message_ids.into_iter().collect::<Vec<_>>();
+    let mut completed_ids = HashSet::new();
     let mut attempt = 0;
     loop {
-        match delete_messages(home, &session_id, &message_ids) {
-            Ok(result) => return Ok(result),
+        match delete_messages_once(home, &session_id, &message_ids) {
+            Ok(mut outcome) => {
+                completed_ids.extend(outcome.deleted_ids);
+                outcome.result.deleted = completed_ids.len();
+                return Ok(outcome.result);
+            }
             Err(error)
                 if attempt < MESSAGE_DELETE_RETRY_DELAYS.len()
-                    && retryable_message_delete_error(&error) =>
+                    && retryable_message_delete_error(&error.source) =>
             {
+                completed_ids.extend(error.deleted_ids);
                 std::thread::sleep(MESSAGE_DELETE_RETRY_DELAYS[attempt]);
                 attempt += 1;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.source),
         }
     }
+}
+
+struct DeleteMessagesAttemptOutcome {
+    result: MessageDeleteResult,
+    deleted_ids: HashSet<String>,
+}
+
+struct DeleteMessagesAttemptError {
+    source: anyhow::Error,
+    deleted_ids: HashSet<String>,
+}
+
+fn delete_messages_once(
+    home: &Path,
+    session_id: &str,
+    message_ids: &[String],
+) -> std::result::Result<DeleteMessagesAttemptOutcome, DeleteMessagesAttemptError> {
+    if session_id.trim().is_empty() || message_ids.is_empty() {
+        return Err(DeleteMessagesAttemptError {
+            source: anyhow::anyhow!("session_id 和 message_ids 不能为空"),
+            deleted_ids: HashSet::new(),
+        });
+    }
+    let session_id = crate::session_metadata::normalize_session_id(session_id);
+    let message_ids = message_ids
+        .iter()
+        .map(|message_id| normalize_message_id(message_id))
+        .filter(|message_id| !message_id.is_empty())
+        .collect::<Vec<_>>();
+    if message_ids.is_empty() {
+        return Err(DeleteMessagesAttemptError {
+            source: anyhow::anyhow!("message_ids 不能为空"),
+            deleted_ids: HashSet::new(),
+        });
+    }
+    let mut result = MessageDeleteResult {
+        deleted: 0,
+        resolved_message_ids: message_ids.clone(),
+        unsupported_databases: Vec::new(),
+    };
+    let mut deleted_ids = HashSet::new();
+    let mut history_session_id = session_id.to_string();
+    let has_rollout = match find_rollout_path(home, session_id) {
+        Ok(Some(rollout_path)) => {
+            if let Some(thread_id) = rollout_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(rollout_thread_id_from_filename)
+            {
+                history_session_id = thread_id;
+            }
+            let selected = message_ids.iter().cloned().collect::<HashSet<_>>();
+            match delete_turns_from_rollout(home, &rollout_path, &selected) {
+                Ok(found) => {
+                    deleted_ids.extend(found);
+                    true
+                }
+                Err(source) => {
+                    return Err(DeleteMessagesAttemptError {
+                        source,
+                        deleted_ids,
+                    });
+                }
+            }
+        }
+        Ok(None) => false,
+        Err(source) => {
+            return Err(DeleteMessagesAttemptError {
+                source,
+                deleted_ids,
+            });
+        }
+    };
+
+    match delete_from_thread_history(
+        &home.join(THREAD_HISTORY_DB),
+        &history_session_id,
+        &message_ids,
+    ) {
+        Ok(Some(found)) => deleted_ids.extend(found),
+        Ok(None) if home.join(THREAD_HISTORY_DB).exists() => result
+            .unsupported_databases
+            .push(home.join(THREAD_HISTORY_DB).to_string_lossy().to_string()),
+        Ok(None) => {}
+        Err(source) => {
+            return Err(DeleteMessagesAttemptError {
+                source,
+                deleted_ids,
+            });
+        }
+    }
+    result.deleted = deleted_ids.len();
+    if has_rollout || result.deleted > 0 {
+        return Ok(DeleteMessagesAttemptOutcome {
+            result,
+            deleted_ids,
+        });
+    }
+
+    // Compatibility path for older Codex builds that stored individual
+    // messages in SQLite instead of turn blocks in a rollout JSONL file.
+    for db_path in codex_session_db_paths_from_home(home) {
+        if !db_path.exists() {
+            continue;
+        }
+        let Some(targets) =
+            find_message_targets(&db_path).map_err(|source| DeleteMessagesAttemptError {
+                source,
+                deleted_ids: deleted_ids.clone(),
+            })?
+        else {
+            result
+                .unsupported_databases
+                .push(db_path.to_string_lossy().to_string());
+            continue;
+        };
+        let deleted =
+            delete_from_db(&db_path, &targets, session_id, &message_ids).map_err(|source| {
+                DeleteMessagesAttemptError {
+                    source,
+                    deleted_ids: deleted_ids.clone(),
+                }
+            })?;
+        deleted_ids.extend(deleted);
+    }
+    result.deleted = deleted_ids.len();
+    Ok(DeleteMessagesAttemptOutcome {
+        result,
+        deleted_ids,
+    })
 }
 
 fn retryable_message_delete_error(error: &anyhow::Error) -> bool {
@@ -401,69 +537,9 @@ pub fn delete_messages(
     session_id: &str,
     message_ids: &[String],
 ) -> Result<MessageDeleteResult> {
-    if session_id.trim().is_empty() || message_ids.is_empty() {
-        anyhow::bail!("session_id 和 message_ids 不能为空");
-    }
-    let session_id = crate::session_metadata::normalize_session_id(session_id);
-    let message_ids = message_ids
-        .iter()
-        .map(|message_id| normalize_message_id(message_id))
-        .filter(|message_id| !message_id.is_empty())
-        .collect::<Vec<_>>();
-    if message_ids.is_empty() {
-        anyhow::bail!("message_ids 不能为空");
-    }
-    let mut result = MessageDeleteResult {
-        deleted: 0,
-        resolved_message_ids: message_ids.clone(),
-        unsupported_databases: Vec::new(),
-    };
-    let mut deleted_ids = HashSet::new();
-    let mut history_session_id = session_id.to_string();
-    let has_rollout = if let Some(rollout_path) = find_rollout_path(home, session_id)? {
-        if let Some(thread_id) = rollout_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(rollout_thread_id_from_filename)
-        {
-            history_session_id = thread_id;
-        }
-        let selected = message_ids.iter().cloned().collect::<HashSet<_>>();
-        deleted_ids.extend(delete_turns_from_rollout(home, &rollout_path, &selected)?);
-        true
-    } else {
-        false
-    };
-
-    let history_path = home.join(THREAD_HISTORY_DB);
-    match delete_from_thread_history(&history_path, &history_session_id, &message_ids)? {
-        Some(found) => deleted_ids.extend(found),
-        None if history_path.exists() => result
-            .unsupported_databases
-            .push(history_path.to_string_lossy().to_string()),
-        None => {}
-    }
-    result.deleted = deleted_ids.len();
-    if has_rollout || result.deleted > 0 {
-        return Ok(result);
-    }
-
-    // Compatibility path for older Codex builds that stored individual
-    // messages in SQLite instead of turn blocks in a rollout JSONL file.
-    for db_path in codex_session_db_paths_from_home(home) {
-        if !db_path.exists() {
-            continue;
-        }
-        let Some(targets) = find_message_targets(&db_path)? else {
-            result
-                .unsupported_databases
-                .push(db_path.to_string_lossy().to_string());
-            continue;
-        };
-        let deleted = delete_from_db(&db_path, &targets, session_id, &message_ids)?;
-        result.deleted += deleted;
-    }
-    Ok(result)
+    delete_messages_once(home, session_id, message_ids)
+        .map(|outcome| outcome.result)
+        .map_err(|error| error.source)
 }
 
 fn normalize_message_id(value: &str) -> String {
@@ -1093,7 +1169,7 @@ fn delete_from_db(
     targets: &[MessageTarget],
     session_id: &str,
     message_ids: &[String],
-) -> Result<usize> {
+) -> Result<HashSet<String>> {
     let mut connection = open_message_delete_database(path)?;
     let placeholders = std::iter::repeat_n("?", message_ids.len())
         .collect::<Vec<_>>()
@@ -1101,14 +1177,19 @@ fn delete_from_db(
     let mut values = message_ids.to_vec();
     values.push(session_id.to_string());
     let transaction = connection.transaction()?;
-    let mut deleted = 0;
+    let mut deleted = HashSet::new();
     for target in targets {
         let sql = format!(
-            "DELETE FROM {} WHERE {} IN ({placeholders}) AND {} = ?",
-            target.table, target.id_column, target.session_column
+            "DELETE FROM {} WHERE {} IN ({placeholders}) AND {} = ? RETURNING {}",
+            target.table, target.id_column, target.session_column, target.id_column
         );
-        deleted += transaction.execute(&sql, params_from_iter(values.iter()))?;
+        let mut statement = transaction.prepare(&sql)?;
+        let found = statement
+            .query_map(params_from_iter(values.iter()), |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        deleted.extend(found);
     }
+    // Only committed IDs count: a later store may fail after this one succeeds.
     transaction.commit()?;
     Ok(deleted)
 }
@@ -1164,6 +1245,7 @@ fn delete_from_thread_history(
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::sync::mpsc;
     use tempfile::tempdir;
 
     #[test]
@@ -1321,6 +1403,130 @@ mod tests {
     }
 
     #[test]
+    fn legacy_deletion_counts_each_requested_id_once_across_stores() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join("sqlite")).unwrap();
+        let paths = [
+            home.path().join("sqlite/codex.db"),
+            home.path().join("state_5.sqlite"),
+        ];
+        for path in &paths {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY);\
+                     CREATE TABLE messages (id TEXT, session_id TEXT);\
+                     CREATE TABLE items (item_id TEXT, thread_id TEXT);\
+                     INSERT INTO messages VALUES ('m1', 's1'), ('m2', 's1'), ('m1', 's2');\
+                     INSERT INTO items VALUES ('m1', 's1'), ('m2', 's1'), ('m1', 's2');",
+                )
+                .unwrap();
+        }
+
+        let result =
+            delete_messages_persistently(home.path(), "s1", &["m1".into(), "missing".into()])
+                .unwrap();
+
+        assert_eq!(result.deleted, 1);
+        assert!(result.unsupported_databases.is_empty());
+        for path in &paths {
+            let connection = Connection::open(path).unwrap();
+            for table in ["messages", "items"] {
+                let remaining: usize = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(remaining, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_deletion_does_not_count_rolled_back_records() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (id TEXT, session_id TEXT);\
+                 CREATE TABLE items (item_id TEXT, thread_id TEXT);\
+                 INSERT INTO messages VALUES ('m1', 's1');\
+                 INSERT INTO items VALUES ('m1', 's1');\
+                 CREATE TRIGGER reject_item_delete BEFORE DELETE ON items \
+                 BEGIN SELECT RAISE(ABORT, 'test deletion failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = delete_messages_once(home.path(), "s1", &["m1".into()])
+            .err()
+            .unwrap();
+
+        assert!(format!("{:#}", error.source).contains("test deletion failure"));
+        assert!(error.deleted_ids.is_empty());
+        let connection = Connection::open(path).unwrap();
+        for table in ["messages", "items"] {
+            let remaining: usize = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(remaining, 1);
+        }
+    }
+
+    #[test]
+    fn retries_after_legacy_lock_without_losing_committed_deletion_ids() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join("sqlite")).unwrap();
+        let first_path = home.path().join("sqlite/codex.db");
+        let locked_path = home.path().join("state_5.sqlite");
+        for (path, message_id) in [(&first_path, "m1"), (&locked_path, "m2")] {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY);\
+                     CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT);",
+                )
+                .unwrap();
+            connection
+                .execute("INSERT INTO messages VALUES (?1, 's1')", [message_id])
+                .unwrap();
+        }
+        assert_eq!(
+            codex_session_db_paths_from_home(home.path()),
+            vec![first_path.clone(), locked_path.clone()]
+        );
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let lock_path = locked_path.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock = Connection::open(lock_path).unwrap();
+            // Allow schema reads while preventing the second store's deletion.
+            lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(5_500));
+            lock.execute_batch("COMMIT").unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        let result = delete_messages_persistently(home.path(), "s1", &["m1".into(), "m2".into()]);
+        lock_thread.join().unwrap();
+        let result = result.unwrap();
+
+        assert_eq!(result.deleted, 2);
+        assert!(result.unsupported_databases.is_empty());
+        for path in [&first_path, &locked_path] {
+            let connection = Connection::open(path).unwrap();
+            let remaining: usize = connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(remaining, 0);
+        }
+    }
+
+    #[test]
     fn deletes_a_projected_turn_using_the_rollout_thread_id() {
         let home = tempdir().unwrap();
         let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
@@ -1432,6 +1638,65 @@ mod tests {
         let result = delete_messages_persistently(home.path(), session_id, &["t1".into()]).unwrap();
 
         assert_eq!(result.deleted, 1);
+        assert!(!fs::read_to_string(&rollout).unwrap().contains("t1"));
+    }
+
+    #[test]
+    fn retries_after_history_lock_without_losing_rollout_deletion_count() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/09/30");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-retry-history-lock.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n",
+            ),
+        )
+        .unwrap();
+        let catalog = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        catalog
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        catalog
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                params!["s1", rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(catalog);
+
+        let history_path = home.path().join(THREAD_HISTORY_DB);
+        let history = Connection::open(&history_path).unwrap();
+        history
+            .execute_batch(
+                "CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT);\
+                 CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, item_id TEXT);",
+            )
+            .unwrap();
+        drop(history);
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let lock_path = history_path.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock = Connection::open(lock_path).unwrap();
+            lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(5_500));
+            lock.execute_batch("COMMIT").unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        let result = delete_messages_persistently(home.path(), "s1", &["t1".into()]).unwrap();
+
+        lock_thread.join().unwrap();
+        assert_eq!(result.deleted, 1);
+        assert!(result.unsupported_databases.is_empty());
         assert!(!fs::read_to_string(&rollout).unwrap().contains("t1"));
     }
 

@@ -1163,10 +1163,7 @@ test("discovers app-shared when the build moves the AppServerManager resolver th
   const entryUrl = "app://-/assets/index-BZNttYfb.js";
   const appSharedUrl = "app://-/assets/app-shared-588591d226f4.js";
   const manager = {
-    discardConversationFromCache() {},
-    handleThreadDeletion() {},
     refreshRecentConversations() {},
-    resumeConversation() {},
     sendRequest() {
       return { rateLimits: { limitId: "codex" } };
     },
@@ -1201,12 +1198,12 @@ test("discovers app-shared when the build moves the AppServerManager resolver th
   });
 
   const controller = await window.__codeyLoadCodexSessionController({
-    feature: "deleteMessages",
+    feature: "refresh",
   });
 
   assert.equal(controller.kind, "manager");
   assert.equal(controller.manager, manager);
-  assert.equal(window.__codeyPageCapabilities.deleteMessages.status, "available");
+  assert.equal(window.__codeyPageCapabilities.refresh.status, "available");
 });
 
 test("discovers the current app-initial asset and resolves AppServerManager from React scope", async () => {
