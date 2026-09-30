@@ -1536,6 +1536,10 @@ function ModelSectionComponent({
                       const upstreamProtocol = value as Profile["upstreamProtocol"];
                       updateRouteDraft({
                         upstreamProtocol,
+                        supportsRemoteCompaction:
+                          upstreamProtocol === "openaiResponses"
+                            ? Boolean(routeDraft.supportsRemoteCompaction)
+                            : false,
                         supportsWebsockets:
                           upstreamProtocol === "openaiResponses"
                             ? Boolean(routeDraft.supportsWebsockets)
@@ -1552,6 +1556,29 @@ function ModelSectionComponent({
 
                 {routeDraft.upstreamProtocol === "openaiResponses" && (
                   <div className="route-protocol-options route-editor-span-all">
+                    <div className="route-option-item">
+                      <div className="route-option-header">
+                        <div className="route-option-title-group">
+                          <strong className="route-option-title">原生远程压缩</strong>
+                          <Tooltip content="仅在上游实现 OpenAI Responses 原生压缩协议时开启；所有启用线路都支持时 Codex 才会使用，能力变更需重启。">
+                            <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
+                              <IconInfoCircle size={13} />
+                            </span>
+                          </Tooltip>
+                        </div>
+                        <Switch
+                          size="sm"
+                          checked={Boolean(routeDraft.supportsRemoteCompaction)}
+                          disabled={isBusy}
+                          onCheckedChange={(checked) =>
+                            updateRouteDraft({ supportsRemoteCompaction: checked })}
+                          aria-label="原生远程压缩"
+                        />
+                      </div>
+                      <small className="route-field-hint">
+                        仅在上游明确支持时开启；所有启用线路都支持时才会使用
+                      </small>
+                    </div>
                     <div className="route-option-item">
                       <div className="route-option-header">
                         <div className="route-option-title-group">

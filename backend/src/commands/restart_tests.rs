@@ -263,7 +263,7 @@ fn full_config_save_restores_route_secrets_and_source_owned_identity() {
 
     assert_eq!(merged[0].api_key, "saved-secret");
     assert_eq!(merged[0].provider_id(), "source-provider");
-    assert!(merged[0].supports_remote_compaction);
+    assert!(!merged[0].supports_remote_compaction);
     assert_eq!(
         merged[0]
             .model_request_headers

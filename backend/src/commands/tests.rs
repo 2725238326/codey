@@ -606,6 +606,38 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
 }
 
 #[test]
+fn provider_secret_merge_preserves_user_remote_compaction_setting() {
+    let mut saved = ProviderProfile::new("Imported Relay");
+    saved.id = "relay-route".into();
+    saved.base_url = "https://relay.example/v1".into();
+    saved.api_key = "saved-secret".into();
+    saved.supports_remote_compaction = true;
+    saved.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: saved.id.clone(),
+        profiles: vec![saved.clone()],
+        ..CodeyConfig::default()
+    };
+
+    let mut disabled = saved.clone();
+    disabled.supports_remote_compaction = false;
+    let merged = merge_profile_secrets(vec![disabled], &previous).unwrap();
+    assert!(!merged[0].supports_remote_compaction);
+
+    let mut previous_disabled_profile = saved;
+    previous_disabled_profile.supports_remote_compaction = false;
+    let previous_disabled = CodeyConfig {
+        active_profile_id: previous_disabled_profile.id.clone(),
+        profiles: vec![previous_disabled_profile.clone()],
+        ..CodeyConfig::default()
+    };
+    let mut enabled = previous_disabled_profile;
+    enabled.supports_remote_compaction = true;
+    let merged = merge_profile_secrets(vec![enabled], &previous_disabled).unwrap();
+    assert!(merged[0].supports_remote_compaction);
+}
+
+#[test]
 fn route_name_limit_matches_the_renderer_and_legacy_names_stay_saveable() {
     let mut legacy = ProviderProfile::new("一条长度超过十五个字符限制的旧线路名称");
     legacy.id = "legacy-route".to_string();
