@@ -45,6 +45,7 @@
   // 堆栈里放着帮助与个人资料按钮，Codey 入口跟随它们落在这里。
   const navigationRailSelector = '[data-app-navigation-rail="true"]';
   const railHelpLabelPattern = /帮助|help/i;
+  const railProfileLabelPattern = /个人资料|账户|账号|profile|account/i;
   const bootstrapProbeSelector = `${headerSelector}, ${sidebarSelector}, ${navigationRailSelector}`;
   const settingsIcon = `
     <svg viewBox="0 0 350 350" aria-hidden="true" focusable="false">
@@ -73,6 +74,7 @@
   let sessionToolsIdleLoadScheduled = false;
   let bootstrapObserver = null;
   let headerMountDirty = true;
+  let navigationRailSeen = false;
 
   const queryWithin = (root, selector) => {
     const matches = [];
@@ -1019,24 +1021,25 @@
   };
 
   // 图标栏底部的贴底堆栈：nav 的最后一个可见子容器 → 它的 flex 列容器，
-  // 里面依次是帮助菜单与个人资料菜单。Codey 入口插在帮助菜单之前。
+  // 帮助菜单可能不再显示，此时将 Codey 入口放在个人资料菜单之前。
   const findRailFooterMount = () => {
     const rail = document.querySelector(navigationRailSelector);
     if (!(rail instanceof HTMLElement)) return null;
+    navigationRailSeen = true;
+    if (!visibleMountRect(rail)) return null;
     const cluster = [...rail.children]
-      .filter((child) => child instanceof HTMLElement
-        && child.getAttribute("aria-hidden") !== "true"
-        && child.getBoundingClientRect().width > 0)
+      .filter((child) => visibleMountRect(child))
       .at(-1);
     const stack = cluster?.firstElementChild;
     if (!(stack instanceof HTMLElement)) return null;
-    const help = [...stack.querySelectorAll("button")]
-      .find((candidate) => candidate.id !== buttonId
-        && railHelpLabelPattern.test(candidate.getAttribute("aria-label") || ""));
-    if (!(help instanceof HTMLElement)) return null;
-    // 帮助按钮外面可能还包着 radix 的触发层，只取 stack 的直接子容器作锚点。
+    const controls = [...stack.querySelectorAll("button")]
+      .filter((candidate) => candidate.id !== buttonId && visibleMountRect(candidate));
+    const anchor = controls.find((candidate) => railHelpLabelPattern.test(candidate.getAttribute("aria-label") || ""))
+      || controls.find((candidate) => railProfileLabelPattern.test(candidate.getAttribute("aria-label") || ""));
+    if (!(anchor instanceof HTMLElement)) return null;
+    // 菜单按钮外面可能还包着 radix 的触发层，只取 stack 的直接子容器作锚点。
     const before = [...stack.children]
-      .find((child) => child instanceof HTMLElement && child.contains(help));
+      .find((child) => child instanceof HTMLElement && child.contains(anchor));
     if (!(before instanceof HTMLElement)) return null;
     return { target: stack, before };
   };
@@ -1056,6 +1059,8 @@
         && parent === button.__codeyRailStack
         && button.nextElementSibling === button.__codeyRailAnchor;
     }
+    // 页面先渲染顶部、后渲染侧栏时，已挂载的顶部入口也需要迁移。
+    if (document.querySelector(navigationRailSelector)) return false;
     if (button.dataset.codeyNativeSlot === "true") {
       const measure = document.getElementById(buttonMeasureId);
       return parent === button.__codeyActionRow
@@ -1080,7 +1085,8 @@
     const existingButton = document.getElementById(buttonId);
     if (mountedButtonIsUsable(existingButton)) return;
     const railMount = findRailFooterMount();
-    const mount = railMount || findHeaderMount();
+    // 仅无图标栏的旧版布局使用顶部入口，侧栏重建期间等待它恢复。
+    const mount = railMount || (!navigationRailSeen ? findHeaderMount() : null);
     if (!mount) {
       existingButton?.remove?.();
       document.getElementById(buttonMeasureId)?.remove();

@@ -159,13 +159,71 @@ test("mounts above the native help entry in the navigation rail footer", () => {
   assert.equal(document.getElementById("codey-settings-button").parentElement, replacement);
   assert.equal(replacement.children[0], document.getElementById("codey-settings-button"));
 
-  // Without the rail Codex still gets the header entry instead of a lost button.
+  // A rebuilding rail must not move the entry back into the header.
   rail.remove();
   window.__codeyRendererInvalidateHeaderMount();
   window.__codeyRendererScan();
-  const fallback = document.getElementById("codey-settings-button");
-  assert.equal(fallback.parentElement, header);
-  assert.equal(fallback.hasAttribute("data-codey-rail-slot"), false);
+  assert.equal(document.getElementById("codey-settings-button"), null);
+  assert.equal(header.querySelector("#codey-settings-button"), null);
+  documentElement.appendChild(rail);
+  window.__codeyRendererScan();
+  assert.equal(document.getElementById("codey-settings-button").parentElement, replacement);
+});
+
+const createProfileRailFixture = ({ label = "打开个人资料菜单", attach = true, profileVisible = true } = {}) => {
+  const header = new FakeElement("header", { right: 1200 });
+  header.appendChild(new FakeElement("button", { right: 1192, width: 28 }));
+  const rail = new FakeElement("nav", { right: 52, width: 52, height: 846, top: 44 });
+  rail.setAttribute("data-app-navigation-rail", "true");
+  const cluster = new FakeElement("div", { right: 44, width: 36, height: 36, top: 850 });
+  const stack = new FakeElement("div", { right: 44, width: 36, height: 36, top: 850 });
+  const profileSlot = new FakeElement("span");
+  const profile = new FakeElement("button", { visible: profileVisible });
+  profile.setAttribute("aria-label", label);
+  profileSlot.appendChild(profile);
+  stack.appendChild(profileSlot);
+  cluster.appendChild(stack);
+  rail.appendChild(cluster);
+  const documentElement = new FakeElement("html");
+  documentElement.appendChild(header);
+  if (attach) documentElement.appendChild(rail);
+  const sandbox = createRendererSandbox({ documentElement, header, rail });
+  runRendererInShell(sandbox);
+  return { ...sandbox, documentElement, header, rail, stack, profile, profileSlot };
+};
+
+test("mounts above the profile menu when the navigation rail has no help entry", () => {
+  for (const label of ["打开个人资料菜单", "Open profile menu"]) {
+    const { document, header, stack, profileSlot, window } = createProfileRailFixture({ label });
+    const button = document.getElementById("codey-settings-button");
+    assert.ok(button);
+    assert.equal(button.parentElement, stack);
+    assert.equal(button.nextElementSibling, profileSlot);
+    assert.equal(button.dataset.codeyRailSlot, "true");
+    assert.equal(header.querySelector("#codey-settings-button"), null);
+    window.__codeyRendererScan();
+    assert.equal(document.getElementById("codey-settings-button"), button);
+  }
+});
+
+test("moves a stable header entry into a navigation rail rendered later", () => {
+  const { document, documentElement, header, rail, stack, window } = createProfileRailFixture({ attach: false });
+  const button = document.getElementById("codey-settings-button");
+  assert.equal(button.parentElement, header);
+  documentElement.appendChild(rail);
+  window.__codeyRendererScan();
+  assert.equal(document.getElementById("codey-settings-button"), button);
+  assert.equal(button.parentElement, stack);
+  assert.equal(button.dataset.codeyRailSlot, "true");
+});
+
+test("waits for a visible footer entry instead of falling back to the header", () => {
+  const { document, header, profile, stack, window } = createProfileRailFixture({ profileVisible: false });
+  assert.equal(document.getElementById("codey-settings-button"), null);
+  assert.equal(header.querySelector("#codey-settings-button"), null);
+  profile.visible = true;
+  window.__codeyRendererScan();
+  assert.equal(document.getElementById("codey-settings-button").parentElement, stack);
 });
 
 test("joins the native measured action row and repairs its noninteractive mirror", () => {
