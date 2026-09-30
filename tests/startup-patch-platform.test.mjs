@@ -188,7 +188,7 @@ test("Store environment uses supervised native activation with scoped cleanup", 
   const supervisor = await readSource("backend/src/launcher/windows_activation.rs");
   assert.doesNotMatch(source, /PACKAGE_NAME_ATTRIBUTE|STARTUPINFOEXW|CreateProcessW|UpdateProcThreadAttribute/);
   assert.match(source, /settings\.EnableDebugging\(/);
-  assert.match(source, /settings\.DisableDebugging\(/);
+  assert.match(source, /settings\s*\.DisableDebugging\(/);
   assert.match(source, /impl Drop for WindowsPackageDebugSession[\s\S]*?journal\.recover\(disable_windows_packaged_environment\)/);
   const prepare = source.indexOf("session.journal.arm(&package_full_name)?");
   const enable = source.indexOf("enable_windows_packaged_environment(", prepare);
@@ -209,6 +209,30 @@ test("Store environment uses supervised native activation with scoped cleanup", 
   assert.match(supervisor, /result = &mut activation => break result/);
   assert.match(supervisor, /let stopped = stop\(\)\.await;[\s\S]*?let cleared = finish\(\);/);
   assert.match(launcherPlatform, /!environment_required && error\.is::<recovery::IntegrationFailure>\(\)/);
+});
+
+test("Store environment failures identify each native operation without logging values", async () => {
+  const source = await readSource("backend/src/launcher/windows_packaged.rs");
+  const setupStart = source.indexOf("fn with_windows_package_debug_settings<T>");
+  const enableStart = source.indexOf("fn enable_windows_packaged_environment(", setupStart);
+  const disableStart = source.indexOf("fn disable_windows_packaged_environment(", enableStart);
+  assert.ok(setupStart >= 0 && enableStart > setupStart && disableStart > enableStart);
+  const setup = source.slice(setupStart, enableStart);
+  const enable = source.slice(enableStart, disableStart);
+  assert.match(setup, /初始化 Windows 包调试 COM 环境失败（CoInitializeEx）/);
+  assert.match(setup, /创建 Windows 包调试设置接口失败（CoCreateInstance）/);
+  assert.match(enable, /\.DisableDebugging\(package\)\s*\.context\("安装兼容环境前清理包调试设置失败/);
+  assert.match(enable, /EnableDebugging；环境块 UTF-16 长度=\{\}，恢复命令 UTF-16 长度=\{\}/);
+  assert.match(source.slice(disableStart), /移除包调试设置失败（IPackageDebugSettings::DisableDebugging）/);
+
+  const failureStart = source.indexOf("let detail = format!(\"{error:#}\");");
+  const cleanupStart = source.indexOf("let cleared = session.finish();", failureStart);
+  assert.ok(failureStart >= 0 && cleanupStart > failureStart);
+  const failure = source.slice(failureStart, cleanupStart);
+  assert.match(failure, /crate::error_log::record_failure\(\s*"package_environment_failed",\s*"enable_windows_packaged_environment"/);
+  assert.match(failure, /"environmentVariableNames": environment\.iter\(\)\s*\.map\(\|\(name, _\)\| name\.as_str\(\)\)/);
+  assert.match(failure, /error\.downcast_ref::<windows::core::Error>\(\)/);
+  assert.doesNotMatch(failure, /"environment"\s*:|"environmentValues"\s*:/);
 });
 
 test("Store debugger resumes only a verified Codex process and its own thread", async () => {

@@ -335,15 +335,26 @@ impl WindowsPackageDebugSession {
             environment,
             session.feedback.as_ref().unwrap(),
         ) {
+            let detail = format!("{error:#}");
+            let context = serde_json::json!({
+                "package": package_full_name,
+                "environmentEntryCount": environment.len(),
+                "environmentVariableNames": environment.iter()
+                    .map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+                "hresult": error.downcast_ref::<windows::core::Error>()
+                    .map(|native| format!("0x{:08X}", native.code().0 as u32)),
+            });
+            crate::error_log::record_failure(
+                "package_environment_failed",
+                "enable_windows_packaged_environment",
+                &detail,
+                context.clone(),
+            );
+            let mut diagnostic = context;
+            diagnostic["detail"] = serde_json::Value::String(detail);
             let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
                 "launcher.windows_package_environment_failed",
-                serde_json::json!({
-                    "package": package_full_name,
-                    "environmentEntryCount": environment.len(),
-                    "detail": format!("{error:#}"),
-                    "hresult": error.downcast_ref::<windows::core::Error>()
-                        .map(|native| format!("0x{:08X}", native.code().0 as u32)),
-                }),
+                diagnostic,
             );
             let cleared = session.finish();
             return Err(super::platform::startup_activation_error_after_cleanup(
@@ -407,7 +418,7 @@ impl Drop for WindowsPackageDebugSession {
 fn with_windows_package_debug_settings<T>(
     operation: impl FnOnce(
         &windows::Win32::UI::Shell::IPackageDebugSettings,
-    ) -> windows::core::Result<T>,
+    ) -> Result<T>,
 ) -> Result<T> {
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -425,16 +436,18 @@ fn with_windows_package_debug_settings<T>(
             } else {
                 Err(error)
             }
-        })?;
+        })
+        .context("初始化 Windows 包调试 COM 环境失败（CoInitializeEx）")?;
         let result = (|| {
             let settings: IPackageDebugSettings =
-                CoCreateInstance(&PackageDebugSettings, None, CLSCTX_INPROC_SERVER)?;
+                CoCreateInstance(&PackageDebugSettings, None, CLSCTX_INPROC_SERVER)
+                    .context("创建 Windows 包调试设置接口失败（CoCreateInstance）")?;
             operation(&settings)
         })();
         if should_uninitialize {
             CoUninitialize();
         }
-        result.map_err(Into::into)
+        result
     }
 }
 
@@ -473,12 +486,21 @@ fn enable_windows_packaged_environment(
 
     with_windows_package_debug_settings(|settings| unsafe {
         let package = PCWSTR(package_full_name.as_ptr());
-        settings.DisableDebugging(package)?;
+        settings
+            .DisableDebugging(package)
+            .context("安装兼容环境前清理包调试设置失败（IPackageDebugSettings::DisableDebugging）")?;
         settings.EnableDebugging(
             package,
             PCWSTR(debugger_command.as_ptr()),
             PCWSTR(environment.as_ptr()),
         )
+        .with_context(|| {
+            format!(
+                "写入包调试兼容环境失败（IPackageDebugSettings::EnableDebugging；环境块 UTF-16 长度={}，恢复命令 UTF-16 长度={}）",
+                environment.len(),
+                debugger_command.len(),
+            )
+        })
     })
     .context("为 Windows Store Codex 安装一次性 CLI 兼容环境失败")
 }
@@ -492,7 +514,9 @@ fn disable_windows_packaged_environment(package_full_name: &str) -> Result<()> {
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let result = with_windows_package_debug_settings(|settings| unsafe {
-        settings.DisableDebugging(PCWSTR(name.as_ptr()))
+        settings
+            .DisableDebugging(PCWSTR(name.as_ptr()))
+            .context("移除包调试设置失败（IPackageDebugSettings::DisableDebugging）")
     });
     if result
         .as_ref()
