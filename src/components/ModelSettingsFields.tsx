@@ -7,7 +7,6 @@ import {
   MAX_CONTEXT_WINDOW_TOKENS,
 } from "../modelContextPresets";
 import {
-  MODEL_REASONING_EFFORT_COLUMNS,
   MODEL_REASONING_EFFORT_LEVELS,
   normalizeReasoningEfforts,
   reasoningEffortsEqual,
@@ -17,6 +16,7 @@ import { Checkbox, Input } from "./ui";
 
 export type ModelSettingsReasoningProps = {
   autoEfforts: readonly ModelReasoningEffort[];
+  supportedLevels?: readonly string[];
   efforts: readonly ModelReasoningEffort[];
   onChange: (efforts: ModelReasoningEffort[]) => void;
   onReset: () => void;
@@ -50,6 +50,11 @@ export function ModelSettingsFields({
   const declaredLevels = reasoning
     ? normalizeReasoningEfforts(reasoning.efforts).map((effort) => effort.level)
     : [];
+  const levelOptions = reasoning?.supportedLevels?.length
+    ? MODEL_REASONING_EFFORT_LEVELS.filter((level) =>
+        reasoning.supportedLevels!.includes(level),
+      )
+    : MODEL_REASONING_EFFORT_LEVELS;
   const summaryBadges: string[] = [];
   if (policy?.contextWindowTokens) {
     summaryBadges.push(`${policy.contextWindowTokens.toLocaleString()} Token`);
@@ -196,8 +201,7 @@ export function ModelSettingsFields({
               </button>
             </div>
             <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
-              {/* 保留 MODEL_REASONING_EFFORT_COLUMNS 引用以维持契约测试 */}
-              {(MODEL_REASONING_EFFORT_COLUMNS && MODEL_REASONING_EFFORT_LEVELS).map((level) => {
+              {levelOptions.map((level) => {
                 const isChecked = selectedLevels.has(level);
                 return (
                   <Checkbox

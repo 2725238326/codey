@@ -6,6 +6,8 @@
 
 `provider.describe` 沿用线路描述，协议须为 `openaiResponses`，`headers` 须为空，并增加 `transport`：
 
+线路也可以返回可选的 `modelReasoningEfforts`，将模型 ID 映射到允许的思考档位。宿主会把它作为线路能力上限，用户可配置范围内的档位并自定义上游取值，但不能借取值启用未声明的 `max` 或 `ultra`；缺省时保持原有自动适配。旧版宿主会拒绝描述中的未知字段，需升级宿主后才能启用带此字段的插件。
+
 ```json
 {
   "accountEmail": "user@example.com",

@@ -4376,6 +4376,46 @@ mod tests {
     }
 
     #[test]
+    fn plugin_reasoning_capability_stays_bounded_after_template_metadata() {
+        let mut model = json!({
+            "slug": "plugin/gpt-6-astra",
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "high"},
+                {"effort": "xhigh"},
+                {"effort": "max"},
+                {"effort": "ultra"}
+            ],
+            "default_reasoning_level": "ultra"
+        });
+        let declaration = vec![
+            crate::config::ModelReasoningEffort {
+                level: "low".into(),
+                value: "low".into(),
+            },
+            crate::config::ModelReasoningEffort {
+                level: "medium".into(),
+                value: "medium".into(),
+            },
+            crate::config::ModelReasoningEffort {
+                level: "high".into(),
+                value: "high".into(),
+            },
+            crate::config::ModelReasoningEffort {
+                level: "xhigh".into(),
+                value: "xhigh".into(),
+            },
+        ];
+        apply_model_reasoning_efforts(&mut model, Some(&declaration));
+        assert_eq!(
+            reasoning_efforts_from_value(&model),
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(model["default_reasoning_level"], "low");
+    }
+
+    #[test]
     fn websocket_preference_is_isolated_per_route_model_alias() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());

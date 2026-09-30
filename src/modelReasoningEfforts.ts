@@ -70,3 +70,29 @@ export function reasoningEffortsEqual(
       effort.level === right[index].level && effort.value === right[index].value,
   );
 }
+
+/// 插件声明决定可用范围；用户缩小范围后仍能恢复完整的自动适配选项。
+export function resolveModelReasoningEfforts(
+  templateLevels: readonly string[],
+  stored: readonly ModelReasoningEffort[] | undefined,
+  capabilityLevels: readonly string[] | undefined,
+): { autoEfforts: ModelReasoningEffort[]; efforts: ModelReasoningEffort[] } {
+  const autoEfforts = autoReasoningEfforts(capabilityLevels ?? templateLevels);
+  if (!stored) return { autoEfforts, efforts: autoEfforts };
+  const normalized = normalizeReasoningEfforts(stored);
+  if (!capabilityLevels) return { autoEfforts, efforts: normalized };
+  const allowed = new Set(capabilityLevels);
+  const bounded: ModelReasoningEffort[] = [];
+  for (const effort of normalized) {
+    if (allowed.has(effort.level)) {
+      const value = ["max", "ultra"].includes(effort.value) && !allowed.has(effort.value)
+        ? effort.level
+        : effort.value;
+      bounded.push({ level: effort.level, value });
+    } else if (["max", "ultra"].includes(effort.level) && allowed.has("xhigh")) {
+      bounded.push({ level: "xhigh", value: "xhigh" });
+    }
+  }
+  const efforts = normalizeReasoningEfforts(bounded);
+  return { autoEfforts, efforts: efforts.length ? efforts : autoEfforts };
+}

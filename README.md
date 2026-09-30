@@ -34,7 +34,7 @@ Codey 是 Codex 桌面客户端的增强启动器，集中管理模型线路、�
 
 ## 第三方声明
 
-Excel Bridge 插件的协议适配迁移自 Kaixxrua/excel-codex-bridge，原项目采用 Unlicense。
+PPT Bridge 插件的协议适配迁移自 Kaixxrua/excel-codex-bridge，原项目采用 Unlicense。
 
     This product includes FastCtx
     (https://github.com/yc-duan/fastctx), Copyright (c) 2026 yc-duan,

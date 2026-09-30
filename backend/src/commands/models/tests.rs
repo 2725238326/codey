@@ -1,6 +1,130 @@
 use super::*;
 
 #[test]
+fn plugin_reasoning_limits_preserve_capabilities_and_reject_unsupported_settings() {
+    use crate::config::ModelReasoningEffort;
+    let mut config = CodeyConfig::default();
+    let profile = &mut config.profiles[0];
+    profile.plugin_owner_id = Some("dev.reasoning".into());
+    profile.plugin_route_spec = Some(
+        serde_json::from_value(json!({
+            "name": "PPT Bridge",
+            "baseUrl": "https://example.test/v1",
+            "upstreamProtocol": "openaiResponses",
+            "models": ["demo"],
+            "headers": {},
+            "modelReasoningEfforts": { "demo": ["low", "medium", "high", "xhigh"] }
+        }))
+        .unwrap(),
+    );
+    let provider_id = profile.provider_id().to_string();
+    let available = vec!["demo".to_string()];
+    for (level, value) in [
+        ("max", "max"),
+        ("ultra", "ultra"),
+        ("xhigh", "ultra"),
+        ("high", "max"),
+    ] {
+        let requested = BTreeMap::from([(
+            "DEMO".into(),
+            vec![ModelReasoningEffort {
+                level: level.into(),
+                value: value.into(),
+            }],
+        )]);
+        let before = config.clone();
+        assert!(
+            set_model_reasoning_efforts(&mut config, &provider_id, Some(&requested), &available)
+                .is_err()
+        );
+        assert_eq!(config, before);
+    }
+    let high = vec![ModelReasoningEffort {
+        level: "high".into(),
+        value: "high".into(),
+    }];
+    let requested = BTreeMap::from([("demo".into(), high.clone())]);
+    set_model_reasoning_efforts(&mut config, &provider_id, Some(&requested), &available).unwrap();
+    assert_eq!(
+        config.model_reasoning_efforts_for_provider(&provider_id)["demo"],
+        high
+    );
+    let public = serde_json::to_value(redacted_config(&config)).unwrap();
+    assert_eq!(
+        public["profiles"][0]["pluginRouteSpec"]["modelReasoningEfforts"]["demo"],
+        json!(["low", "medium", "high", "xhigh"])
+    );
+    set_model_reasoning_efforts(
+        &mut config,
+        &provider_id,
+        Some(&BTreeMap::new()),
+        &available,
+    )
+    .unwrap();
+    assert_eq!(
+        config.model_reasoning_efforts_for_provider(&provider_id)["demo"].len(),
+        4
+    );
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("models_cache.json"),
+        serde_json::to_vec(&json!({
+            "models": [{
+                "slug": "demo", "display_name": "demo", "default_reasoning_level": "ultra",
+                "supported_reasoning_levels": [
+                    {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+                    {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}
+                ]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    config
+        .selected_models_by_provider
+        .insert(provider_id.clone(), available.clone());
+    config
+        .upstream_models_by_provider
+        .insert(provider_id.clone(), available.clone());
+    let state = current_model_state_at(&config, home.path()).unwrap();
+    let model = state
+        .third_party_model_metadata
+        .iter()
+        .find(|entry| entry.slug == "demo")
+        .unwrap();
+    assert_eq!(
+        model.supported_reasoning_efforts,
+        ["low", "medium", "high", "xhigh"]
+    );
+    config.subagent_model = "demo".into();
+    config.subagent_reasoning_effort = "ultra".into();
+    crate::subagent_policy::reconcile_for_current_provider(&mut config, home.path(), false);
+    assert!(
+        ["low", "medium", "high", "xhigh"].contains(&config.subagent_reasoning_effort.as_str())
+    );
+    // 普通线路保持原有能力，未来明确声明更高档位的插件也可使用。
+    let ultra = BTreeMap::from([(
+        "demo".into(),
+        vec![ModelReasoningEffort {
+            level: "ultra".into(),
+            value: "ultra".into(),
+        }],
+    )]);
+    config.profiles[0]
+        .plugin_route_spec
+        .as_mut()
+        .unwrap()
+        .model_reasoning_efforts
+        .get_mut("demo")
+        .unwrap()
+        .push("ultra".into());
+    set_model_reasoning_efforts(&mut config, &provider_id, Some(&ultra), &available).unwrap();
+    config.profiles[0].plugin_route_spec = None;
+    config.profiles[0].plugin_owner_id = None;
+    set_model_reasoning_efforts(&mut config, &provider_id, Some(&ultra), &available).unwrap();
+}
+
+#[test]
 fn model_context_policy_validates_budgets_membership_and_restart() {
     use crate::config::ModelContextConfig;
     let policy = ModelContextConfig {

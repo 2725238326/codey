@@ -269,6 +269,7 @@ export function App({
     updateDraftModelContext,
     draftReasoningEfforts,
     reasoningEffortAutoByModel,
+    modelPickerReasoningCapabilities,
     updateDraftReasoningEffort,
     resetDraftReasoningEffort,
     draftManualThirdPartyModelKeys,
@@ -1691,6 +1692,7 @@ export function App({
         modelSyncWarning={modelSyncWarning}
         loading={modelPickerLoading}
         autoReviewSupported={draftAutoReviewSupported}
+        reasoningEffortCapabilities={modelPickerReasoningCapabilities}
         thirdPartyModelOptions={thirdPartyModelOptions}
         modelState={modelEditorState}
         draftModelSet={draftModelSet}

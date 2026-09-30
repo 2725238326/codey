@@ -34,6 +34,7 @@ import {
   autoReasoningEfforts,
   normalizeReasoningEfforts,
   reasoningEffortsEqual,
+  resolveModelReasoningEfforts,
 } from "./modelReasoningEfforts";
 
 const MAX_MODEL_ID_BYTES = 512;
@@ -134,6 +135,14 @@ export function useModelSelection({
   const officialOnly = Boolean(
     officialRoutePicker || (!modelPickerRouteId && currentProvider?.official),
   );
+  const modelPickerReasoningCapabilities = useMemo(() => {
+    const profile = config?.profiles.find(
+      (entry) => entry.id === (modelPickerRouteId ?? config.activeProfileId),
+    );
+    return Object.fromEntries(Object.entries(
+      profile?.pluginOwnerId ? profile.pluginRouteSpec?.modelReasoningEfforts ?? {} : {},
+    ).map(([model, levels]) => [modelKey(model), levels]));
+  }, [config, modelPickerRouteId]);
   const officialSlugKeys = useMemo(
     () =>
       new Set(
@@ -232,13 +241,20 @@ export function useModelSelection({
       const declared = state.thirdPartyModelMetadata?.find(
         (entry) => modelKey(entry.slug) === key,
       )?.autoSupportedReasoningEfforts;
-      const base = autoReasoningEfforts(
-        declared?.length ? declared : DEFAULT_THIRD_PARTY_REASONING_EFFORTS,
-      );
-      autoEfforts[key] = base;
       const stored = Object.entries(storedReasoningEfforts ?? {}).find(([name]) =>
         modelIdsEqual(name, model))?.[1];
-      draftEfforts[key] = stored ? normalizeReasoningEfforts(stored) : base;
+      const capability = profile?.pluginOwnerId
+        ? Object.entries(profile.pluginRouteSpec?.modelReasoningEfforts ?? {}).find(
+            ([name]) => modelIdsEqual(name, model),
+          )?.[1]
+        : undefined;
+      const resolved = resolveModelReasoningEfforts(
+        declared?.length ? declared : DEFAULT_THIRD_PARTY_REASONING_EFFORTS,
+        stored,
+        capability,
+      );
+      autoEfforts[key] = resolved.autoEfforts;
+      draftEfforts[key] = resolved.efforts;
     }
     setReasoningEffortAutoByModel(autoEfforts);
     setDraftReasoningEfforts(draftEfforts);
@@ -556,6 +572,7 @@ export function useModelSelection({
     updateDraftModelContext,
     draftReasoningEfforts,
     reasoningEffortAutoByModel,
+    modelPickerReasoningCapabilities,
     updateDraftReasoningEffort,
     resetDraftReasoningEffort,
     draftManualThirdPartyModelKeys,

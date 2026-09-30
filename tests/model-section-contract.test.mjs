@@ -68,7 +68,7 @@ test("model settings merge context budget and reasoning effort declarations", as
   ]);
   const comboboxSource = await readSource("src/components/ModelContextWindowCombobox.tsx");
   assert.match(fieldsSource, /<ModelContextWindowCombobox/);
-  assert.match(fieldsSource, /MODEL_REASONING_EFFORT_COLUMNS/);
+  assert.match(fieldsSource, /MODEL_REASONING_EFFORT_LEVELS/);
   assert.doesNotMatch(fieldsSource, /线上取值/);
   assert.match(comboboxSource, /allowsCustomValue/);
   assert.match(comboboxSource, /CONTEXT_WINDOW_PRESETS/);

@@ -487,6 +487,17 @@ pub(crate) fn set_model_reasoning_efforts(
                 .iter()
                 .find(|candidate| model_id::equal(candidate, model))
                 .ok_or_else(|| format!("模型 {model} 不在该线路的可用模型列表中"))?;
+            let plugin_levels = config
+                .profiles
+                .iter()
+                .find(|profile| profile.provider_id() == provider_id)
+                .and_then(|profile| profile.plugin_route_spec.as_ref())
+                .and_then(|spec| {
+                    spec.model_reasoning_efforts
+                        .iter()
+                        .find(|(candidate, _)| model_id::equal(candidate, canonical_model))
+                        .map(|(_, levels)| levels.as_slice())
+                });
             let mut seen_levels = HashSet::new();
             let mut canonical_efforts = Vec::with_capacity(efforts.len());
             for effort in efforts {
@@ -497,6 +508,21 @@ pub(crate) fn set_model_reasoning_efforts(
                 }
                 if value.is_empty() {
                     return Err(format!("模型 {model} 的思考强度 {level} 缺少线上取值"));
+                }
+                if plugin_levels.is_some_and(|levels| {
+                    matches!(value.as_str(), "max" | "ultra")
+                        && !levels.iter().any(|allowed| allowed == &value)
+                }) {
+                    return Err(format!(
+                        "插件线路模型 {canonical_model} 的思考强度取值超出线路能力"
+                    ));
+                }
+                if plugin_levels
+                    .is_some_and(|levels| !levels.iter().any(|allowed| allowed == &level))
+                {
+                    return Err(format!(
+                        "插件线路模型 {canonical_model} 不支持思考强度 {level}"
+                    ));
                 }
                 if value.len() > crate::config::MAX_MODEL_REASONING_EFFORT_VALUE_BYTES {
                     return Err(format!(

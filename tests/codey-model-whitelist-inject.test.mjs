@@ -693,7 +693,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "58");
+  assert.equal(patch.version, "59");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -4428,6 +4428,151 @@ test("catalog delivery survives a query client whose entries are not key-value p
 });
 
 const subagentRouteModel = "codey-official-account-d3265a21-a59f-40c8-a05a-5b4e03231c22/gpt-6-luna";
+const composerRouteModel = "route-mu5dql1a-5j3e97/gpt-6-astra";
+const composerOtherRouteModel = "route-other/gpt-6-astra";
+const composerCatalog = (prefix = "主") => ({
+  status: "ok",
+  models: [composerRouteModel, composerOtherRouteModel],
+  default_model: composerRouteModel,
+  model_metadata: [
+    [composerRouteModel, prefix], [composerOtherRouteModel, "备"],
+  ].map(([model, route]) => ({
+    model, display_name: `[${route}] gpt-6-astra`, route_name: route,
+    provider_id: "codey_router", route_provider_id: model.split("/")[0],
+    source_model: "gpt-6-astra",
+  })),
+});
+
+function composerModelTrigger(body, text, { reactPicker = true } = {}) {
+  const trigger = body.appendChild(new FakeElementCore("button", {
+    attributes: { "aria-haspopup": "menu" },
+  }));
+  const label = trigger.appendChild(new FakeElementCore("span"));
+  const textNode = { nodeType: 3, nodeValue: text, parentElement: label };
+  label.childNodes = [textNode];
+  Object.defineProperty(label, "textContent", {
+    get: () => label.childNodes.map((node) => node.nodeValue).join(""),
+    set: () => assert.fail("preserve React's model label node"),
+  });
+  const effort = trigger.appendChild(new FakeElementCore("span"));
+  const effortNode = { nodeType: 3, nodeValue: "极高", parentElement: effort };
+  effort.childNodes = [effortNode];
+  const icon = trigger.appendChild(new FakeElementCore("svg"));
+  Object.defineProperty(trigger, "childNodes", { get: () => trigger.children });
+  const picker = { model: text, models: [], onSelectModel() {} };
+  if (reactPicker) trigger.__reactFiber$pickerLabelTest = { memoizedProps: picker };
+  return { trigger, label, textNode, effortNode, icon, picker };
+}
+
+for (const nativeSelectionOnly of [false, true]) {
+  test(`composer trigger shows the route short name and preserves native nodes (native: ${nativeSelectionOnly})`, async () => {
+    const body = new FakeElementCore("body", { connected: true });
+    const { trigger, label, textNode, effortNode, icon, picker } = composerModelTrigger(body, composerRouteModel);
+    let clicks = 0;
+    trigger.addEventListener("click", () => { clicks += 1; });
+    const runtime = await loadPatch({ ...composerCatalog(), native_selection_only: nativeSelectionOnly }, [statsigClient()], { documentBody: body, nativeSelectionOnly });
+    assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
+    assert.equal(label.childNodes[0], textNode);
+    assert.equal(effortNode.nodeValue, "极高");
+    assert.equal(trigger.children[2], icon);
+    assert.equal(picker.model, composerRouteModel);
+    assert.deepEqual(runtime.patch.snapshot().models, [composerRouteModel, composerOtherRouteModel]);
+    trigger.dispatchEvent({ type: "click" });
+    assert.equal(clicks, 1);
+    const observer = runtime.mutationObserverInstalls().find(entry => entry.target === trigger);
+    assert.deepEqual(observer.options, { childList: true, characterData: true, subtree: true });
+    assert.equal(runtime.mutationObserverInstalls().find(entry => entry.target === body).options.characterData, undefined);
+    runtime.patch.dispose();
+    assert.equal(textNode.nodeValue, composerRouteModel);
+    assert.equal(observer.observer.disconnected, true);
+  });
+}
+
+test("composer trigger tracks exact route aliases, React updates and renamed routes", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const { trigger, label, textNode } = composerModelTrigger(body, ` ${composerRouteModel} · 极高`);
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], { documentBody: body });
+  const nativeUpdate = (text) => {
+    textNode.nodeValue = text;
+    runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+  };
+  assert.equal(textNode.nodeValue, " [主] gpt-6-astra · 极高");
+  nativeUpdate(`${composerOtherRouteModel} · High`);
+  assert.equal(textNode.nodeValue, "[备] gpt-6-astra · High");
+  nativeUpdate(`${composerRouteModel} · 中`);
+  nativeUpdate("[主] gpt-6-astra · 极高");
+  await runtime.patch.setCatalog(composerCatalog("新"));
+  assert.equal(textNode.nodeValue, "[新] gpt-6-astra · 极高");
+  const replacement = { nodeType: 3, nodeValue: composerOtherRouteModel, parentElement: label };
+  label.childNodes = [replacement];
+  runtime.dispatchObserverMutations(trigger, [{ type: "childList", target: label, addedNodes: [replacement], removedNodes: [textNode] }]);
+  assert.equal(replacement.nodeValue, "[备] gpt-6-astra");
+  assert.equal(textNode.nodeValue, `${composerRouteModel} · 极高`);
+  replacement.nodeValue = "gpt-6-astra";
+  runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: replacement }]);
+  assert.equal(replacement.nodeValue, "gpt-6-astra", "a shared upstream name must not select a route");
+  runtime.patch.dispose();
+  assert.equal(replacement.nodeValue, "gpt-6-astra");
+});
+
+test("composer trigger handles late catalogs and model changes from native labels", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const { trigger, textNode } = composerModelTrigger(body, "GPT-6");
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], { documentBody: body, bridgeReady: false });
+  assert.equal(textNode.nodeValue, "GPT-6");
+  runtime.connectBridge();
+  await runtime.patch.refresh();
+  textNode.nodeValue = composerRouteModel;
+  runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+  assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
+  runtime.patch.dispose();
+});
+
+test("composer trigger fallback stays inside popup buttons and handles historical models", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const active = composerModelTrigger(body, composerRouteModel, { reactPicker: false });
+  const historical = composerModelTrigger(body, "route-mu5dql1a-5j3e97/retired-model · Low", { reactPicker: false });
+  const unrelated = composerModelTrigger(body, "vendor/model", { reactPicker: false });
+  const plain = composerModelTrigger(body, composerRouteModel);
+  plain.trigger.removeAttribute("aria-haspopup");
+  const turn = body.appendChild(new FakeElementCore("div", { attributes: { "data-turn-key": "turn" } }));
+  const conversation = composerModelTrigger(turn, composerRouteModel);
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], { documentBody: body });
+  assert.equal(active.textNode.nodeValue, "[主] gpt-6-astra");
+  assert.equal(historical.textNode.nodeValue, "[主] retired-model · Low");
+  for (const control of [unrelated, plain, conversation]) {
+    assert.equal(control.textNode.nodeValue, control.picker.model);
+    assert.ok(!runtime.mutationObserverInstalls().some(entry => entry.target === control.trigger));
+  }
+  runtime.patch.dispose();
+});
+
+test("composer trigger handles mounting, removal and hot reload without full scans", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], { documentBody: body });
+  const scans = runtime.wildcardScanCount();
+  const { trigger, textNode } = composerModelTrigger(body, composerRouteModel);
+  runtime.dispatchObserverMutations(body, [{ type: "childList", target: body, addedNodes: [trigger], removedNodes: [] }]);
+  assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
+  const observer = runtime.mutationObserverInstalls().find(entry => entry.target === trigger);
+  trigger.remove();
+  runtime.dispatchObserverMutations(body, [{ type: "childList", target: body, addedNodes: [], removedNodes: [trigger] }]);
+  assert.equal(observer.observer.disconnected, true);
+  assert.equal(textNode.nodeValue, composerRouteModel);
+  body.appendChild(trigger);
+  runtime.dispatchObserverMutations(body, [{ type: "childList", target: body, addedNodes: [trigger], removedNodes: [] }]);
+  assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
+  assert.equal(runtime.wildcardScanCount(), scans);
+  const previousObservers = [...runtime.mutationObserverInstalls()];
+  runtime.patch.version = "previous";
+  const nextPatch = await runtime.reload();
+  assert.ok(previousObservers.every(entry => entry.observer.disconnected));
+  assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
+  nextPatch.dispose();
+  assert.equal(textNode.nodeValue, composerRouteModel);
+  assert.ok(runtime.mutationObserverInstalls().every(entry => entry.observer.disconnected));
+});
+
 const subagentCatalog = (prefix = "官1") => ({
   status: "ok",
   models: [subagentRouteModel],

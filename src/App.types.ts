@@ -20,6 +20,9 @@ export type Profile = {
   modelRequestHeaders?: Record<string, string>;
   upstreamProxy?: string;
   sourceProviderId?: string;
+  pluginOwnerId?: string;
+  /** 宿主已返回的插件声明；这里只使用独立于用户设置的模型能力。 */
+  pluginRouteSpec?: { modelReasoningEfforts?: Record<string, string[]> };
   officialAccount: boolean;
   /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
   officialAccountId?: string;

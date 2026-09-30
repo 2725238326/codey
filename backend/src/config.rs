@@ -1368,19 +1368,100 @@ impl CodeyConfig {
             .filter(|profile| profile.enabled)
             .filter(|profile| !profile.official_account || self.official_route_usable(profile))
             .flat_map(|profile| {
-                self.model_reasoning_efforts_by_provider
-                    .get(profile.provider_id())
+                self.model_reasoning_efforts_for_provider(profile.provider_id())
                     .into_iter()
-                    .flat_map(move |models| {
-                        models.iter().map(move |(model, efforts)| {
-                            (
-                                runtime_catalog_model_id(profile, model, qualify_official),
-                                efforts.clone(),
-                            )
-                        })
+                    .map(move |(model, efforts)| {
+                        (
+                            runtime_catalog_model_id(profile, &model, qualify_official),
+                            efforts,
+                        )
                     })
             })
             .collect()
+    }
+
+    /// Returns the effective thinking levels for one route. Plugin declarations
+    /// form the route capability boundary; user declarations can customize the
+    /// upstream value for an allowed level but cannot add a new level.
+    pub(crate) fn model_reasoning_efforts_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> BTreeMap<String, Vec<ModelReasoningEffort>> {
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.provider_id() == provider_id)
+        else {
+            return self
+                .model_reasoning_efforts_by_provider
+                .get(provider_id)
+                .cloned()
+                .unwrap_or_default();
+        };
+        let capabilities = profile
+            .plugin_route_spec
+            .as_ref()
+            .map(|spec| spec.model_reasoning_efforts.clone())
+            .unwrap_or_default();
+        let mut effective = capabilities
+            .iter()
+            .map(|(model, levels)| {
+                (
+                    model.clone(),
+                    levels
+                        .iter()
+                        .map(|level| ModelReasoningEffort {
+                            level: level.clone(),
+                            value: level.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let Some(user_models) = self.model_reasoning_efforts_by_provider.get(provider_id) else {
+            return effective;
+        };
+        for (model, configured) in user_models {
+            let capability = capabilities
+                .iter()
+                .find(|(candidate, _)| model_id::equal(candidate, model));
+            let Some((canonical_model, allowed_levels)) = capability else {
+                effective.insert(model.clone(), configured.clone());
+                continue;
+            };
+            let mut seen = BTreeSet::new();
+            let mut values = Vec::new();
+            for effort in configured {
+                let (level, value) = if allowed_levels
+                    .iter()
+                    .any(|allowed| allowed == &effort.level)
+                {
+                    let value = if matches!(effort.value.as_str(), "max" | "ultra")
+                        && !allowed_levels
+                            .iter()
+                            .any(|allowed| allowed == &effort.value)
+                    {
+                        effort.level.clone()
+                    } else {
+                        effort.value.clone()
+                    };
+                    (effort.level.clone(), value)
+                } else if matches!(effort.level.as_str(), "max" | "ultra")
+                    && allowed_levels.iter().any(|allowed| allowed == "xhigh")
+                {
+                    ("xhigh".to_string(), "xhigh".to_string())
+                } else {
+                    continue;
+                };
+                if seen.insert(level.clone()) {
+                    values.push(ModelReasoningEffort { level, value });
+                }
+            }
+            if !values.is_empty() {
+                effective.insert(canonical_model.clone(), values);
+            }
+        }
+        effective
     }
 
     pub(crate) fn provider_is_disabled(&self, provider_id: &str) -> bool {

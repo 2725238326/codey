@@ -28,15 +28,16 @@ pub(crate) fn reconcile_for_current_provider(
             .map(|provider_id| config.enabled_route_models(provider_id))
             .unwrap_or_default()
     };
+    let reasoning_efforts = config
+        .current_provider_id()
+        .map(|provider_id| config.model_reasoning_efforts_for_provider(provider_id));
     let state = model_catalog::selection_state_with_manual_models(
         codex_home,
         official_provider,
         config.upstream_models_snapshot(),
         &selected_models,
         config.manual_third_party_models(),
-        config
-            .current_provider_id()
-            .and_then(|provider_id| config.model_reasoning_efforts_by_provider.get(provider_id)),
+        reasoning_efforts.as_ref(),
         Some(&config.subagent_model),
     )
     .ok();

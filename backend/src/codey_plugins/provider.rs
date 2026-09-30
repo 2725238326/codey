@@ -12,6 +12,7 @@ pub(crate) use codey_plugin_sdk::provider::METHOD_DESCRIBE as DESCRIBE_METHOD;
 const MAX_MODELS: usize = 32;
 const MAX_MODEL_CHARS: usize = 128;
 const MAX_NAME_CHARS: usize = 15;
+const MODEL_REASONING_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const ROUTE_PROTOCOLS: &[&str] = &[
     "openaiResponses",
@@ -26,6 +27,8 @@ pub struct PluginRouteSpec {
     pub base_url: String,
     pub upstream_protocol: String,
     pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_reasoning_efforts: BTreeMap<String, Vec<String>>,
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub short_name: String,
@@ -156,6 +159,38 @@ pub(crate) fn parse_route_descriptor(value: Value) -> Result<PluginRouteSpec, St
         }
         models.push(model.to_string());
     }
+    let mut model_reasoning_efforts = BTreeMap::new();
+    for (model, efforts) in descriptor.model_reasoning_efforts {
+        let canonical_model = models
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(model.trim()))
+            .ok_or_else(|| format!("插件线路思考强度声明的模型不在模型列表中：{model}"))?
+            .clone();
+        if efforts.is_empty() {
+            return Err(format!(
+                "插件线路模型 {canonical_model} 的思考强度声明不能为空"
+            ));
+        }
+        let mut normalized = Vec::with_capacity(efforts.len());
+        let mut seen = std::collections::HashSet::new();
+        for effort in efforts {
+            let effort = effort.trim().to_ascii_lowercase();
+            if !MODEL_REASONING_EFFORT_LEVELS.contains(&effort.as_str())
+                || !seen.insert(effort.clone())
+            {
+                return Err(format!(
+                    "插件线路模型 {canonical_model} 的思考强度无效或重复：{effort}"
+                ));
+            }
+            normalized.push(effort);
+        }
+        if model_reasoning_efforts
+            .insert(canonical_model.clone(), normalized)
+            .is_some()
+        {
+            return Err(format!("插件线路模型思考强度声明重复：{canonical_model}"));
+        }
+    }
     if descriptor.headers.len() > 32 {
         return Err("插件线路请求头超过 32 项".into());
     }
@@ -208,6 +243,7 @@ pub(crate) fn parse_route_descriptor(value: Value) -> Result<PluginRouteSpec, St
         base_url: descriptor.base_url,
         upstream_protocol: descriptor.upstream_protocol,
         models,
+        model_reasoning_efforts,
         headers,
         short_name: String::new(),
         transport: descriptor.transport,
@@ -234,6 +270,52 @@ mod tests {
         let spec = parse_route_descriptor(descriptor()).unwrap();
         assert_eq!(spec.headers.get("x-region").map(String::as_str), Some("us"));
         assert_eq!(spec.models, vec!["demo-model"]);
+    }
+
+    #[test]
+    fn parse_accepts_model_reasoning_capabilities() {
+        let mut value = descriptor();
+        value["modelReasoningEfforts"] = json!({
+            "demo-model": ["low", "medium", "high", "xhigh"]
+        });
+        let spec = parse_route_descriptor(value).unwrap();
+        assert_eq!(
+            spec.model_reasoning_efforts["demo-model"],
+            ["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_invalid_model_reasoning_capabilities() {
+        let mut unknown_model = descriptor();
+        unknown_model["modelReasoningEfforts"] = json!({"other": ["low"]});
+        assert!(
+            parse_route_descriptor(unknown_model)
+                .unwrap_err()
+                .contains("不在模型列表")
+        );
+        let mut duplicate = descriptor();
+        duplicate["modelReasoningEfforts"] = json!({"demo-model": ["xhigh", "xhigh"]});
+        assert!(
+            parse_route_descriptor(duplicate)
+                .unwrap_err()
+                .contains("无效或重复")
+        );
+        let mut empty = descriptor();
+        empty["modelReasoningEfforts"] = json!({"demo-model": []});
+        assert!(
+            parse_route_descriptor(empty)
+                .unwrap_err()
+                .contains("不能为空")
+        );
+        let mut duplicate_model = descriptor();
+        duplicate_model["modelReasoningEfforts"] =
+            json!({"demo-model": ["low"], "DEMO-MODEL": ["xhigh"]});
+        assert!(
+            parse_route_descriptor(duplicate_model)
+                .unwrap_err()
+                .contains("声明重复")
+        );
     }
 
     #[test]

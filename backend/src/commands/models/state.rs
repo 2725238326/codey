@@ -398,7 +398,7 @@ pub(crate) fn renderer_route_model_catalog(
             .upstream_models_by_provider
             .get(&provider_id)
             .map(Vec::as_slice);
-        let reasoning_efforts = config.model_reasoning_efforts_by_provider.get(&provider_id);
+        let reasoning_efforts = config.model_reasoning_efforts_for_provider(&provider_id);
         let default_model = config.default_model_for_profile(profile);
         let state = if provider_id == config.current_provider_id().unwrap_or_default() {
             active_model_state.clone()
@@ -409,7 +409,7 @@ pub(crate) fn renderer_route_model_catalog(
                 upstream_models,
                 &selected_models,
                 manual_models,
-                reasoning_efforts,
+                Some(&reasoning_efforts),
                 default_model.as_deref(),
             )
             .unwrap_or_default()

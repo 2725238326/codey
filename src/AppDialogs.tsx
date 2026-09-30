@@ -53,6 +53,7 @@ type ModelPickerDialogProps = {
   modelSyncWarning: string;
   loading?: boolean;
   autoReviewSupported: boolean;
+  reasoningEffortCapabilities?: Record<string, readonly string[]>;
   thirdPartyModelOptions: string[];
   modelState: ModelState;
   draftModelSet: Set<string>;
@@ -87,6 +88,7 @@ function ModelPickerDialogComponent({
   modelSyncWarning,
   loading = false,
   autoReviewSupported,
+  reasoningEffortCapabilities = {},
   thirdPartyModelOptions,
   modelState,
   draftModelSet,
@@ -410,6 +412,7 @@ function ModelPickerDialogComponent({
                     reasoning={{
                       efforts: draftReasoningEfforts[key] ?? [],
                       autoEfforts: reasoningEffortAutoByModel[key] ?? [],
+                      supportedLevels: reasoningEffortCapabilities[key],
                       onChange: (efforts) => onUpdateDraftReasoningEffort(model, efforts),
                       onReset: () => onResetDraftReasoningEffort(model),
                     }}

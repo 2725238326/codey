@@ -359,6 +359,7 @@ mod tests {
             base_url: url.into(),
             upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.into(),
             models: vec!["demo-model".into()],
+            model_reasoning_efforts: BTreeMap::new(),
             headers: BTreeMap::from([("x-region".into(), "us".into())]),
             short_name: String::new(),
             transport: None,
@@ -615,5 +616,49 @@ mod tests {
             .api_key = "fake-key".into();
         release(&mut config, "dev.transport");
         assert!(config.profiles.iter().all(|p| p.id != id));
+    }
+
+    #[test]
+    fn plugin_reasoning_capability_limits_legacy_levels_to_xhigh() {
+        let mut config = CodeyConfig::default();
+        let mut descriptor = spec("https://relay.example/v1");
+        descriptor.model_reasoning_efforts = BTreeMap::from([(
+            "demo-model".into(),
+            vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+        )]);
+        let id = upsert(&mut config, "dev.reasoning", descriptor, true)
+            .unwrap()
+            .unwrap();
+        let provider_id = config
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .unwrap()
+            .provider_id()
+            .to_string();
+        config.model_reasoning_efforts_by_provider.insert(
+            provider_id.clone(),
+            BTreeMap::from([(
+                "demo-model".into(),
+                vec![
+                    crate::config::ModelReasoningEffort {
+                        level: "low".into(),
+                        value: "max".into(),
+                    },
+                    crate::config::ModelReasoningEffort {
+                        level: "max".into(),
+                        value: "max".into(),
+                    },
+                ],
+            )]),
+        );
+        let effective = config.model_reasoning_efforts_for_provider(&provider_id);
+        let levels = effective["demo-model"]
+            .iter()
+            .map(|effort| effort.level.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(levels, ["low", "xhigh"]);
+        assert_eq!(effective["demo-model"][0].value, "low");
+        assert_eq!(effective["demo-model"][1].value, "xhigh");
     }
 }

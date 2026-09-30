@@ -413,6 +413,7 @@ pub(crate) fn current_model_state_at(
         config.enabled_route_models(provider_id)
     };
     let requested_default_model = config.default_model_for_profile(active_profile);
+    let reasoning_efforts = config.model_reasoning_efforts_for_provider(provider_id);
     model_catalog::selection_state_with_manual_models(
         home,
         official,
@@ -426,7 +427,7 @@ pub(crate) fn current_model_state_at(
             .get(provider_id)
             .map(Vec::as_slice)
             .unwrap_or_default(),
-        config.model_reasoning_efforts_by_provider.get(provider_id),
+        Some(&reasoning_efforts),
         requested_default_model.as_deref(),
     )
     .map_err(|error| error.to_string())

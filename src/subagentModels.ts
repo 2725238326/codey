@@ -2,6 +2,7 @@ import type { Config, ModelState, Profile, ProviderStatus } from "./App.types";
 import { modelKey, uniqueModelIds } from "./modelIds";
 import { routeModelAlias, routeProviderId } from "./modelRoutes";
 import { routeDisplayPrefix } from "./routeShortNames";
+import { resolveModelReasoningEfforts } from "./modelReasoningEfforts";
 
 const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
 const THIRD_PARTY_REASONING_EFFORT_ALLOWLIST = [
@@ -112,7 +113,18 @@ export function buildSubagentModelOptions(
         thirdPartyModelMetadata?.supportedReasoningEfforts ??
           officialModelMetadata?.supportedReasoningEfforts,
       );
-    const supportedReasoningEfforts = efforts.length > 0 ? efforts : ["low"];
+    const profile = config.profiles.find((candidate) => candidate.id === routeId);
+    const capability = !official && config.localRouterEnabled && profile?.pluginOwnerId
+      ? Object.entries(profile.pluginRouteSpec?.modelReasoningEfforts ?? {}).find(
+          ([model]) => modelKey(model) === modelKey(modelId),
+        )?.[1]
+      : undefined;
+    const stored = Object.entries(config.modelReasoningEffortsByProvider?.[providerId] ?? {})
+      .find(([model]) => modelKey(model) === modelKey(modelId))?.[1];
+    const boundedEfforts = capability
+      ? resolveModelReasoningEfforts(efforts, stored, capability).efforts.map((effort) => effort.value)
+      : efforts;
+    const supportedReasoningEfforts = boundedEfforts.length > 0 ? boundedEfforts : ["low"];
     const requestedDefaultEffort =
       official && officialModelMetadata
         ? officialModelMetadata.defaultReasoningEffort || supportedReasoningEfforts[0]
