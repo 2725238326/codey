@@ -457,7 +457,6 @@ fn enable_windows_packaged_environment(
     environment: &[(String, String)],
     feedback: &ResumeFeedback,
 ) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
 
     let package_full_name = package_full_name
@@ -467,21 +466,10 @@ fn enable_windows_packaged_environment(
     let executable = std::env::current_exe().context("定位 Codey 包启动恢复助手失败")?;
     let feedback_path =
         std::fs::canonicalize(&feedback.path).context("定位 Windows Store 启动助手通知文件失败")?;
-    let mut debugger_command = vec![u16::from(b'"')];
-    debugger_command.extend(executable.as_os_str().encode_wide());
-    debugger_command.extend(
-        format!(
-            "\" {} --launch-id {} --launch-state \"",
-            crate::codex_startup_patch::WINDOWS_PACKAGE_RESUME_ARGUMENT,
-            feedback.id,
-        )
-        .encode_utf16(),
-    );
-    // Windows file names cannot contain quotes; this path ends with .json,
-    // so there is no trailing backslash to escape the closing quote.
-    debugger_command.extend(feedback_path.as_os_str().encode_wide());
-    debugger_command.push(u16::from(b'"'));
-    debugger_command.push(0);
+    // Windows 提供短路径时优先使用，以缩短调试器命令；没有更短别名则保留原路径。
+    let executable = windows_short_path(&executable);
+    let feedback_path = windows_short_parent_path(&feedback_path);
+    let debugger_command = build_debugger_command(&executable, &feedback_path, feedback.id);
     let environment = windows_environment_block(environment)?;
 
     with_windows_package_debug_settings(|settings| unsafe {
@@ -503,6 +491,84 @@ fn enable_windows_packaged_environment(
         })
     })
     .context("为 Windows Store Codex 安装一次性 CLI 兼容环境失败")
+}
+
+#[cfg(windows)]
+fn windows_short_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+    use windows::core::PCWSTR;
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut buffer = vec![0u16; 1024];
+    let mut length =
+        unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(buffer.as_mut_slice())) };
+    if length as usize >= buffer.len() {
+        buffer.resize(length as usize + 1, 0);
+        length = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(buffer.as_mut_slice())) };
+    }
+    if length == 0 {
+        return path.to_path_buf();
+    }
+    let short = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize]));
+    if short.as_os_str().encode_wide().count() < path.as_os_str().encode_wide().count() {
+        short
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(windows)]
+fn windows_short_parent_path(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let mut shortened = windows_short_path(parent);
+    shortened.push(file_name);
+    shortened
+}
+
+#[cfg(any(windows, test))]
+fn build_debugger_command(
+    executable: &Path,
+    feedback_path: &Path,
+    feedback_id: uuid::Uuid,
+) -> Vec<u16> {
+    let mut command = vec![u16::from(b'"')];
+    command.extend(encode_path_utf16(executable));
+    command.extend(
+        format!(
+            "\" {} --launch-id {} --launch-state \"",
+            crate::codex_startup_patch::WINDOWS_PACKAGE_RESUME_ARGUMENT,
+            feedback_id,
+        )
+        .encode_utf16(),
+    );
+    // Windows file names cannot contain quotes; this path ends with .json,
+    // so there is no trailing backslash to escape the closing quote.
+    command.extend(encode_path_utf16(feedback_path));
+    command.push(u16::from(b'"'));
+    command.push(0);
+    command
+}
+
+#[cfg(windows)]
+fn encode_path_utf16(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str().encode_wide().collect()
+}
+
+#[cfg(not(windows))]
+fn encode_path_utf16(path: &Path) -> Vec<u16> {
+    path.to_string_lossy().encode_utf16().collect()
 }
 
 #[cfg(windows)]
@@ -849,6 +915,24 @@ mod tests {
         ] {
             assert!(windows_environment_block(&[(name.into(), value.into())]).is_err());
         }
+    }
+
+    #[test]
+    fn debugger_command_keeps_resume_state_file_name_and_terminates() {
+        let id = uuid::Uuid::parse_str("37f4f759-55f1-4b66-a45d-160644fe20d4").unwrap();
+        let command = build_debugger_command(
+            Path::new(r"C:\Program Files\Codey\codey.exe"),
+            Path::new(
+                r"C:\Users\User\AppData\Local\Codey\resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json",
+            ),
+            id,
+        );
+        assert_eq!(command.last(), Some(&0));
+        let command = String::from_utf16(&command[..command.len() - 1]).unwrap();
+        assert_eq!(
+            command,
+            r#""C:\Program Files\Codey\codey.exe" --codey-resume-packaged-app --launch-id 37f4f759-55f1-4b66-a45d-160644fe20d4 --launch-state "C:\Users\User\AppData\Local\Codey\resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json""#
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use codey_runtime_core::codex_sqlite::{
@@ -21,6 +22,12 @@ const TOMBSTONE_VERSION: u32 = 1;
 const TOMBSTONE_DIR: &str = ".codey-message-delete-tombstones-v1";
 const TOMBSTONE_LOCK_FILE: &str = ".codey-message-delete-tombstones-v1.lock";
 const THREAD_HISTORY_DB: &str = "thread_history_1.sqlite";
+// Codex keeps these databases open while a conversation is loaded. A short
+// wait avoids turning the normal handoff between the renderer and the writer
+// into an intermittent delete failure.
+const MESSAGE_DELETE_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MESSAGE_DELETE_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(40), Duration::from_millis(160)];
 static TOMBSTONE_LOCK: Mutex<()> = Mutex::new(());
 type PendingDeleteTombstones = BTreeMap<String, (BTreeSet<String>, Vec<PathBuf>)>;
 type ResolvedPersistentMessageIds = (BTreeSet<String>, Vec<(String, String)>);
@@ -78,11 +85,29 @@ pub fn delete_messages_persistently(
         resolve_persistent_message_ids(home, &session_id, &message_ids)?;
     record_delete_tombstones_unlocked(home, &session_id, &message_ids)?;
     record_resolved_tail_aliases_unlocked(home, &session_id, &resolved_tail_aliases)?;
-    delete_messages(
-        home,
-        &session_id,
-        &message_ids.into_iter().collect::<Vec<_>>(),
-    )
+    let message_ids = message_ids.into_iter().collect::<Vec<_>>();
+    let mut attempt = 0;
+    loop {
+        match delete_messages(home, &session_id, &message_ids) {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if attempt < MESSAGE_DELETE_RETRY_DELAYS.len()
+                    && retryable_message_delete_error(&error) =>
+            {
+                std::thread::sleep(MESSAGE_DELETE_RETRY_DELAYS[attempt]);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn retryable_message_delete_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("会话记录已变化")
+        || message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("sqlite_busy")
 }
 
 pub(crate) fn reapply_persisted_deletions(home: &Path) -> Result<MessageDeleteReplaySummary> {
@@ -522,7 +547,7 @@ fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
         if !db_path.exists() {
             continue;
         }
-        let connection = Connection::open(&db_path)?;
+        let connection = open_message_delete_database(&db_path)?;
         let has_rollout_path = connection
             .query_row(
                 "SELECT 1 FROM pragma_table_info('threads') WHERE name='rollout_path' LIMIT 1",
@@ -542,11 +567,18 @@ fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
             .optional()?;
         if let Some(path) = path {
             let path = PathBuf::from(path);
-            return Ok(Some(if path.is_absolute() {
+            let path = if path.is_absolute() {
                 path
             } else {
                 home.join(path)
-            }));
+            };
+            // The catalog can briefly retain the old location while Codex
+            // moves a thread between sessions/ and archived_sessions/. Fall
+            // through to the filename scan instead of failing on a stale
+            // catalog path.
+            if path.is_file() {
+                return Ok(Some(path));
+            }
         }
     }
     // Some Codex builds only keep a catalog row (or none at all) and never map
@@ -1008,8 +1040,17 @@ fn recover_rollout_write(destination: &Path) -> Result<()> {
 }
 
 fn table_columns(path: &Path, table: &str) -> Result<std::collections::HashSet<String>> {
-    let connection = Connection::open(path)?;
+    let connection = open_message_delete_database(path)?;
     Ok(crate::sqlite_util::table_columns(&connection, table)?)
+}
+
+fn open_message_delete_database(path: &Path) -> Result<Connection> {
+    let connection = Connection::open(path)
+        .with_context(|| format!("打开会话数据库失败：{}", path.display()))?;
+    connection
+        .busy_timeout(MESSAGE_DELETE_SQLITE_BUSY_TIMEOUT)
+        .with_context(|| format!("设置会话数据库等待时间失败：{}", path.display()))?;
+    Ok(connection)
 }
 
 #[derive(Debug, Clone)]
@@ -1053,7 +1094,7 @@ fn delete_from_db(
     session_id: &str,
     message_ids: &[String],
 ) -> Result<usize> {
-    let mut connection = Connection::open(path)?;
+    let mut connection = open_message_delete_database(path)?;
     let placeholders = std::iter::repeat_n("?", message_ids.len())
         .collect::<Vec<_>>()
         .join(",");
@@ -1080,7 +1121,7 @@ fn delete_from_thread_history(
     if !path.exists() {
         return Ok(None);
     }
-    let mut connection = Connection::open(path)?;
+    let mut connection = open_message_delete_database(path)?;
     let mut tables = Vec::new();
     for table in ["thread_items", "thread_turns"] {
         let columns = crate::sqlite_util::table_columns(&connection, table)?;
@@ -1351,6 +1392,47 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn falls_back_to_the_archived_rollout_when_catalog_path_is_stale() {
+        let home = tempdir().unwrap();
+        let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
+        let rollout_dir = home.path().join("archived_sessions/2026/09/30");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join(format!("rollout-2026-09-30T09-08-00-{session_id}.jsonl"));
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let catalog = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        catalog
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        catalog
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2)",
+                params![
+                    session_id,
+                    home.path().join("sessions/moved.jsonl").to_string_lossy()
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+
+        let result = delete_messages_persistently(home.path(), session_id, &["t1".into()]).unwrap();
+
+        assert_eq!(result.deleted, 1);
+        assert!(!fs::read_to_string(&rollout).unwrap().contains("t1"));
     }
 
     #[test]

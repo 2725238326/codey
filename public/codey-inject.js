@@ -50,6 +50,7 @@
     </svg>
   `;
   let lastSelectedRow = null;
+  let messageDeleteInFlight = false;
   let scanTimer = 0;
   let initialScanHandle = 0;
   let initialScanUsesIdleCallback = false;
@@ -2405,6 +2406,11 @@
     if (cleanup?.status === "failed") {
       throw new Error(cleanup.message || "卸载会话后的持久化清理失败");
     }
+    if (Array.isArray(cleanup?.unsupportedDatabases) && cleanup.unsupportedDatabases.length) {
+      throw new Error(
+        `卸载会话后的索引清理未完成：${cleanup.unsupportedDatabases.join("、")}`,
+      );
+    }
     await controller.resumeConversation({
       conversationId: normalizedSessionId,
       model: null,
@@ -2780,8 +2786,9 @@
   };
 
   const deleteSelected = async () => {
+    if (messageDeleteInFlight) return;
     const rows = selectedRows();
-    const sessionId = getSessionId();
+    const sessionId = String(getSessionId() || "").replace(/^local:/, "").trim();
     const selectedGroupsByAnchor = new Map();
     logicalMessageSelectionGroups(sessionId).forEach((messageIds) => {
       if (messageIds[0]) selectedGroupsByAnchor.set(messageIds[0], messageIds);
@@ -2803,55 +2810,69 @@
       return;
     }
     if (!window.confirm(`删除 ${logicalCount} 轮对话？\n无法撤销。`)) return;
-    showRuntimeToast(`正在永久删除 ${logicalCount} 轮对话…`);
-    let result;
+    messageDeleteInFlight = true;
+    const deleteButton = document.getElementById(toolbarId)?.querySelector?.("[data-codey-delete]");
+    if (deleteButton) deleteButton.disabled = true;
     try {
-      await callNativeSessionOperation((controller) => controller.discardConversation(sessionId.replace(/^local:/, "").trim()));
-      result = await callBridge("/session/delete-messages", { sessionId, messageIds });
-    } catch (error) {
-      const message = typeof error?.message === "string" ? error.message : String(error);
-      if (error?.code === "codey_capability_unavailable") {
-        showRuntimeToast(message, "error");
+      showRuntimeToast(`正在永久删除 ${logicalCount} 轮对话…`);
+      let result;
+      try {
+        await callNativeSessionOperation((controller) => controller.discardConversation(sessionId));
+        result = await callBridge("/session/delete-messages", { sessionId, messageIds });
+      } catch (error) {
+        const message = typeof error?.message === "string" ? error.message : String(error);
+        if (error?.code === "codey_capability_unavailable") {
+          showRuntimeToast(message, "error");
+          return;
+        }
+        window.alert(`删除失败：${message}`);
         return;
       }
-      window.alert(`删除失败：${message}`);
-      return;
+      if (result?.status === "failed") {
+        window.alert(`删除失败：${result.message || "未知错误"}`);
+        return;
+      }
+      if (Array.isArray(result?.unsupportedDatabases) && result.unsupportedDatabases.length) {
+        window.alert(
+          `会话文件已处理，但索引数据库未完成清理：${result.unsupportedDatabases.join("、")}。请退出 Codex 后重试。`,
+        );
+        return;
+      }
+      const deleted = Number(result?.deleted || 0);
+      if (deleted !== messageIds.length) {
+        const partialMessage = logicalCount === messageIds.length
+          ? `只永久删除了 ${deleted}/${messageIds.length} 轮对话。`
+          : `所选 ${logicalCount} 轮对话包含 ${messageIds.length} 个连续记录片段，只永久删除了 ${deleted} 个。`;
+        window.alert(
+          deleted
+            ? `${partialMessage}页面不会隐藏未确认删除的轮次，请重启 Codex 刷新会话后重试。`
+            : "未在会话文件中找到所选轮次，页面不会再假装删除。请更新或重启 Codey 后重试。",
+        );
+        return;
+      }
+      const resolvedMessageIds = Array.isArray(result?.resolvedMessageIds)
+        && result.resolvedMessageIds.length === messageIds.length
+        ? result.resolvedMessageIds.map(normalizeMessageId).filter(Boolean)
+        : messageIds;
+      forgetLogicalMessageSelections(sessionId, [...messageIds, ...resolvedMessageIds]);
+      forgetLogicalMessageIds(sessionId, [...messageIds, ...resolvedMessageIds]);
+      rememberHardDeletedMessages(sessionId, [...messageIds, ...resolvedMessageIds]);
+      physicalRows.forEach((row) => row.remove());
+      lastSelectedRow = null;
+      syncSelectionGroups();
+      updateToolbar();
+      try {
+        await reloadConversationAfterHardDelete(sessionId, resolvedMessageIds, true);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        window.alert(`消息已从会话文件永久删除，但 Codex 会话重新加载失败。\n请重启 Codex 后再继续对话。\n\n${message}`);
+        return;
+      }
+      showRuntimeToast(`已永久删除 ${logicalCount} 轮对话`);
+    } finally {
+      messageDeleteInFlight = false;
+      if (deleteButton) deleteButton.disabled = false;
     }
-    if (result?.status === "failed") {
-      window.alert(`删除失败：${result.message || "未知错误"}`);
-      return;
-    }
-    const deleted = Number(result?.deleted || 0);
-    if (deleted !== messageIds.length) {
-      const partialMessage = logicalCount === messageIds.length
-        ? `只永久删除了 ${deleted}/${messageIds.length} 轮对话。`
-        : `所选 ${logicalCount} 轮对话包含 ${messageIds.length} 个连续记录片段，只永久删除了 ${deleted} 个。`;
-      window.alert(
-        deleted
-          ? `${partialMessage}页面不会隐藏未确认删除的轮次，请重启 Codex 刷新会话后重试。`
-          : "未在会话文件中找到所选轮次，页面不会再假装删除。请更新或重启 Codey 后重试。",
-      );
-      return;
-    }
-    const resolvedMessageIds = Array.isArray(result?.resolvedMessageIds)
-      && result.resolvedMessageIds.length === messageIds.length
-      ? result.resolvedMessageIds.map(normalizeMessageId).filter(Boolean)
-      : messageIds;
-    forgetLogicalMessageSelections(sessionId, [...messageIds, ...resolvedMessageIds]);
-    forgetLogicalMessageIds(sessionId, [...messageIds, ...resolvedMessageIds]);
-    rememberHardDeletedMessages(sessionId, [...messageIds, ...resolvedMessageIds]);
-    physicalRows.forEach((row) => row.remove());
-    lastSelectedRow = null;
-    syncSelectionGroups();
-    updateToolbar();
-    try {
-      await reloadConversationAfterHardDelete(sessionId, resolvedMessageIds, true);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      window.alert(`消息已从会话文件永久删除，但 Codex 会话重新加载失败。\n请重启 Codex 后再继续对话。\n\n${message}`);
-      return;
-    }
-    showRuntimeToast(`已永久删除 ${logicalCount} 轮对话`);
   };
 
   const mountToolbar = () => {

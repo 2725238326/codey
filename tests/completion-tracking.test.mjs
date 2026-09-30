@@ -849,6 +849,59 @@ test("persistent deletion waits for the host to release the conversation", async
   assert.equal(deleteCalls, 2);
 });
 
+test("serializes concurrent partial deletion requests", async () => {
+  let release;
+  let dispatchCalls = 0;
+  let deleteCalls = 0;
+  const runtime = loadInjection({
+    turnIds: ["turn-1"], selectedTurnIds: ["turn-1"],
+    codexSignalDispatcher: (signal) => {
+      dispatchCalls += 1;
+      if (signal === "unsubscribe-thread-for-host" && dispatchCalls === 1) {
+        return new Promise((resolve) => { release = resolve; });
+      }
+      return Promise.resolve();
+    },
+    bridgeHandler: async (path) => {
+      if (path === "/session/delete-messages") deleteCalls += 1;
+      return { status: "ok", deleted: 1 };
+    },
+  });
+
+  const first = runtime.window.__codeyDeleteSelectedMessages();
+  await flushMicrotasks();
+  const second = runtime.window.__codeyDeleteSelectedMessages();
+  await flushMicrotasks();
+
+  assert.equal(dispatchCalls, 1);
+  assert.equal(deleteCalls, 0);
+  release();
+  await Promise.all([first, second]);
+  assert.equal(deleteCalls, 2);
+});
+
+test("does not hide a row when an index database remains unsupported", async () => {
+  const runtime = loadInjection({
+    turnIds: ["turn-unsupported"],
+    selectedTurnIds: ["turn-unsupported"],
+    codexSignalDispatcher: async () => {},
+    bridgeHandler: async (path) => (
+      path === "/session/delete-messages"
+        ? {
+          status: "ok",
+          deleted: 1,
+          unsupportedDatabases: ["thread_history_1.sqlite"],
+        }
+        : { status: "ok" }
+    ),
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-unsupported"]);
+  assert.match(runtime.alerts[0], /索引数据库未完成清理/);
+});
+
 test("failed host release never sends a destructive delete request", async () => {
   const runtime = loadInjection({
     turnIds: ["turn-1"], selectedTurnIds: ["turn-1"],
