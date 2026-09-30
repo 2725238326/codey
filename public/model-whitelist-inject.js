@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "57";
+  const patchVersion = "58";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -29,6 +29,7 @@
   const groupedMenuStyleId = "codey-model-route-menu-style";
   const groupedMenuSelector = "[role='menu'], [role='listbox']";
   const groupedMenuItemSelector = "[role='menuitem'], [role='menuitemradio'], [role='option']";
+  const subagentModelLabelSelector = "[class*='max-w-1/2']";
   const modelQueryKey = ["models", "list"];
   const modelResponseEvent = "message";
   const modelRequestEvent = "codex-message-from-view";
@@ -91,6 +92,7 @@
   let groupedMenuTimer = 0;
   let groupedMenuObserver = null;
   const groupedMenuTextObservers = new Map();
+  const subagentModelLabels = new Map();
   const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   const patchedRouteKey = Symbol("codeyPatchedRoute");
   const blockedProviderRequestKey = Symbol("codeyBlockedProviderRequest");
@@ -1337,6 +1339,84 @@
     return parent && typeof parent.matches === "function" ? parent : null;
   };
 
+  // This header is already mounted when CLI fallback injects the renderer.
+  // Update its label here instead of rewriting a lazily loaded native bundle.
+  const isSubagentModelLabel = (element) => (
+    element?.tagName === "SPAN"
+    && element.matches?.(subagentModelLabelSelector)
+    && element.closest?.("[class*='h-toolbar-pane']")
+    && !element.closest?.("[data-turn-key]")
+    && element.parentElement?.querySelector?.("button[aria-label]")
+  );
+
+  const writeSubagentModelLabel = (element, text) => {
+    // Preserve the text node owned by React whenever it is still present.
+    if (element.childNodes?.length === 1 && element.firstChild?.nodeType === 3) {
+      element.firstChild.nodeValue = text;
+    } else {
+      element.textContent = text;
+    }
+  };
+
+  const updateSubagentModelLabel = (element) => {
+    const state = subagentModelLabels.get(element);
+    if (!state || disposed || !catalog.loaded || element.isConnected === false) return;
+    const text = element.textContent || "";
+    if (text !== state.renderedText) {
+      const parts = text.match(/^(.*?)(\s+·\s+[^·]+)?$/);
+      if (!parts) return;
+      const label = parts[1].trim();
+      const suffix = parts[2] || "";
+      // React may replace only the effort while retaining our model label.
+      if (label !== state.displayName) state.model = label;
+      state.suffix = suffix;
+      state.nativeText = `${state.model}${suffix}`;
+    }
+    state.displayName = modelPresentation(state.model).displayName;
+    state.renderedText = `${state.displayName}${state.suffix}`;
+    if (text !== state.renderedText) writeSubagentModelLabel(element, state.renderedText);
+  };
+
+  const stopSubagentModelLabel = (element) => {
+    const state = subagentModelLabels.get(element);
+    if (!state) return;
+    state.observer?.disconnect?.();
+    if (element.textContent === state.renderedText) {
+      writeSubagentModelLabel(element, state.nativeText);
+    }
+    subagentModelLabels.delete(element);
+  };
+
+  const observeSubagentModelLabel = (element) => {
+    if (disposed || !isSubagentModelLabel(element)) return;
+    if (!subagentModelLabels.has(element)) {
+      const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
+      const observer = typeof MutationObserver === "function"
+        ? new MutationObserver(() => updateSubagentModelLabel(element))
+        : null;
+      subagentModelLabels.set(element, { observer });
+      // CharacterData stays confined to the title, never conversation text.
+      observer?.observe(element, { childList: true, characterData: true, subtree: true });
+    }
+    updateSubagentModelLabel(element);
+  };
+
+  const discoverSubagentModelLabels = (node) => {
+    const element = groupedMenuElement(node);
+    if (!element || element.closest?.("[data-turn-key]")) return;
+    observeSubagentModelLabel(element);
+    for (const label of element.querySelectorAll?.(subagentModelLabelSelector) || []) {
+      observeSubagentModelLabel(label);
+    }
+  };
+
+  const refreshSubagentModelLabels = () => {
+    for (const element of subagentModelLabels.keys()) {
+      if (element.isConnected === false) stopSubagentModelLabel(element);
+      else updateSubagentModelLabel(element);
+    }
+  };
+
   const groupedMenuContainer = (node) => {
     const element = groupedMenuElement(node);
     if (!element) return null;
@@ -1379,7 +1459,7 @@
   };
 
   const syncGroupedMenuTextObservers = (roots = []) => {
-    if (disposed) return;
+    if (disposed || nativeSelectionOnly) return;
     const menus = roots.length > 0
       ? roots.flatMap(menusWithin)
       : Array.from(document.querySelectorAll?.(groupedMenuSelector) || []);
@@ -1415,14 +1495,17 @@
     const discoveredMenus = [];
     let relevant = false;
     for (const mutation of mutations) {
-      const targetMenu = groupedMenuContainer(mutation.target);
+      const label = groupedMenuElement(mutation.target)?.closest?.(subagentModelLabelSelector);
+      if (label) observeSubagentModelLabel(label);
+      const targetMenu = nativeSelectionOnly ? null : groupedMenuContainer(mutation.target);
       if (targetMenu) {
         relevant = true;
         discoveredMenus.push(targetMenu);
       }
       if (mutation.type === "characterData") continue;
       for (const node of mutation.addedNodes || []) {
-        const menus = menusWithin(node);
+        discoverSubagentModelLabels(node);
+        const menus = nativeSelectionOnly ? [] : menusWithin(node);
         if (menus.length === 0) continue;
         relevant = true;
         discoveredMenus.push(...menus);
@@ -1438,10 +1521,14 @@
       if (container.isConnected === false) stopGroupedMenuTextObserver(container);
     }
     if (relevant) scheduleGroupedModelMenuEnhancement();
+    for (const element of subagentModelLabels.keys()) {
+      if (element.isConnected === false) stopSubagentModelLabel(element);
+    }
   };
 
   const installGroupedModelMenuObserver = () => {
     if (groupedMenuObserver || !document.body) return;
+    discoverSubagentModelLabels(document.body);
     const dispatcher = window.__codeyMutationDispatcher;
     if (typeof dispatcher?.subscribe === "function") {
       const unsubscribe = dispatcher.subscribe(handleGroupedMenuMutations, {
@@ -1772,6 +1859,7 @@
       reactContainers: firstPass.reactContainers + secondPass.reactContainers,
     });
     scheduleGroupedModelMenuEnhancement();
+    refreshSubagentModelLabels();
     return true;
   };
 
@@ -2806,9 +2894,9 @@
     if (event?.type === "keydown"
       && (!pickerInteraction || !["Enter", " ", "ArrowDown"].includes(event.key))) return;
     if (pickerInteraction) repairNativeFastControls(event.target);
+    installGroupedModelMenuObserver();
     if (nativeSelectionOnly && !pickerInteraction) return;
     if (!nativeSelectionOnly) {
-      installGroupedModelMenuObserver();
       rememberMenuRouteIntent(event);
     }
     scheduleGroupedModelMenuEnhancement();
@@ -2830,9 +2918,7 @@
   interactionEvents.forEach((eventName) => {
     document.addEventListener(eventName, handleInteraction, true);
   });
-  if (!nativeSelectionOnly) {
-    installGroupedModelMenuObserver();
-  }
+  installGroupedModelMenuObserver();
   restoreThreadRoutes();
   restoreDefaultModelHistory();
   window.addEventListener?.("focus", handleFocus);
@@ -2891,6 +2977,9 @@
         observer.disconnect?.();
       }
       groupedMenuTextObservers.clear();
+      for (const element of subagentModelLabels.keys()) {
+        stopSubagentModelLabel(element);
+      }
       interactionEvents.forEach((eventName) => {
         document.removeEventListener(eventName, handleInteraction, true);
       });

@@ -220,6 +220,14 @@ async function loadPatch(
   if (bridgeReady) await patch.refresh();
   return {
     patch,
+    async reload() {
+      Function("window", "document", "globalThis", "console", source)(
+        window, document, window, { warn() {} },
+      );
+      const nextPatch = window.__codeyModelWhitelistPatch;
+      await nextPatch.refresh();
+      return nextPatch;
+    },
     dispatchWasWrapped() { return window.dispatchEvent !== originalDispatchEvent; },
     connectBridge() {
       window.__codexSessionDeleteBridge = bridge;
@@ -685,7 +693,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "57");
+  assert.equal(patch.version, "58");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -4418,3 +4426,154 @@ test("catalog delivery survives a query client whose entries are not key-value p
   assert.deepEqual(goodClient.models(), ["route-a/current-model"]);
   runtime.patch.dispose();
 });
+
+const subagentRouteModel = "codey-official-account-d3265a21-a59f-40c8-a05a-5b4e03231c22/gpt-6-luna";
+const subagentCatalog = (prefix = "官1") => ({
+  status: "ok",
+  models: [subagentRouteModel],
+  default_model: subagentRouteModel,
+  model_metadata: [{
+    model: subagentRouteModel,
+    display_name: `[${prefix}] gpt-6-luna`,
+    route_name: "官方账号1",
+    provider_id: "codey_router",
+    route_provider_id: subagentRouteModel.split("/")[0],
+    source_model: "gpt-6-luna",
+  }],
+});
+
+function subagentHeader(body, text) {
+  const toolbar = body.appendChild(new FakeElementCore("div"));
+  toolbar.className = "relative h-toolbar-pane border-b";
+  const header = toolbar.appendChild(new FakeElementCore("div"));
+  header.appendChild(new FakeElementCore("button", {
+    attributes: { "aria-label": "Back to subagents" },
+  }));
+  const label = header.appendChild(new FakeElementCore("span"));
+  label.className = "max-w-1/2 min-w-0 truncate text-xs text-tertiary select-none";
+  label.textContent = text;
+  return { toolbar, header, label };
+}
+
+test("mounted subagent headers use catalog labels without a startup resource patch", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const raw = `${subagentRouteModel} · 极高`;
+  const { label } = subagentHeader(body, raw);
+  const textNode = { nodeType: 3, nodeValue: raw, parentElement: label };
+  label.firstChild = textNode;
+  label.childNodes = [textNode];
+  Object.defineProperty(label, "textContent", {
+    get: () => textNode.nodeValue,
+    set: () => assert.fail("the text node owned by React must be preserved"),
+  });
+  const thread = { model: subagentRouteModel, reasoningEffort: "xhigh" };
+  label.__reactFiber$headerTest = { memoizedProps: thread };
+  const runtime = await loadPatch(subagentCatalog(), [statsigClient()], { documentBody: body });
+  assert.equal(label.textContent, "[官1] gpt-6-luna · 极高");
+  assert.equal(thread.model, subagentRouteModel);
+  assert.equal(runtime.patch.snapshot().models[0], subagentRouteModel);
+  const observer = runtime.mutationObserverInstalls().find(entry => entry.target === label);
+  assert.deepEqual(observer.options, { childList: true, characterData: true, subtree: true });
+  runtime.patch.dispose();
+  assert.equal(label.textContent, raw);
+  assert.equal(observer.observer.disconnected, true);
+});
+
+test("subagent headers survive React text updates and route renames", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const { label } = subagentHeader(body, subagentRouteModel);
+  const runtime = await loadPatch(subagentCatalog(), [statsigClient()], { documentBody: body });
+  const nativeUpdate = (text) => {
+    label.textContent = text;
+    runtime.dispatchObserverMutations(label, [{
+      type: "characterData", target: { parentElement: label },
+    }]);
+  };
+  assert.equal(label.textContent, "[官1] gpt-6-luna");
+  nativeUpdate(`${subagentRouteModel} · High`);
+  assert.equal(label.textContent, "[官1] gpt-6-luna · High");
+  nativeUpdate("[官1] gpt-6-luna · 中");
+  assert.equal(label.textContent, "[官1] gpt-6-luna · 中");
+  await runtime.patch.setCatalog(subagentCatalog("主"));
+  assert.equal(label.textContent, "[主] gpt-6-luna · 中");
+  nativeUpdate("vendor/custom-model · Low");
+  assert.equal(label.textContent, "vendor/custom-model · Low");
+  nativeUpdate("codey-official-account-deleted/gpt-6-sol · 极高");
+  assert.equal(label.textContent, "gpt-6-sol · 极高");
+  nativeUpdate(subagentRouteModel);
+  assert.equal(label.textContent, "[主] gpt-6-luna");
+  nativeUpdate(label.textContent);
+  assert.equal(label.textContent, "[主] gpt-6-luna");
+  runtime.patch.dispose();
+  assert.equal(label.textContent, subagentRouteModel);
+});
+
+test("subagent headers observe late mounts and release removed labels without scanning turns", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const runtime = await loadPatch(subagentCatalog(), [statsigClient()], { documentBody: body });
+  const scans = runtime.wildcardScanCount();
+  const { toolbar, header, label } = subagentHeader(body, `${subagentRouteModel} · 中`);
+  runtime.dispatchObserverMutations(body, [{
+    type: "childList", target: body, addedNodes: [toolbar], removedNodes: [],
+  }]);
+  assert.equal(label.textContent, "[官1] gpt-6-luna · 中");
+  const observer = runtime.mutationObserverInstalls().find(entry => entry.target === label);
+  label.remove();
+  runtime.dispatchObserverMutations(body, [{
+    type: "childList", target: header, addedNodes: [], removedNodes: [label],
+  }]);
+  assert.equal(observer.observer.disconnected, true);
+  assert.equal(label.textContent, `${subagentRouteModel} · 中`);
+  header.appendChild(label);
+  runtime.dispatchObserverMutations(body, [{
+    type: "childList", target: header, addedNodes: [label], removedNodes: [],
+  }]);
+  assert.equal(label.textContent, "[官1] gpt-6-luna · 中");
+  const turn = body.appendChild(new FakeElementCore("div", { attributes: { "data-turn-key": "turn" } }));
+  const content = subagentHeader(turn, subagentRouteModel);
+  runtime.dispatchObserverMutations(body, [{
+    type: "childList", target: turn, addedNodes: [content.toolbar], removedNodes: [],
+  }]);
+  assert.equal(content.label.textContent, subagentRouteModel);
+  assert.equal(runtime.mutationObserverInstalls().length, 3);
+  assert.equal(runtime.wildcardScanCount(), scans);
+  runtime.patch.dispose();
+});
+
+test("subagent header hot reload restores raw labels before reinstalling observers", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const { label } = subagentHeader(body, `${subagentRouteModel} · 极高`);
+  const runtime = await loadPatch(subagentCatalog(), [statsigClient()], { documentBody: body });
+  const firstObservers = [...runtime.mutationObserverInstalls()];
+  runtime.patch.version = "previous";
+  const reloaded = await runtime.reload();
+  assert.notEqual(reloaded, runtime.patch);
+  assert.equal(label.textContent, "[官1] gpt-6-luna · 极高");
+  assert.ok(firstObservers.every(entry => entry.observer.disconnected));
+  reloaded.dispose();
+  assert.equal(label.textContent, `${subagentRouteModel} · 极高`);
+  assert.ok(runtime.mutationObserverInstalls().every(entry => entry.observer.disconnected));
+});
+
+for (const nativeSelectionOnly of [false, true]) {
+  test(`subagent headers handle a late catalog without touching conversation content (native: ${nativeSelectionOnly})`, async () => {
+    const body = new FakeElementCore("body", { connected: true });
+    const { label } = subagentHeader(body, subagentRouteModel);
+    const turn = body.appendChild(new FakeElementCore("div", { attributes: { "data-turn-key": "turn" } }));
+    const content = subagentHeader(turn, subagentRouteModel);
+    const unrelated = body.appendChild(new FakeElementCore("span"));
+    unrelated.className = label.className;
+    unrelated.textContent = subagentRouteModel;
+    const runtime = await loadPatch({ ...subagentCatalog(), native_selection_only: nativeSelectionOnly }, [statsigClient()], {
+      documentBody: body, bridgeReady: false, nativeSelectionOnly,
+    });
+    assert.equal(label.textContent, subagentRouteModel);
+    runtime.connectBridge();
+    await runtime.patch.refresh();
+    assert.equal(label.textContent, "[官1] gpt-6-luna");
+    assert.equal(content.label.textContent, subagentRouteModel);
+    assert.equal(unrelated.textContent, subagentRouteModel);
+    assert.equal(runtime.mutationObserverInstalls().length, 2);
+    runtime.patch.dispose();
+  });
+}

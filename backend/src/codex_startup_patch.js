@@ -587,25 +587,6 @@
         "completed thread reconciliation",
       );
     }
-    if (source.includes("`localConversation.subagentsPanel.modelAndReasoningEffort`")) {
-      // Codex formats this header with its GPT name helper, which leaves a
-      // route alias unchanged. Use the same short-name label as the model picker.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /([$A-Z_a-z][$\w]*)\[(\d+)\]===([$A-Z_a-z][$\w]*)\.model\?([$A-Z_a-z][$\w]*)=\1\[(\d+)\]:\(\4=([$A-Z_a-z][$\w]*)\(\3\.model\),\1\[\2\]=\3\.model,\1\[\5\]=\4\)(?=[\s\S]{0,1200}?`localConversation\.subagentsPanel\.modelAndReasoningEffort`)/g,
-        (
-          _match,
-          cache,
-          keySlot,
-          thread,
-          label,
-          valueSlot,
-          formatModel,
-        ) =>
-          `(${label}=globalThis.__codeyModelWhitelistPatch?.presentModel?.(${thread}.model)?.displayName||${formatModel}(${thread}.model),${cache}[${keySlot}]===${label}?${label}=${cache}[${valueSlot}]:(${cache}[${keySlot}]=${label},${cache}[${valueSlot}]=${label}))`,
-        "subagent header model label",
-      );
-    }
     if (
       source.includes("useHiddenModels:") &&
       source.includes("availableModels:") &&
@@ -968,7 +949,7 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group|local-conversation-subagents-panel)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
+          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
           ) ||
           (

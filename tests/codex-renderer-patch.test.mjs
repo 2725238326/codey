@@ -673,66 +673,6 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "the AppServerRequestClient route preflight must patch without compatibility errors",
     );
 
-    const subagentHeaderSource = [
-      "function formatModel(model){return model}",
-      "let t=[];",
-      "function headerLabel(thread){",
-      "let e;",
-      "t[3]===thread.model?e=t[4]:(e=formatModel(thread.model),t[3]=thread.model,t[4]=e);",
-      "const messageId=`localConversation.subagentsPanel.modelAndReasoningEffort`;",
-      "return {label:e,messageId}}",
-    ].join("");
-    electron.protocol.handle("app", async () => new Response(subagentHeaderSource));
-    const subagentHeaderResponse = await installedHandler({
-      url: "app://-/assets/local-conversation-subagents-panel-tab-b38592af9cec.js",
-    });
-    const patchedSubagentHeaderSource = await subagentHeaderResponse.text();
-    assert.match(
-      patchedSubagentHeaderSource,
-      /__codeyModelWhitelistPatch\?\.presentModel\?\.\(thread\.model\)\?\.displayName/,
-    );
-    const headerLabel = Function(
-      `${patchedSubagentHeaderSource};return headerLabel`,
-    )();
-    globalThis.__codeyModelWhitelistPatch = {
-      presentModel(model) {
-        return model === "codey-official-account-d3265a21-a59f-4c0e/gpt-5.6-sol"
-          ? { displayName: "[官] gpt-5.6-sol" }
-          : null;
-      },
-    };
-    assert.deepEqual(
-      headerLabel({
-        model: "codey-official-account-d3265a21-a59f-4c0e/gpt-5.6-sol",
-      }),
-      {
-        label: "[官] gpt-5.6-sol",
-        messageId: "localConversation.subagentsPanel.modelAndReasoningEffort",
-      },
-    );
-    assert.deepEqual(
-      headerLabel({
-        model: "codey-official-account-d3265a21-a59f-4c0e/gpt-5.6-sol",
-      }).label,
-      "[官] gpt-5.6-sol",
-    );
-    globalThis.__codeyModelWhitelistPatch.presentModel = () => ({
-      displayName: "[备] gpt-5.6-sol",
-    });
-    assert.equal(
-      headerLabel({
-        model: "codey-official-account-d3265a21-a59f-4c0e/gpt-5.6-sol",
-      }).label,
-      "[备] gpt-5.6-sol",
-    );
-    delete globalThis.__codeyModelWhitelistPatch;
-    assert.equal(
-      patchErrors.length,
-      2,
-      "the subagent header label patch must match the Codex panel exactly once",
-    );
-
-
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
       "from\"./codex-avatar-BpKnWN_W.js\";",
