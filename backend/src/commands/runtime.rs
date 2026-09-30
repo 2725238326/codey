@@ -418,9 +418,7 @@ pub async fn launch_codey_runtime(state: &Arc<AppState>) -> anyhow::Result<Value
             message.clone(),
             error_log::FailureMetadata {
                 stage: Some("startup.runtime".to_string()),
-                recoverable: Some(
-                    error.is::<crate::model_catalog::ContextBudgetCatalogError>(),
-                ),
+                recoverable: Some(error.is::<crate::model_catalog::ContextBudgetCatalogError>()),
             },
             runtime_start_failure_context(state, false, &message).await,
         );
@@ -557,7 +555,8 @@ async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot
             }
         }
     }
-    *restart_state.startup_error.write().await = launch.as_ref().err().map(|error| format!("{error:#}"));
+    *restart_state.startup_error.write().await =
+        launch.as_ref().err().map(|error| format!("{error:#}"));
     let Err(error) = launch else {
         return;
     };

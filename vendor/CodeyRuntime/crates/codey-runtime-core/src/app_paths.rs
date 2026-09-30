@@ -3,10 +3,6 @@ use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use std::process::Command;
 
 #[derive(Debug, Clone, Copy)]
 struct AppPackageSpec {
@@ -110,8 +106,6 @@ fn registered_codex_app_dirs() -> Option<Vec<PathBuf>> {
 }
 
 #[cfg(any(windows, test))]
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
 struct RegisteredCodexPackage {
     package_full_name: String,
     install_location: PathBuf,
@@ -119,24 +113,31 @@ struct RegisteredCodexPackage {
 
 #[cfg(windows)]
 fn registered_codex_packages() -> Option<Vec<RegisteredCodexPackage>> {
-    let output = Command::new("powershell")
-        .creation_flags(crate::windows_create_no_window())
-        .args([
-            "-NoProfile",
-            "-Command",
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); $names=@('OpenAI.Codex','OpenAI.CodexBeta'); $packages=@(Get-AppxPackage | Where-Object { $names -contains $_.Name } | Select-Object PackageFullName,InstallLocation); ConvertTo-Json -InputObject $packages -Compress",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    registered_codex_packages_from_output(&output.stdout)
+    let packages = registered_windows_package_values(|package| {
+        let identity = package.Id()?;
+        let name = identity.Name()?.to_string_lossy();
+        if !APP_PACKAGE_SPECS
+            .iter()
+            .any(|spec| spec.identity.eq_ignore_ascii_case(&name))
+        {
+            return Ok(None);
+        }
+        let package_full_name = identity.FullName()?.to_string_lossy();
+        let location =
+            windows_package_location(package.InstalledLocation().and_then(|folder| folder.Path()))?;
+        Ok(location.map(|install_location| RegisteredCodexPackage {
+            package_full_name,
+            install_location,
+        }))
+    })
+    .ok()?;
+    validate_registered_codex_packages(packages)
 }
 
 #[cfg(any(windows, test))]
-fn registered_codex_packages_from_output(output: &[u8]) -> Option<Vec<RegisteredCodexPackage>> {
-    let packages: Vec<RegisteredCodexPackage> = serde_json::from_slice(output).ok()?;
+fn validate_registered_codex_packages(
+    packages: Vec<RegisteredCodexPackage>,
+) -> Option<Vec<RegisteredCodexPackage>> {
     packages
         .iter()
         .all(|package| {
@@ -144,6 +145,64 @@ fn registered_codex_packages_from_output(output: &[u8]) -> Option<Vec<Registered
                 && package.install_location.is_absolute()
         })
         .then_some(packages)
+}
+
+#[cfg(windows)]
+fn registered_windows_package_values<T>(
+    mut read: impl FnMut(&windows::ApplicationModel::Package) -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<Vec<T>> {
+    use anyhow::Context;
+    use windows::Management::Deployment::PackageManager;
+    use windows::core::HSTRING;
+
+    // An empty SID selects the current user, as Get-AppxPackage did. Query the
+    // live registration state without starting PowerShell or caching identities.
+    let manager = PackageManager::new().context("无法打开 Windows 包管理器")?;
+    let packages = manager
+        .FindPackagesByUserSecurityId(&HSTRING::new())
+        .context("无法查询当前用户的 Windows 包注册信息")?;
+    let iterator = packages.First().context("无法枚举 Windows 包注册信息")?;
+    let mut has_current = iterator
+        .HasCurrent()
+        .context("无法读取 Windows 包枚举状态")?;
+    let mut values = Vec::new();
+    // The bindings' IntoIterator drops iteration errors. Use the fallible
+    // methods so a partial enumeration can never authorize a standalone launch.
+    while has_current {
+        let package = iterator.Current().context("无法读取 Windows 包注册信息")?;
+        if let Some(value) = read(&package).context("无法读取 Windows 包安装信息")? {
+            values.push(value);
+        }
+        has_current = iterator
+            .MoveNext()
+            .context("无法继续枚举 Windows 包注册信息")?;
+    }
+    Ok(values)
+}
+
+#[cfg(windows)]
+fn windows_package_location(
+    location: windows::core::Result<windows::core::HSTRING>,
+) -> anyhow::Result<Option<PathBuf>> {
+    use anyhow::Context;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::core::HRESULT;
+
+    let location = match location {
+        Ok(location) => location,
+        // Removed packages can retain registrations without an installed folder.
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("无法读取 Windows 包注册路径"),
+    };
+    if location.is_empty() {
+        return Ok(None);
+    }
+    let location = PathBuf::from(std::ffi::OsString::from_wide(location.as_wide()));
+    anyhow::ensure!(location.is_absolute(), "Windows 包注册路径不是绝对路径");
+    Ok(Some(location))
 }
 
 #[cfg(any(windows, test))]
@@ -449,30 +508,10 @@ fn ensure_unregistered_windows_install(app_dir: &Path) -> anyhow::Result<()> {
 
         // Include all identities: an unrecognized registered package must not
         // fall back to standalone launch just because its name is unfamiliar.
-        let output = Command::new("powershell")
-            .creation_flags(crate::windows_create_no_window())
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                r#"$ErrorActionPreference='Stop'
-[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new()
-Get-AppxPackage | ForEach-Object {
-    try { $_ | Select-Object -ExpandProperty InstallLocation }
-    catch {
-        # Removed packages can leave registrations with no installation location.
-        if ($_.Exception.InnerException -isnot [System.IO.FileNotFoundException]) { throw }
-    }
-}"#,
-            ])
-            .output()
-            .context("无法查询 Windows 包注册信息，未按独立安装处理")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "查询 Windows 包注册信息失败，未按独立安装处理"
-        );
-        let locations =
-            String::from_utf8(output.stdout).context("Windows 包注册路径不是有效 UTF-8")?;
+        let locations = registered_windows_package_values(|package| {
+            windows_package_location(package.InstalledLocation().and_then(|folder| folder.Path()))
+        })
+        .context("无法查询 Windows 包注册信息，未按独立安装处理")?;
         anyhow::ensure!(
             !app_dir_is_within_registered_package(app_dir, &locations)?,
             "无法安全识别 Windows 打包安装，未按独立安装处理：{}",
@@ -488,15 +527,13 @@ Get-AppxPackage | ForEach-Object {
 }
 
 #[cfg(any(windows, test))]
-fn app_dir_is_within_registered_package(app_dir: &Path, locations: &str) -> anyhow::Result<bool> {
+fn app_dir_is_within_registered_package(
+    app_dir: &Path,
+    locations: &[PathBuf],
+) -> anyhow::Result<bool> {
     use anyhow::Context;
 
-    for location in locations
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let location = Path::new(location);
+    for location in locations {
         anyhow::ensure!(location.is_absolute(), "Windows 包注册路径不是绝对路径");
         let package_root = std::fs::canonicalize(location)
             .with_context(|| format!("无法核实 Windows 包注册路径：{}", location.display()))?;
@@ -1301,30 +1338,60 @@ mod tests {
         let sibling = temp.path().join("UnknownPackage-copy");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
-        let locations = format!("\r\n{}\r\n", package.display());
+        let locations = [package.clone()];
         for app in [&package, &nested] {
             let app = std::fs::canonicalize(app).unwrap();
             assert!(app_dir_is_within_registered_package(&app, &locations).unwrap());
             #[cfg(windows)]
             assert!(
-                app_dir_is_within_registered_package(&app, &locations.to_ascii_uppercase())
-                    .unwrap()
+                app_dir_is_within_registered_package(
+                    &app,
+                    &[PathBuf::from(package.as_os_str().to_ascii_uppercase())],
+                )
+                .unwrap()
             );
         }
         let sibling = std::fs::canonicalize(sibling).unwrap();
         assert!(!app_dir_is_within_registered_package(&sibling, &locations).unwrap());
         let parent = std::fs::canonicalize(temp.path()).unwrap();
         assert!(!app_dir_is_within_registered_package(&parent, &locations).unwrap());
-        assert!(!app_dir_is_within_registered_package(&parent, "\r\n").unwrap());
+        assert!(!app_dir_is_within_registered_package(&parent, &[]).unwrap());
     }
 
     #[test]
     fn registered_package_locations_fail_closed_on_unverifiable_paths() {
         let temp = tempfile::tempdir().unwrap();
         let app = std::fs::canonicalize(temp.path()).unwrap();
-        assert!(app_dir_is_within_registered_package(&app, "relative/package").is_err());
+        assert!(app_dir_is_within_registered_package(&app, &["relative/package".into()]).is_err());
         let missing = temp.path().join("missing");
-        assert!(app_dir_is_within_registered_package(&app, &missing.to_string_lossy()).is_err());
+        assert!(app_dir_is_within_registered_package(&app, &[missing]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_package_locations_skip_only_missing_or_empty_installations() {
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+        };
+        use windows::core::{Error, HRESULT, HSTRING};
+
+        assert!(
+            windows_package_location(Ok(HSTRING::new()))
+                .unwrap()
+                .is_none()
+        );
+        let missing = Error::from_hresult(HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0));
+        assert!(windows_package_location(Err(missing)).unwrap().is_none());
+        for code in [ERROR_ACCESS_DENIED, ERROR_PATH_NOT_FOUND] {
+            let error = Error::from_hresult(HRESULT::from_win32(code.0));
+            assert!(windows_package_location(Err(error)).is_err());
+        }
+        assert!(windows_package_location(Ok(HSTRING::from("relative/package"))).is_err());
+        let location = r"C:\应用 包\Codex";
+        assert_eq!(
+            windows_package_location(Ok(HSTRING::from(location))).unwrap(),
+            Some(PathBuf::from(location)),
+        );
     }
 
     #[test]
@@ -1355,27 +1422,23 @@ mod tests {
     }
 
     #[test]
-    fn registered_package_output_preserves_identity_and_install_location() {
+    fn registered_package_records_preserve_identity_and_install_location() {
         let temp = tempfile::tempdir().unwrap();
         let location = temp.path().join("Codex 安装");
         let full_name = "OpenAI.Codex_26.924.22138.0_x64__2p2nqsd0c76g0";
-        let output = serde_json::to_vec(&serde_json::json!([{
-            "PackageFullName": full_name,
-            "InstallLocation": location,
-        }]))
+        let packages = validate_registered_codex_packages(vec![RegisteredCodexPackage {
+            package_full_name: full_name.into(),
+            install_location: location.clone(),
+        }])
         .unwrap();
-        let packages = registered_codex_packages_from_output(&output).unwrap();
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].package_full_name, full_name);
         assert_eq!(packages[0].install_location, location);
         assert!(
-            registered_codex_packages_from_output(b"[]")
+            validate_registered_codex_packages(vec![])
                 .unwrap()
                 .is_empty()
         );
-        for output in [b"".as_slice(), b"null", b"{}", b"not JSON", b"[{}]"] {
-            assert!(registered_codex_packages_from_output(output).is_none());
-        }
         for (full_name, location) in [
             ("Other.App_26.924.22138.0_x64__2p2nqsd0c76g0", temp.path()),
             ("OpenAI.Codex_26.924.22138.0_x64__unknown", temp.path()),
@@ -1385,12 +1448,12 @@ mod tests {
             ),
             (full_name, Path::new("relative")),
         ] {
-            let output = serde_json::to_vec(&serde_json::json!([{
-                "PackageFullName": full_name, "InstallLocation": location,
-            }]))
-            .unwrap();
             assert!(
-                registered_codex_packages_from_output(&output).is_none(),
+                validate_registered_codex_packages(vec![RegisteredCodexPackage {
+                    package_full_name: full_name.into(),
+                    install_location: location.into(),
+                }])
+                .is_none(),
                 "{full_name}"
             );
         }

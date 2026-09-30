@@ -91,10 +91,9 @@ async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
     );
     let codex_config = b"model_catalog_json = 'custom.json'\n";
     std::fs::write(directory.path().join("config.toml"), codex_config).unwrap();
-    let catalog = serde_json::to_vec(
-        &codey_runtime_core::model_suffix::bundled_model_catalog().unwrap(),
-    )
-    .unwrap();
+    let catalog =
+        serde_json::to_vec(&codey_runtime_core::model_suffix::bundled_model_catalog().unwrap())
+            .unwrap();
     let source = directory.path().join("custom.json");
     std::fs::write(&source, &catalog).unwrap();
     let error = crate::codex_config::runtime_model_catalog_path(

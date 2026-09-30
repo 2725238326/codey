@@ -79,7 +79,20 @@ test("Windows source contract: background helpers request no-window execution", 
   );
   assert.match(
     runtimeAppPaths,
-    /Command::new\("powershell"\)\s*\.creation_flags\(crate::windows_create_no_window\(\)\)/,
+    /fn registered_codex_packages\(\)[\s\S]*?registered_windows_package_values\(/,
+  );
+  const nativePackages = runtimeAppPaths.match(
+    /#\[cfg\(windows\)\]\s*fn registered_windows_package_values<T>\([\s\S]*?\n\}/,
+  )?.[0];
+  assert.ok(nativePackages, "Windows 包发现应使用原生枚举");
+  assert.match(nativePackages, /PackageManager::new\(\)/);
+  assert.match(nativePackages, /FindPackagesByUserSecurityId\(&HSTRING::new\(\)\)/);
+  assert.match(nativePackages, /packages\.First\(\)\.context\([^\n]+\)\?/);
+  assert.match(nativePackages, /\.MoveNext\(\)\s*\.context\([^\n]+\)\?/);
+  assert.doesNotMatch(nativePackages, /Command::new|CreateProcess|ShellExecute/);
+  assert.doesNotMatch(
+    runtimeAppPaths,
+    /Command::new\(\s*"(?:powershell|pwsh|cmd)(?:\.exe)?"/i,
   );
 });
 
@@ -162,10 +175,12 @@ test("Windows source contract: missing Codex paths recover before startup", asyn
     runtime.indexOf("pub async fn launch_codey_runtime"),
   );
 
-  assert.match(launch, /ensure_windows_codex_app_path\(state\)\.await\?/);
+  const recoverBeforeLaunch = launch.match(
+    /ensure_windows_codex_app_path\(state\)\s*\.await\s*\.map_err\(anyhow::Error::msg\)\?/,
+  );
+  assert.ok(recoverBeforeLaunch, "启动前必须恢复 Codex 路径并传播失败");
   assert.ok(
-    launch.indexOf("ensure_windows_codex_app_path(state).await?")
-      < launch.indexOf("CodeyRuntime::start"),
+    recoverBeforeLaunch.index < launch.indexOf("CodeyRuntime::start"),
   );
   assert.match(
     commands,

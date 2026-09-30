@@ -22,6 +22,10 @@ zip.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
+  "ApplicationModel",
+  "Foundation_Collections",
+  "Management_Deployment",
+  "Storage",
   "Win32_Foundation",
   "Win32_Storage_EnhancedStorage",
   "Win32_Storage_FileSystem",
