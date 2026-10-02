@@ -43,7 +43,7 @@ pub async fn save_default_model(
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(hot_reload.add_to_response(json!({
         "status":"ok",
@@ -216,7 +216,7 @@ pub async fn save_official_route_models(
         }
         (response, subagent_hot_reload)
     } else {
-        let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+        let hot_reload = hot_reload_runtime_models(state).await;
         timings.mark("modelDeliveryMs");
         let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
         timings.mark("subagentReloadMs");
@@ -300,82 +300,6 @@ async fn persist_official_account_proxy(
     .await
     .map_err(|error| format!("保存官方账号线路代理任务异常退出：{error}"))?
     .map_err(|error| format!("{error:#}"))
-}
-
-pub(crate) async fn hot_reload_runtime_models(
-    state: &Arc<AppState>,
-    config: &CodeyConfig,
-    model_state: &model_catalog::ModelSelectionState,
-) -> ModelHotReloadOutcome {
-    let runtime = state.runtime.lock().await.clone();
-    let Some(runtime) = runtime else {
-        return ModelHotReloadOutcome::default();
-    };
-    if runtime.applied_config.local_router_enabled != config.local_router_enabled {
-        return ModelHotReloadOutcome::default();
-    }
-    // 待重启的线路能力差异（例如 Responses WebSocket 开关）不阻塞模型成员送达，
-    // 只把运输能力固定在启动时的取值，重启后自然切换。
-    let delivered =
-        if runtime_supports_current_routes_for_hot_reload(&runtime.applied_config, config) {
-            config.clone()
-        } else {
-            config_with_launch_pinned_transport(&runtime.applied_config, config)
-        };
-    // 路由快照和渲染端模型列表成对送达，失败回退时不能覆盖另一次送达的结果。
-    let _delivery = state.model_delivery_lock.lock().await;
-    let router_swap = if delivered.local_router_enabled {
-        match runtime.sync_local_router_routes(&delivered) {
-            Ok(swap) => swap,
-            Err(error) => {
-                return ModelHotReloadOutcome {
-                    error: Some(format!("{error:#}")),
-                    ..ModelHotReloadOutcome::default()
-                };
-            }
-        }
-    } else {
-        None
-    };
-    let expected_catalog = renderer_model_catalog_value(&delivered, model_state);
-    let expected_models = expected_catalog
-        .get("models")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or_default();
-    let websocket_url = runtime.renderer_websocket_url().await;
-    match cdp::refresh_model_whitelist(&websocket_url, &expected_catalog).await {
-        Ok(refresh) => {
-            runtime.mark_model_config_applied(&delivered).await;
-            ModelHotReloadOutcome {
-                reloaded: true,
-                deferred: refresh.deferred,
-                error: None,
-            }
-        }
-        Err(error) => {
-            // 未确认送达时仍以已应用的模型配置为准（需要重启的判断也以它为基准），
-            // 路由退回原快照，与 Codex 仍在显示的模型列表一致。
-            if let Some(swap) = router_swap {
-                runtime.revert_local_router_routes(swap);
-            }
-            let error = format!("{error:#}");
-            error_log::record_failure(
-                "patch_verification_failed",
-                "refresh_model_whitelist",
-                error.clone(),
-                json!({
-                    "modelCount": expected_models,
-                    "websocketUrl": websocket_url,
-                }),
-            );
-            ModelHotReloadOutcome {
-                reloaded: false,
-                deferred: false,
-                error: Some(error),
-            }
-        }
-    }
 }
 
 pub(crate) fn current_model_state(

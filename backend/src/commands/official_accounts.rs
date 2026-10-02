@@ -643,7 +643,7 @@ pub(crate) async fn refresh_official_route_after_account_change(
     let prepare_error = prepare_routes_for_current_launch(state).await.err();
     let config = state.config.read().await.clone();
     let model_state = current_model_state_async(&config).await?;
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let store = state.official_accounts();
     let accounts = tokio::task::spawn_blocking(move || accounts_payload(&store))

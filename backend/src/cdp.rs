@@ -944,15 +944,11 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
     && snapshot.models.every((model, index) => model === expectedModels[index])
     && snapshot.defaultModel === expectedDefaultModel
   );
-  // The response patch rewrites every future `model/list` bridge reply and
-  // the scheduled/interaction passes keep patching the query cache, so a
-  // renderer whose model picker has not mounted yet still receives the
-  // catalog — just lazily. That counts as a deferred delivery, not a
-  // failure; only a missing Statsig or response patch is a real failure.
   const catalogAccepted = (delivery) => (
     delivery?.responsePatchInstalled === true
     && Number(delivery.statsigClients) > 0
     && Number(delivery.notifiedClients) > 0
+    && Number(delivery.pendingQueryEntries || 0) === 0
   );
   const reachedActiveModelPicker = (delivery) => (
     catalogAccepted(delivery)
@@ -960,7 +956,7 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
     && Number(delivery.queryEntries) > 0
   );
   const deliverySummary = (delivery) => delivery
-    ? `（statsigClients=${{Number(delivery.statsigClients)}}, notifiedClients=${{Number(delivery.notifiedClients)}}, queryClients=${{Number(delivery.queryClients)}}, queryEntries=${{Number(delivery.queryEntries)}}）`
+    ? `（statsigClients=${{Number(delivery.statsigClients)}}, notifiedClients=${{Number(delivery.notifiedClients)}}, queryClients=${{Number(delivery.queryClients)}}, queryEntries=${{Number(delivery.queryEntries)}}, pendingQueryEntries=${{Number(delivery.pendingQueryEntries || 0)}}）`
     : "";
   let snapshot = null;
   let delivery = null;
@@ -997,6 +993,8 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
         lastError = "模型响应补丁未安装";
       }} else if (Number(delivery.statsigClients) < 1) {{
         lastError = "未找到 Codex 的 Statsig 客户端";
+      }} else if (Number(delivery.pendingQueryEntries) > 0) {{
+        lastError = "Codex 已有模型查询缓存尚未更新";
       }} else {{
         lastError = "未能通知 Codex 的 Statsig 客户端";
       }}

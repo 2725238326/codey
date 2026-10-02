@@ -19,7 +19,7 @@ pub async fn set_route_enabled(
     let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     drop(config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let hot_reload = hot_reload_runtime_models(state).await;
     let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(add_subagent_hot_reload_to_response(
@@ -80,7 +80,7 @@ pub async fn reorder_route_models(
     let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     drop(config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(hot_reload.add_to_response(json!({
         "status": "ok",
@@ -160,7 +160,7 @@ pub async fn delete_route(
     *state.config.write().await = config.clone();
     let model_state = current_model_state_async(&config).await?;
     drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let hot_reload = hot_reload_runtime_models(state).await;
     let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(add_subagent_hot_reload_to_response(
@@ -529,7 +529,7 @@ pub async fn fetch_route_models(
     *state.config.write().await = latest.clone();
     drop(_config_write_guard);
     timings.mark("saveConfigMs");
-    let hot_reload = hot_reload_runtime_models(state, &latest, &model_state).await;
+    let hot_reload = hot_reload_runtime_models(state).await;
     timings.mark("modelDeliveryMs");
     let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &latest).await;
     timings.mark("subagentReloadMs");

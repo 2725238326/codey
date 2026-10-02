@@ -80,7 +80,7 @@ test("失效账号的线路随失效标记一起移除", () => {
   )?.[0];
   assert.ok(refreshRoutes, "应存在账号变更后的线路刷新函数");
   assert.match(refreshRoutes, /prepare_routes_for_current_launch\(state\)\.await/);
-  assert.match(refreshRoutes, /hot_reload_runtime_models\(state, &config, &model_state\)\.await/);
+  assert.match(refreshRoutes, /hot_reload_runtime_models\(state\)\.await/);
   assert.match(refreshRoutes, /"config": redacted_config\(&config\)/);
   assert.match(refreshRoutes, /"modelState": model_state/);
   assert.match(

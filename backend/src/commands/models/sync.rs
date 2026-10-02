@@ -1,27 +1,5 @@
 use super::*;
 
-#[derive(Default)]
-pub(crate) struct ModelHotReloadOutcome {
-    pub(crate) reloaded: bool,
-    pub(crate) deferred: bool,
-    pub(crate) error: Option<String>,
-}
-
-impl ModelHotReloadOutcome {
-    pub(crate) fn add_to_response(self, mut response: Value) -> Value {
-        if let Some(object) = response.as_object_mut() {
-            object.insert("modelHotReloaded".into(), Value::Bool(self.reloaded));
-            if self.deferred {
-                object.insert("modelHotReloadDeferred".into(), Value::Bool(true));
-            }
-            if let Some(error) = self.error {
-                object.insert("modelHotReloadError".into(), Value::String(error));
-            }
-        }
-        response
-    }
-}
-
 pub(crate) fn add_subagent_hot_reload_to_response(
     mut response: Value,
     outcome: SubagentHotReloadOutcome,
@@ -76,16 +54,17 @@ pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Valu
     }
     let provider_status = sync_current_third_party_provider_state(state).await?;
     let config = sync_provider_models_for_launch(state, true).await;
-    let restart_required = runtime_config_requires_restart(state, &config).await;
     let model_state = current_model_state_async(&config).await?;
+    let hot_reload = hot_reload_runtime_models(state).await;
+    let restart_required = runtime_config_requires_restart(state, &config).await;
     let public_config = redacted_config(&config);
-    Ok(json!({
+    Ok(hot_reload.add_to_response(json!({
         "status":"ok",
         "config":public_config,
         "providerStatus":provider_status,
         "modelState":model_state,
         "restartRequired":restart_required,
-    }))
+    })))
 }
 
 pub(crate) struct NativeProviderContext {
@@ -268,7 +247,7 @@ pub(crate) async fn sync_native_current_provider_models(
     }
     drop(_config_write_guard);
 
-    let hot_reload = hot_reload_runtime_models(state, &next, &model_state).await;
+    let hot_reload = hot_reload_runtime_models(state).await;
     let subagent_hot_reload = if changed {
         hot_reload_runtime_subagent_config(state, &next).await
     } else {

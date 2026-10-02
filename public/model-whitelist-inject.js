@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "59";
+  const patchVersion = "61";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -78,7 +78,8 @@
   let refreshUntil = 0;
   let refreshRetryDelay = 120;
   let refreshDeliveryInFlight = false;
-  let catalogLoadPromise = null;
+  let catalogRequestGeneration = 0;
+  let catalogLoadRequest = null;
   let catalogRevision = 0;
   let disposed = false;
   const fullReactDiscoveryIntervalMs = 10_000;
@@ -126,6 +127,7 @@
     notifiedClients: 0,
     queryClients: 0,
     queryEntries: 0,
+    pendingQueryEntries: 0,
     reactContainers: 0,
     responsePatchInstalled: false,
   };
@@ -924,16 +926,18 @@
 
   const patchedModelPayload = (value) => {
     if (!catalog.loaded || !value || typeof value !== "object") {
-      return { changed: false, value };
+      return { changed: false, recognized: false, value };
     }
     if (Array.isArray(value)) {
-      const models = patchedModelArray(value);
+      const recognized = modelArrayLooksPatchable(value, true);
+      const models = patchedModelArray(value, true);
       return models
-        ? { changed: true, value: models }
-        : { changed: false, value };
+        ? { changed: true, recognized, value: models }
+        : { changed: false, recognized, value };
     }
 
     let changed = false;
+    let recognized = false;
     const next = { ...value };
     for (const key of ["data", "models"]) {
       const allowEmpty = key === "data"
@@ -943,6 +947,7 @@
           || "default_model" in value
           || "hasModelSupportingMaxReasoningEffort" in value
         );
+      recognized ||= modelArrayLooksPatchable(value[key], allowEmpty);
       const models = patchedModelArray(value[key], allowEmpty);
       if (!models) continue;
       next[key] = models;
@@ -951,6 +956,7 @@
     for (const key of ["result", "message"]) {
       if (!value[key] || typeof value[key] !== "object") continue;
       const nested = patchedModelPayload(value[key]);
+      recognized ||= nested.recognized;
       if (!nested.changed) continue;
       next[key] = nested.value;
       changed = true;
@@ -986,7 +992,7 @@
         changed = true;
       }
     }
-    return { changed, value: changed ? next : value };
+    return { changed, recognized, value: changed ? next : value };
   };
 
   const patchedModelConfig = (config) => {
@@ -1840,114 +1846,116 @@
     return scanReactObjectGraph(runFullScan, discover);
   };
 
+  const currentDelivery = (revision) => !disposed && revision === catalogRevision;
+
+  const readModelQueryEntries = (client) => {
+    const entries = client.getQueriesData({ queryKey: modelQueryKey, exact: false });
+    if (!entries || typeof entries[Symbol.iterator] !== "function") return null;
+    return Array.from(entries).filter((entry) => (
+      Array.isArray(entry)
+      && entry.length >= 2
+      && Array.isArray(entry[0])
+      && modelQueryKey.every((part, index) => entry[0][index] === part)
+    ));
+  };
+
   const patchModelQueryClients = async ({
     forceScan = false,
     discover = false,
     invalidate = false,
   } = {}) => {
+    const revision = catalogRevision;
     const scan = scanReactObjectGraphWhenDue(forceScan, discover);
     let queryEntries = 0;
+    let pendingQueryEntries = 0;
     let changedEntries = 0;
     const invalidations = [];
 
     for (const client of scan.queryClients) {
-      let entries = [];
+      if (!currentDelivery(revision)) break;
+      let entries;
       try {
-        const result = client.getQueriesData({
-          queryKey: modelQueryKey,
-          exact: false,
-        });
-        if (!result || typeof result[Symbol.iterator] !== "function") {
-          knownModelQueryClients.delete(client);
-          continue;
-        }
-        entries = Array.from(result);
+        entries = readModelQueryEntries(client);
       } catch {
+        entries = null;
+      }
+      if (!entries) {
         knownModelQueryClients.delete(client);
         continue;
       }
-      queryEntries += entries.length;
-      for (const entry of entries) {
-        if (!Array.isArray(entry)) continue;
-        const [queryKey, current] = entry;
+      for (const [queryKey, current] of entries) {
+        if (!currentDelivery(revision)) break;
         const patched = patchedModelPayload(current);
         if (!patched.changed) continue;
         try {
           client.setQueryData(queryKey, patched.value);
           changedEntries += 1;
-        } catch {
-          // The response interceptor still patches the next active refetch.
-        }
+        } catch {}
       }
-      if (invalidate) {
+      try {
+        const verified = readModelQueryEntries(client);
+        if (!verified) throw new Error("Model query cache is unavailable");
+        for (const [, current] of verified) {
+          if (current == null) continue;
+          const patched = patchedModelPayload(current);
+          if (patched.recognized && !patched.changed) queryEntries += 1;
+          else pendingQueryEntries += 1;
+        }
+      } catch {
+        pendingQueryEntries += entries.filter(([, current]) => current != null).length;
+      }
+      if (invalidate && currentDelivery(revision)) {
         try {
           invalidations.push(Promise.resolve(client.invalidateQueries({
             queryKey: modelQueryKey,
             exact: false,
             refetchType: "active",
           })));
-        } catch {
-          // A later scheduled pass retries discovery and refresh.
-        }
+        } catch {}
       }
     }
     if (invalidations.length > 0) {
       void Promise.allSettled(invalidations).then(async () => {
-        if (disposed || !catalog.loaded) return;
-        const settledPass = await patchModelQueryClients({
-          forceScan: false,
-          invalidate: false,
-        });
+        if (!currentDelivery(revision)) return;
+        const settledPass = await patchModelQueryClients({ invalidate: false });
+        if (!currentDelivery(revision)) return;
         const notifiedClients = notifyStatsigClients();
         updateDeliveryState({
+          ...settledPass,
           statsigClients: statsigClients().length,
           notifiedClients,
-          queryClients: settledPass.queryClients,
-          queryEntries: settledPass.queryEntries,
-          reactContainers: settledPass.reactContainers,
-        });
-      });
+        }, revision);
+      }).catch((error) => console.warn("[Codey] model query refresh failed", error));
     }
     return {
       queryClients: scan.queryClients.length,
       queryEntries,
+      pendingQueryEntries,
       changedEntries,
       reactContainers: scan.reactContainers,
     };
   };
 
-  const updateDeliveryState = (report) => {
-    if (deliveryState.revision !== catalogRevision) {
+  const updateDeliveryState = (report, revision) => {
+    if (!currentDelivery(revision)) return;
+    if (deliveryState.revision !== revision) {
       deliveryState = {
-        revision: catalogRevision,
+        revision,
         statsigClients: 0,
         notifiedClients: 0,
         queryClients: 0,
         queryEntries: 0,
+        pendingQueryEntries: 0,
         reactContainers: 0,
         responsePatchInstalled: true,
       };
     }
-    deliveryState.statsigClients = Math.max(
-      deliveryState.statsigClients,
-      report.statsigClients || 0,
-    );
-    deliveryState.notifiedClients = Math.max(
-      deliveryState.notifiedClients,
-      report.notifiedClients || 0,
-    );
-    deliveryState.queryClients = Math.max(
-      deliveryState.queryClients,
-      report.queryClients || 0,
-    );
-    deliveryState.queryEntries = Math.max(
-      deliveryState.queryEntries,
-      report.queryEntries || 0,
-    );
-    deliveryState.reactContainers = Math.max(
-      deliveryState.reactContainers,
-      report.reactContainers || 0,
-    );
+    deliveryState.statsigClients = report.statsigClients;
+    deliveryState.notifiedClients = Math.max(deliveryState.notifiedClients, report.notifiedClients);
+    deliveryState.queryClients = report.queryClients;
+    deliveryState.queryEntries = report.queryEntries;
+    deliveryState.pendingQueryEntries = report.pendingQueryEntries;
+    deliveryState.reactContainers = report.reactContainers;
   };
 
   const deliverModelCatalog = async ({
@@ -1955,29 +1963,31 @@
     invalidate = true,
   } = {}) => {
     if (!catalog.loaded || disposed) return false;
+    const revision = catalogRevision;
     const statsigChanged = applyModelWhitelist();
     const firstPass = await patchModelQueryClients({
       forceScan: invalidate,
       discover: discoverQueryClients,
       invalidate,
     });
+    if (!currentDelivery(revision)) return false;
     const shouldNotify = (
       invalidate
       || statsigChanged
+      || deliveryState.notifiedClients === 0
       || firstPass.changedEntries > 0
       || firstPass.reactContainers > 0
     );
-    const firstNotifications = shouldNotify ? notifyStatsigClients() : 0;
-    const secondPass = invalidate
-      ? await patchModelQueryClients({ forceScan: false, invalidate: false })
+    const notifiedClients = shouldNotify ? notifyStatsigClients() : 0;
+    const finalPass = invalidate
+      ? await patchModelQueryClients({ invalidate: false })
       : firstPass;
+    if (!currentDelivery(revision)) return false;
     updateDeliveryState({
+      ...finalPass,
       statsigClients: statsigClients().length,
-      notifiedClients: firstNotifications,
-      queryClients: Math.max(firstPass.queryClients, secondPass.queryClients),
-      queryEntries: Math.max(firstPass.queryEntries, secondPass.queryEntries),
-      reactContainers: firstPass.reactContainers + secondPass.reactContainers,
-    });
+      notifiedClients,
+    }, revision);
     scheduleGroupedModelMenuEnhancement();
     refreshSubagentModelLabels();
     refreshModelPickerTriggers();
@@ -2028,64 +2038,65 @@
     refreshTimer = window.setTimeout(tick, 0);
   };
 
+  const applyModelCatalog = async (nextCatalog) => {
+    if (disposed) return false;
+    const changed = !sameCatalog(catalog, nextCatalog);
+    if (changed) {
+      rememberSupersededModelMenuItems(catalog, nextCatalog);
+      rememberSupersededDefaultRoute(catalog, nextCatalog);
+      catalogRevision += 1;
+      catalog = nextCatalog;
+    }
+    const revision = catalogRevision;
+    try {
+      return await deliverModelCatalog({
+        discoverQueryClients: !changed,
+        invalidate: changed,
+      });
+    } finally {
+      if (currentDelivery(revision)) scheduleRefresh(changed ? 5000 : 1000);
+    }
+  };
+
   const loadModelCatalog = () => {
-    if (catalogLoadPromise) return catalogLoadPromise;
-    const requestedRevision = catalogRevision;
-    catalogLoadPromise = (async () => {
-      if (disposed || typeof window.__codexSessionDeleteBridge !== "function") {
+    if (disposed) return Promise.resolve(false);
+    if (catalogLoadRequest?.generation === catalogRequestGeneration) {
+      return catalogLoadRequest.promise;
+    }
+    const request = { generation: catalogRequestGeneration, promise: null };
+    catalogLoadRequest = request;
+    request.promise = (async () => {
+      if (typeof window.__codexSessionDeleteBridge !== "function") {
         scheduleRefresh();
         return false;
       }
       try {
         const result = await window.__codexSessionDeleteBridge(modelCatalogPath, {});
+        if (disposed || request.generation !== catalogRequestGeneration) return false;
         const nextCatalog = normalizedCatalog(result);
         if (!nextCatalog) {
           if (!catalog.loaded) scheduleRefresh();
           return false;
         }
-        if (requestedRevision !== catalogRevision) return false;
-        const unchanged = sameCatalog(catalog, nextCatalog);
-        if (unchanged) {
-          // Window-focus reloads land here when nothing changed upstream:
-          // skip the invalidating re-delivery (full client scan plus query
-          // invalidation) and keep only a short non-invalidating window.
-          scheduleRefresh(1000);
-          return true;
-        }
-        rememberSupersededModelMenuItems(catalog, nextCatalog);
-        rememberSupersededDefaultRoute(catalog, nextCatalog);
-        catalogRevision += 1;
-        catalog = nextCatalog;
-        await deliverModelCatalog();
-        scheduleRefresh();
-        return true;
+        return await applyModelCatalog(nextCatalog);
       } catch (error) {
+        if (disposed || request.generation !== catalogRequestGeneration) return false;
         console.warn("[Codey] model whitelist refresh failed", error);
-        if (!catalog.loaded) scheduleRefresh();
+        scheduleRefresh();
         return false;
       }
     })().finally(() => {
-      catalogLoadPromise = null;
+      if (catalogLoadRequest === request) catalogLoadRequest = null;
     });
-    return catalogLoadPromise;
+    return request.promise;
   };
 
   const setModelCatalog = (value) => {
     if (disposed) return false;
     const nextCatalog = normalizedCatalog(value);
     if (!nextCatalog) return false;
-    if (sameCatalog(catalog, nextCatalog)) {
-      scheduleRefresh(1000);
-      return Promise.resolve(true);
-    }
-    rememberSupersededModelMenuItems(catalog, nextCatalog);
-    rememberSupersededDefaultRoute(catalog, nextCatalog);
-    catalogRevision += 1;
-    catalog = nextCatalog;
-    return deliverModelCatalog().then((delivered) => {
-      scheduleRefresh();
-      return delivered;
-    });
+    catalogRequestGeneration += 1;
+    return applyModelCatalog(nextCatalog);
   };
 
   const routeForModel = (modelName) => {

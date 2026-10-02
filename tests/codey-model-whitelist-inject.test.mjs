@@ -693,7 +693,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "59");
+  assert.equal(patch.version, "61");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -722,6 +722,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
     notifiedClients: 1,
     queryClients: 1,
     queryEntries: 1,
+    pendingQueryEntries: 0,
     reactContainers: 0,
     responsePatchInstalled: true,
   });
@@ -4069,6 +4070,201 @@ test("a stale bridge response cannot overwrite a backend-pushed catalog", async 
     models: ["provider-current"],
     defaultModel: "provider-current",
   });
+  runtime.patch.dispose();
+});
+
+test("an unchanged backend push supersedes an in-flight catalog refresh", async () => {
+  const currentCatalog = {
+    status: "ok",
+    models: ["provider-current"],
+    default_model: "provider-current",
+  };
+  let catalogResponse = currentCatalog;
+  const queryClient = activeModelQueryClient(["provider-current"]);
+  const runtime = await loadPatch(() => catalogResponse, [statsigClient()], { queryClient });
+  let resolveCatalog;
+  catalogResponse = new Promise((resolve) => { resolveCatalog = resolve; });
+  const staleRefresh = runtime.patch.refresh();
+  const deliveryBeforePush = runtime.patch.delivery();
+  const scansBeforePush = runtime.wildcardScanCount();
+
+  assert.equal(await runtime.patch.setCatalog(currentCatalog), true);
+  resolveCatalog({
+    status: "ok",
+    models: ["provider-stale"],
+    default_model: "provider-stale",
+  });
+  await staleRefresh;
+
+  assert.deepEqual(runtime.patch.snapshot(), {
+    loaded: true,
+    models: ["provider-current"],
+    defaultModel: "provider-current",
+  });
+  assert.deepEqual(queryClient.models(), ["provider-current"]);
+  assert.equal(runtime.patch.delivery().revision, deliveryBeforePush.revision);
+  assert.equal(runtime.wildcardScanCount(), scansBeforePush);
+
+  catalogResponse = {
+    status: "ok",
+    models: ["provider-newer"],
+    default_model: "provider-newer",
+  };
+  assert.equal(await runtime.patch.refresh(), true);
+  assert.deepEqual(queryClient.models(), ["provider-newer"]);
+  runtime.patch.dispose();
+});
+
+test("superseded catalog loads neither block nor clear a newer refresh", async () => {
+  const current = { status: "ok", models: ["current"], default_model: "current" };
+  let response = current;
+  let requests = 0;
+  const runtime = await loadPatch(() => { requests += 1; return response; }, [statsigClient()]);
+  let resolveStale;
+  response = new Promise((resolve) => { resolveStale = resolve; });
+  const stale = runtime.patch.refresh();
+  await runtime.patch.setCatalog(current);
+  let resolveLatest;
+  response = new Promise((resolve) => { resolveLatest = resolve; });
+  const latest = runtime.patch.refresh();
+  assert.equal(requests, 3);
+  assert.notEqual(latest, stale);
+
+  resolveStale({ status: "ok", models: ["stale"], default_model: "stale" });
+  assert.equal(await stale, false);
+  assert.equal(runtime.patch.refresh(), latest);
+  assert.equal(requests, 3);
+  resolveLatest({ status: "ok", models: ["latest"], default_model: "latest" });
+  assert.equal(await latest, true);
+  assert.deepEqual(runtime.patch.snapshot().models, ["latest"]);
+  runtime.patch.dispose();
+});
+
+test("an unchanged catalog immediately repairs a stale picker without rescanning the document", async () => {
+  const catalog = { status: "ok", models: ["current"], default_model: "current" };
+  const queryClient = activeModelQueryClient(["current"]);
+  const runtime = await loadPatch(catalog, [statsigClient()], { queryClient });
+  const [[queryKey]] = queryClient.getQueriesData({ queryKey: ["models", "list"] });
+  queryClient.setQueryData(queryKey, { data: [modelDescriptor("stale")], nextCursor: null });
+  const scans = runtime.wildcardScanCount();
+  const invalidations = queryClient.invalidations;
+
+  assert.equal(await runtime.patch.setCatalog(catalog), true);
+  assert.deepEqual(queryClient.models(), ["current"]);
+  assert.equal(runtime.wildcardScanCount(), scans);
+  assert.equal(queryClient.invalidations, invalidations);
+  assert.equal(runtime.patch.delivery().pendingQueryEntries, 0);
+  runtime.patch.dispose();
+});
+
+test("a disposed patch cannot accept a late catalog response", async () => {
+  let response = { status: "ok", models: ["current"], default_model: "current" };
+  const client = statsigClient();
+  const queryClient = activeModelQueryClient(["current"]);
+  const runtime = await loadPatch(() => response, [client], { queryClient });
+  let resolveLate;
+  response = new Promise((resolve) => { resolveLate = resolve; });
+  const pending = runtime.patch.refresh();
+  const snapshot = runtime.patch.snapshot();
+  runtime.patch.dispose();
+  const notifications = client.events.length;
+
+  resolveLate({ status: "ok", models: ["late"], default_model: "late" });
+  assert.equal(await pending, false);
+  assert.equal(await runtime.patch.refresh(), false);
+  assert.deepEqual(runtime.patch.snapshot(), snapshot);
+  assert.deepEqual(queryClient.models(), ["current"]);
+  assert.equal(client.events.length, notifications);
+});
+
+test("superseded catalog deliveries cannot publish another revision's acknowledgements", async () => {
+  const queryClient = activeModelQueryClient(["initial"]);
+  const runtime = await loadPatch({ status: "ok", models: ["initial"] }, [statsigClient()], { queryClient });
+  const stale = runtime.patch.setCatalog({ status: "ok", models: ["stale"] });
+  const latest = runtime.patch.setCatalog({ status: "ok", models: ["latest"] });
+
+  assert.equal(await stale, false);
+  assert.equal(await latest, true);
+  assert.deepEqual(queryClient.models(), ["latest"]);
+  assert.equal(runtime.patch.delivery().revision, 3);
+  assert.equal(runtime.patch.delivery().queryEntries, 1);
+  assert.equal(runtime.patch.delivery().pendingQueryEntries, 0);
+  runtime.patch.dispose();
+});
+
+test("disposing a patch during delivery prevents later notifications", async () => {
+  const client = statsigClient();
+  const runtime = await loadPatch({ status: "ok", models: ["initial"] }, [client]);
+  const pending = runtime.patch.setCatalog({ status: "ok", models: ["new"] });
+  runtime.patch.dispose();
+  const notifications = client.events.length;
+  assert.equal(await pending, false);
+  assert.equal(client.events.length, notifications);
+});
+
+async function verifyRendererDelivery(patch, catalog) {
+  const source = await readFile(new URL("../backend/src/cdp.rs", import.meta.url), "utf8");
+  const functionSource = source.slice(source.indexOf("fn model_whitelist_refresh_script("));
+  const template = functionSource.match(/r#"([\s\S]*?)"#/)[1];
+  const script = template.replaceAll("{{", "{").replaceAll("}}", "}")
+    .replace("{expected_catalog}", JSON.stringify(catalog));
+  const report = await Function("window", `return ${script}`)({
+    __codeyModelWhitelistPatch: patch,
+    setTimeout(callback) { callback(); },
+  });
+  return JSON.parse(report);
+}
+
+test("CDP requires every existing model cache to acknowledge the catalog", async () => {
+  const catalog = { status: "ok", models: ["current"], default_model: "current" };
+  const failingClient = activeModelQueryClient(["stale"]);
+  const goodClient = activeModelQueryClient(["stale"]);
+  const write = failingClient.setQueryData;
+  let writable = false;
+  failingClient.setQueryData = (...args) => { if (writable) return write(...args); };
+  const runtime = await loadPatch(catalog, [statsigClient()], {
+    queryClient: failingClient, reactModelState: { goodClient },
+  });
+
+  const failed = await verifyRendererDelivery(runtime.patch, catalog);
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /查询缓存尚未更新/);
+  assert.equal(failed.delivery.queryEntries, 1);
+  assert.equal(failed.delivery.pendingQueryEntries, 1);
+  assert.deepEqual(failingClient.models(), ["stale"]);
+
+  writable = true;
+  const repaired = await verifyRendererDelivery(runtime.patch, catalog);
+  assert.equal(repaired.ok, true);
+  assert.equal(repaired.delivered, "active");
+  assert.equal(repaired.delivery.queryEntries, 2);
+  assert.equal(repaired.delivery.pendingQueryEntries, 0);
+  assert.deepEqual(failingClient.models(), ["current"]);
+  runtime.patch.dispose();
+});
+
+test("CDP accepts a cold picker as deferred rather than requiring a restart", async () => {
+  const catalog = { status: "ok", models: ["current"], default_model: "current" };
+  const runtime = await loadPatch(catalog, [statsigClient()]);
+  const report = await verifyRendererDelivery(runtime.patch, catalog);
+  assert.equal(report.ok, true);
+  assert.equal(report.delivered, "deferred");
+  assert.equal(report.delivery.pendingQueryEntries, 0);
+  runtime.patch.dispose();
+});
+
+test("an empty model-array query receives newly added route models", async () => {
+  let models = [];
+  const queryKey = ["models", "list", "local"];
+  const queryClient = {
+    getQueriesData() { return [[queryKey, models]]; },
+    setQueryData(_queryKey, next) { models = next; },
+    async invalidateQueries() {},
+  };
+  const runtime = await loadPatch({ status: "ok", models: ["current"] }, [statsigClient()], { queryClient });
+  assert.deepEqual(models.map((model) => model.model), ["current"]);
+  assert.equal(runtime.patch.delivery().queryEntries, 1);
+  assert.equal(runtime.patch.delivery().pendingQueryEntries, 0);
   runtime.patch.dispose();
 });
 

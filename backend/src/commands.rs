@@ -34,15 +34,16 @@ pub(crate) use models::native_subagent_model_state;
 #[cfg(test)]
 use models::{
     config_with_current_provider_models, config_with_launch_pinned_transport,
-    preserve_selected_third_party_models, preserve_selected_third_party_models_except,
-    provider_route_requires_restart, renderer_model_catalog_value, should_refresh_model_catalog,
+    model_catalog_config_for_runtime, preserve_selected_third_party_models,
+    preserve_selected_third_party_models_except, provider_route_requires_restart,
+    renderer_model_catalog_value, should_refresh_model_catalog,
     startup_model_sync_models_or_fallback, sync_provider_state_with,
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state_async, current_provider_status_async, current_renderer_model_catalog_async,
-    hot_reload_runtime_models, native_web_search_capability_requires_restart,
-    official_route_snapshots_for_runtime, reconcile_subagent_models_for_mode,
+    current_model_state_async, current_provider_status_async, hot_reload_runtime_models,
+    native_web_search_capability_requires_restart, official_route_snapshots_for_runtime,
+    reconcile_subagent_models_for_mode, runtime_renderer_model_catalog,
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
     sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
@@ -411,32 +412,9 @@ impl AppState {
                 serde_json::to_value(redacted_config(&config))
                     .expect("CodeyConfig must be JSON-serializable")
             }
-            "/codex-model-catalog" => {
-                let runtime = self.runtime.lock().await.clone();
-                let applied_catalog_config = match runtime.as_ref() {
-                    Some(runtime) => Some(runtime.applied_model_catalog_config().await),
-                    None => None,
-                };
-                let catalog_config = {
-                    let config = self.config.read().await;
-                    let current_config = runtime
-                        .as_ref()
-                        .filter(|runtime| {
-                            runtime.validate_subagent_route_hot_reload(&config).is_err()
-                        })
-                        .and(applied_catalog_config.as_ref())
-                        .unwrap_or(&config);
-                    model_catalog_config_for_runtime(
-                        current_config,
-                        runtime.as_ref().map(|runtime| &runtime.applied_config),
-                        applied_catalog_config.as_ref(),
-                    )
-                    .clone()
-                };
-                current_renderer_model_catalog_async(catalog_config)
-                    .await
-                    .unwrap_or_else(api_error_message)
-            }
+            "/codex-model-catalog" => runtime_renderer_model_catalog(self)
+                .await
+                .unwrap_or_else(api_error_message),
             "/backend/status" => {
                 let mut value = runtime_status(self).await.unwrap_or_else(api_error_message);
                 if let Some(object) = value.as_object_mut() {
@@ -2072,20 +2050,10 @@ fn schedule_plugin_route_hot_reload(state: &Arc<AppState>) {
     let state = Arc::clone(state);
     runtime.spawn(async move {
         let _serial = state.plugin_route_reload_lock.lock().await;
-        let config = state.config.read().await.clone();
-        let model_state = match current_model_state_async(&config).await {
-            Ok(model_state) => model_state,
-            Err(error) => {
-                record_plugin_route_hot_reload_failure(error);
-                return;
-            }
-        };
-        if let Some(error) = hot_reload_runtime_models(&state, &config, &model_state)
-            .await
-            .error
-        {
+        if let Some(error) = hot_reload_runtime_models(&state).await.error {
             record_plugin_route_hot_reload_failure(error);
         }
+        let config = state.config.read().await.clone();
         if config.subagent_optimization {
             let outcome = hot_reload_runtime_subagent_config(&state, &config).await;
             if outcome.requires_restart()
@@ -2258,7 +2226,7 @@ async fn finish_codey_config_save(
     }
     schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
     let model_state = current_model_state_async(&saved.config).await?;
-    let model_hot_reload = hot_reload_runtime_models(state, &saved.config, &model_state).await;
+    let model_hot_reload = hot_reload_runtime_models(state).await;
     let route_request_log_hot_reload = hot_reload_runtime_request_log(state, &saved.config).await;
     let subagent_hot_reload = if saved.reconcile_subagent_config {
         hot_reload_runtime_subagent_config(state, &saved.config).await
@@ -3055,18 +3023,6 @@ pub(super) fn provider_route_restart_required_for_runtime(
             != official_route_snapshots_for_runtime(current)
         || websocket_transport_requires_restart(applied, current)
         || native_web_search_capability_requires_restart(applied, current)
-}
-
-fn model_catalog_config_for_runtime<'a>(
-    current: &'a CodeyConfig,
-    runtime_applied: Option<&'a CodeyConfig>,
-    applied_catalog: Option<&'a CodeyConfig>,
-) -> &'a CodeyConfig {
-    runtime_applied
-        .filter(|applied| !runtime_supports_current_routes_for_hot_reload(applied, current))
-        // 待重启的能力变更保留最近已生效的模型，不能退回启动时的旧目录。
-        .map(|applied| applied_catalog.unwrap_or(applied))
-        .unwrap_or(current)
 }
 
 async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyConfig) -> bool {
