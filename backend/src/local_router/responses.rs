@@ -1257,10 +1257,15 @@ impl RouterServer {
                             serde_json::json!({ "requestId": request_id }),
                         );
                         if !downstream.terminal_started {
+                            let timeout = is_upstream_timeout_error(&error);
                             downstream
                                 .write_error(
-                                    502,
-                                    "websocket_proxy_failed",
+                                    if timeout { 504 } else { 502 },
+                                    if timeout {
+                                        "upstream_timeout"
+                                    } else {
+                                        "websocket_proxy_failed"
+                                    },
                                     format!("Codey 本地路由处理请求失败；请求 ID：{request_id}"),
                                     None,
                                 )
@@ -1466,6 +1471,11 @@ impl RouterServer {
     where
         D: ResponsesDownstream + ?Sized,
     {
+        downstream.set_streaming_errors(
+            request_kind == ResponsesRequestKind::Create
+                && !is_compaction_request(&body, request_kind)
+                && body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        );
         let probe = self.request_log.begin(|producer| {
             let request_id = current_router_request_id().unwrap_or_default();
             let (codex_session_id, codex_session_is_parent) = request_log_codex_session(&request);
@@ -2013,6 +2023,7 @@ impl RouterServer {
             && !resolved.route.official_account
             && chat_reasoning_summaries.iter().any(Option::is_some))
         .then_some(chat_reasoning_summaries);
+        let (result, stream_failure) = CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
         let result: Result<()> = async {
         let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
@@ -2274,6 +2285,7 @@ impl RouterServer {
         };
         let mut upstream_status = response.status().as_u16();
         let mut upstream_request_id = upstream_request_id_from_headers(response.headers());
+        let mut retry_advice = ResponseRetryAdvice::from_headers(response.headers());
         if let Some(probe) = downstream.request_log_probe() {
             probe.set_upstream_response_headers(&format_upstream_response_headers(
                 response.headers(),
@@ -2368,6 +2380,7 @@ impl RouterServer {
                 };
                 upstream_status = retried.status().as_u16();
                 upstream_request_id = upstream_request_id_from_headers(retried.headers());
+                retry_advice = ResponseRetryAdvice::from_headers(retried.headers());
                 if let Some(probe) = downstream.request_log_probe() {
                     probe.set_upstream_response_headers(&format_upstream_response_headers(
                         retried.headers(),
@@ -2391,6 +2404,7 @@ impl RouterServer {
                 downstream,
                 upstream_status,
                 upstream_request_id.as_deref(),
+                retry_advice,
                 preloaded_error_body.as_deref().unwrap_or_default(),
                 &resolved,
                 bridge,
@@ -2399,8 +2413,6 @@ impl RouterServer {
             .await;
         };
         let result = match bridge {
-            // Every upstream protocol surfaces its real HTTP status. Mapping
-            // Anthropic 4xx to 502 made Codex retry non-retryable failures.
             _ if !response.status().is_success() => {
                 let probe = downstream.request_log_probe().cloned();
                 let deadline = upstream_response_body_deadline();
@@ -2417,6 +2429,7 @@ impl RouterServer {
                             downstream,
                             upstream_status,
                             upstream_request_id.as_deref(),
+                            retry_advice,
                             &body,
                             &resolved,
                             bridge,
@@ -2481,8 +2494,8 @@ impl RouterServer {
                 .unwrap_or_else(|| "上游响应未能完成".to_string());
             return downstream
                 .write_error(
-                    502,
-                    "upstream_response_failed",
+                    if is_upstream_timeout_error(error) { 504 } else { 502 },
+                    if is_upstream_timeout_error(error) { "upstream_timeout" } else { "upstream_response_failed" },
                     format!(
                         "Codey 线路「{}」处理上游 HTTP 响应失败：{detail}",
                         route_display_name(&resolved.route)
@@ -2493,6 +2506,12 @@ impl RouterServer {
         }
         result
         }.await;
+        (result, CURRENT_LIFECYCLE_FAILURE.with(|failure| failure.borrow_mut().take()))
+        }).await;
+        if let Some((status, code)) = stream_failure {
+            observed.status = Some(status);
+            observed.error = Some(code);
+        }
         let result = match result {
             Err(error) if error.is::<crate::codey_plugins::lifecycle::LifecycleError>() => {
                 let error = error
@@ -2596,11 +2615,6 @@ impl RouterServer {
                         ),
                     )
                 };
-                // Codex currently reduces JSON bodies from locally generated
-                // gateway failures to "Unknown error". A concise text body is
-                // preserved in its surfaced `unexpected status` message. A
-                // transport setup failure uses non-retryable 424 so Codex does
-                // not repeat the same deterministic failure four more times.
                 downstream.write_text_error(status, code, message).await?;
                 return Ok(None);
             }

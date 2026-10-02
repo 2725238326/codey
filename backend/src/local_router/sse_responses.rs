@@ -580,11 +580,27 @@ impl<'a> ResponsesSseState<'a> {
         downstream.finish_event_stream().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn fail<D>(
         &mut self,
         downstream: &mut D,
         code: &str,
         message: &str,
+    ) -> Result<()>
+    where
+        D: ResponsesDownstream + ?Sized,
+    {
+        self.fail_with_error(
+            downstream,
+            json!({"type":"codey_route_error","code":code,"message":message}),
+        )
+        .await
+    }
+
+    pub(crate) async fn fail_with_error<D>(
+        &mut self,
+        downstream: &mut D,
+        error: Value,
     ) -> Result<()>
     where
         D: ResponsesDownstream + ?Sized,
@@ -603,11 +619,7 @@ impl<'a> ResponsesSseState<'a> {
                     "status":"failed",
                     "model":self.model,
                     "output":[],
-                    "error":{
-                        "type":"codey_route_error",
-                        "code":code,
-                        "message":message,
-                    },
+                    "error":error,
                     "incomplete_details":Value::Null,
                 }
             }))

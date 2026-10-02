@@ -116,84 +116,6 @@ impl XaiResponseFix {
     }
 }
 
-pub(crate) struct XaiSseRewriter<'a> {
-    fix: &'a XaiResponseFix,
-    buffer: Vec<u8>,
-    cursor: SseCursor,
-}
-
-impl<'a> XaiSseRewriter<'a> {
-    pub(crate) fn new(fix: &'a XaiResponseFix) -> Self {
-        Self {
-            fix,
-            buffer: Vec::new(),
-            cursor: SseCursor::default(),
-        }
-    }
-
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>> {
-        self.buffer.extend_from_slice(chunk);
-        if self.buffer.len() > MAX_UPSTREAM_RESPONSE_BYTES {
-            anyhow::bail!("Responses SSE 单帧超过上限");
-        }
-        let mut output = Vec::new();
-        while let Some(frame) = take_next_sse_frame(&self.buffer, &mut self.cursor) {
-            output.extend(rewrite_sse_frame(frame, self.fix));
-        }
-        compact_sse_buffer(&mut self.buffer, &mut self.cursor);
-        Ok(output)
-    }
-
-    pub(crate) fn finish(&mut self) -> Vec<u8> {
-        let tail = self.buffer[self.cursor.consumed..].to_vec();
-        self.buffer.clear();
-        self.cursor = SseCursor::default();
-        if tail.iter().all(u8::is_ascii_whitespace) {
-            return Vec::new();
-        }
-        rewrite_sse_frame(&tail, self.fix)
-    }
-}
-
-fn rewrite_sse_frame(frame: &[u8], fix: &XaiResponseFix) -> Vec<u8> {
-    let passthrough = || {
-        let mut output = frame.to_vec();
-        output.extend_from_slice(b"\n\n");
-        output
-    };
-    let Ok(Some(data)) = sse_frame_data(frame) else {
-        return passthrough();
-    };
-    if data.trim() == "[DONE]" {
-        return passthrough();
-    }
-    let Ok(mut event) = serde_json::from_str::<Value>(&data) else {
-        return passthrough();
-    };
-    if !fix.apply(&mut event) {
-        return passthrough();
-    }
-    let Ok(text) = std::str::from_utf8(frame) else {
-        return passthrough();
-    };
-    let Ok(json) = serde_json::to_string(&event) else {
-        return passthrough();
-    };
-    let mut output = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() || line.starts_with("data:") {
-            continue;
-        }
-        output.extend_from_slice(line.as_bytes());
-        output.push(b'\n');
-    }
-    output.extend_from_slice(b"data: ");
-    output.extend_from_slice(json.as_bytes());
-    output.extend_from_slice(b"\n\n");
-    output
-}
-
 fn promote_additional_tools(body: &mut Value) -> bool {
     let Some(input) = body.get("input").and_then(Value::as_array) else {
         return false;
@@ -1129,7 +1051,7 @@ mod tests {
         let frame = format!(
             "event: response.output_item.done\ndata: {{\"type\":\"function_call\",\"name\":{flat:?},\"arguments\":\"{{\\\"n\\\":1.0}}\"}}\n\n"
         );
-        let mut rewriter = XaiSseRewriter::new(&prepared.response);
+        let mut rewriter = ResponsesSseRewriter::new(Some(&prepared.response), true, None);
         let split = frame.len() / 2;
         assert!(
             rewriter

@@ -635,8 +635,10 @@ mod tests {
         );
         upstream.await.unwrap();
         client.send(WebSocketMessage::Text(json!({"type":"response.create","model":model,"previous_response_id":"resp-missing","input":[{"type":"compaction_trigger"}]}).to_string().into())).await.unwrap();
+        let failure = terminal(&mut client).await;
+        assert_eq!(failure["response"]["error"]["code"], "invalid_prompt");
         assert_eq!(
-            terminal(&mut client).await["response"]["error"]["code"],
+            failure["response"]["error"]["codey"]["errorCode"],
             "context_not_recoverable"
         );
         client.close(None).await.unwrap();
@@ -655,9 +657,10 @@ mod tests {
             client.send(WebSocketMessage::Text(json!({"type":"response.create","model":model_alias(&provider, &model),"previous_response_id":"resp-from-another-socket","input":[result(custom, "missing-call")]}).to_string().into())).await.unwrap();
             let error = terminal(&mut client).await;
             assert_eq!(
-                error["response"]["error"]["code"],
+                error["response"]["error"]["codey"]["errorCode"],
                 "context_not_recoverable"
             );
+            assert_eq!(error["response"]["error"]["code"], "invalid_prompt");
         }
         assert!(
             tokio::time::timeout(Duration::from_millis(100), listener.accept())

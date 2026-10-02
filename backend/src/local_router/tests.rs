@@ -7166,7 +7166,7 @@ fn websocket_failure_event_keeps_provider_codes_and_adds_route_context() {
 }
 
 #[tokio::test]
-async fn native_responses_upstream_http_error_is_preserved_as_safe_text() {
+async fn native_responses_stream_error_preserves_status_and_safe_details() {
     let logs = tempfile::tempdir().unwrap();
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
@@ -7217,7 +7217,7 @@ async fn native_responses_upstream_http_error_is_preserved_as_safe_text() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert!(
         response
             .headers()
@@ -7225,7 +7225,7 @@ async fn native_responses_upstream_http_error_is_preserved_as_safe_text() {
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("text/plain")
+            .starts_with("text/event-stream")
     );
     let body = response.text().await.unwrap();
     assert!(body.contains("线路「Relay」"));
@@ -7235,6 +7235,12 @@ async fn native_responses_upstream_http_error_is_preserved_as_safe_text() {
     assert!(body.contains("image_too_large"));
     assert!(body.contains("上游请求 ID：upstream-request-123"));
     assert!(!body.contains("sk-upstream"));
+    let events = parse_responses_websocket_sse_events(&body).unwrap();
+    assert_eq!(
+        events[0]["response"]["error"]["code"],
+        "rate_limit_exceeded"
+    );
+    assert_eq!(events[0]["response"]["error"]["codey"]["httpStatus"], 429);
     assert_eq!(upstream_task.await.unwrap(), "/v1/responses");
     router.stop().await.unwrap();
     let page = crate::route_request_log::query_route_request_logs(
@@ -7248,6 +7254,9 @@ async fn native_responses_upstream_http_error_is_preserved_as_safe_text() {
         page.items[0].upstream_error_summary.as_deref(),
         Some(expected.as_str())
     );
+    assert_eq!(page.items[0].status_code, Some(429));
+    assert_eq!(page.items[0].upstream_status_code, Some(429));
+    assert_eq!(page.items[0].status, "failed");
 }
 
 #[tokio::test]
@@ -7737,9 +7746,11 @@ async fn streaming_header_timeout_still_bounds_the_wait_after_upload() {
         .await
         .expect("uploaded requests must still hit the header timeout")
         .unwrap();
-    assert_eq!(response.status().as_u16(), 504);
+    assert_eq!(response.status().as_u16(), 200);
     let body = response.text().await.unwrap();
     assert!(body.contains("upstream_header_timeout"), "{body}");
+    let events = parse_responses_websocket_sse_events(&body).unwrap();
+    assert_eq!(events[0]["response"]["error"]["codey"]["httpStatus"], 504);
     upstream_task.abort();
     router.stop().await.unwrap();
 }
@@ -8726,7 +8737,7 @@ async fn adapted_stream_failures_keep_redacted_diagnostics_in_request_logs() {
         assert!(summary.chars().count() <= 4097);
         match case {
             "provider_error" => {
-                assert!(summary.contains("Chat Completions 流返回错误"));
+                assert!(summary.contains("上游流返回错误"));
                 assert!(summary.contains("***"));
                 assert!(summary.ends_with('…'));
             }
@@ -10881,7 +10892,7 @@ fn upstream_authority_omits_credentials_paths_and_queries() {
 }
 
 #[tokio::test]
-async fn transport_error_response_is_plain_text_and_non_retryable() {
+async fn non_stream_transport_error_response_preserves_http_status_and_text() {
     let (mut reader, mut writer) = tokio::io::duplex(4096);
 
     write_text_error_response(
@@ -11549,7 +11560,7 @@ async fn request_body_read_reserves_declared_length_once() {
 }
 
 #[tokio::test]
-async fn anthropic_upstream_http_error_keeps_status_and_safe_text() {
+async fn anthropic_stream_authentication_error_is_terminal_and_preserves_details() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
     let upstream_task = tokio::spawn(async move {
@@ -11587,8 +11598,7 @@ async fn anthropic_upstream_http_error_keeps_status_and_safe_text() {
         .await
         .unwrap();
 
-    // The real upstream status reaches Codex instead of a retryable 502.
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert!(
         response
             .headers()
@@ -11596,7 +11606,7 @@ async fn anthropic_upstream_http_error_keeps_status_and_safe_text() {
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("text/plain")
+            .starts_with("text/event-stream")
     );
     let body = response.text().await.unwrap();
     assert!(body.contains("线路「Relay」"), "{body}");
@@ -11605,6 +11615,9 @@ async fn anthropic_upstream_http_error_keeps_status_and_safe_text() {
     assert!(body.contains("invalid x-api-key ***"), "{body}");
     assert!(body.contains("上游请求 ID：req_anthropic_1"), "{body}");
     assert!(!body.contains("sk-upstream"), "{body}");
+    let events = parse_responses_websocket_sse_events(&body).unwrap();
+    assert_eq!(events[0]["response"]["error"]["code"], "invalid_prompt");
+    assert_eq!(events[0]["response"]["error"]["codey"]["httpStatus"], 401);
     assert_eq!(upstream_task.await.unwrap(), "/v1/messages");
     router.stop().await.unwrap();
 }

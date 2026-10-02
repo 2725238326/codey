@@ -225,21 +225,13 @@ impl AnthropicSseAccumulator {
     }
 
     pub(crate) fn ingest(&mut self, event: &Value) -> Result<()> {
-        check_context_length_error(event)?;
+        check_upstream_stream_failure(event)?;
         let event_type = event
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Anthropic SSE 事件缺少 type"))?;
         match event_type {
             "ping" => {}
-            "error" => {
-                let detail = event
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("未知错误");
-                anyhow::bail!("Anthropic SSE 返回错误：{detail}");
-            }
             "message_start" => {
                 let message = event
                     .get("message")
@@ -478,6 +470,7 @@ where
     D: ResponsesDownstream + ?Sized,
 {
     let mut output = ResponsesSseState::new(model, tool_bridge);
+    let retry_advice = prepared.retry_advice.clone();
     prepared.retained.get_or_insert_with(Default::default);
     output.start(downstream).await?;
     let mut accumulator = AnthropicSseAccumulator::for_streaming(model);
@@ -556,8 +549,13 @@ where
             return Err(error);
         }
         observe_upstream_stream_error(request_log_probe.as_ref(), &error, route);
-        let (code, message) = streaming_failure_message(&error, route);
-        let _ = output.fail(downstream, code, &message).await;
+        let failure = streaming_response_failure(&error, route, retry_advice);
+        let _ = output
+            .fail_with_error(
+                downstream,
+                failure.normalized_event()["response"]["error"].clone(),
+            )
+            .await;
         return Err(error);
     }
     Ok(())
@@ -571,6 +569,7 @@ pub(crate) async fn emit_anthropic_stream_event<D>(
 where
     D: ResponsesDownstream + ?Sized,
 {
+    check_upstream_stream_failure(event)?;
     let event_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -623,7 +622,6 @@ where
             }
         }
         "ping" | "content_block_stop" | "message_delta" | "message_stop" => {}
-        "error" => anyhow::bail!("Anthropic SSE 返回错误"),
         other => anyhow::bail!("不支持的 Anthropic SSE 事件类型 {other}"),
     }
     output.write_events(downstream, events).await
@@ -689,6 +687,14 @@ pub(crate) fn streaming_failure_message(
             "upstream_idle_timeout",
             format!(
                 "线路「{}」的上游流长时间没有返回新数据",
+                route_display_name(route)
+            ),
+        )
+    } else if is_upstream_timeout_error(error) {
+        (
+            "upstream_timeout",
+            format!(
+                "线路「{}」的上游响应超过等待期限",
                 route_display_name(route)
             ),
         )

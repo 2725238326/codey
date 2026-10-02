@@ -8,6 +8,42 @@ use http_body::{Body as HttpBody, Frame};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+tokio::task_local! {
+    pub(super) static CURRENT_LIFECYCLE_FAILURE: std::cell::RefCell<Option<(u16, String)>>;
+}
+
+pub(super) fn observe_lifecycle_response_failure(event: &Value) {
+    if !responses_event_is_failure(event) {
+        return;
+    }
+    let error = event
+        .pointer("/response/error")
+        .or_else(|| event.get("error"))
+        .unwrap_or(event);
+    let status = error
+        .pointer("/codey/httpStatus")
+        .or_else(|| error.get("status"))
+        .or_else(|| event.get("status"))
+        .and_then(Value::as_u64)
+        .filter(|status| (400..600).contains(status))
+        .unwrap_or(502) as u16;
+    let code = first_string_at(
+        error,
+        &[
+            "/codey/errorCode",
+            "/codey/upstreamCode",
+            "/codey/originalCode",
+            "/code",
+        ],
+    )
+    .unwrap_or("upstream_response_failed");
+    let _ = CURRENT_LIFECYCLE_FAILURE.try_with(|failure| {
+        failure
+            .borrow_mut()
+            .get_or_insert_with(|| (status, code.to_owned()));
+    });
+}
+
 /// hyper 1.11 HTTP/1 的默认写缓冲上限（`DEFAULT_MAX_BUFFER_SIZE`）。
 /// 缓冲还放得下时，连接会先把正文取完并丢掉，再去刷套接字；响应头期限因此
 /// 会把仍堵在用户态缓冲里的历史上传算进去。最后一块必须至少这么大，连接
@@ -465,6 +501,9 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
     fn event_stream_started(&self) -> bool {
         self.inner.event_stream_started()
     }
+    fn set_streaming_errors(&mut self, enabled: bool) {
+        self.inner.set_streaming_errors(enabled);
+    }
     fn request_log_probe(&self) -> Option<&RouteRequestLogProbe> {
         self.inner.request_log_probe()
     }
@@ -502,6 +541,11 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
         self.error = Some(code.into());
         self.inner.write_text_error(status, code, message).await
     }
+    async fn write_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        self.status = Some(failure.status);
+        self.error = Some(failure.code.clone());
+        self.inner.write_response_failure(failure).await
+    }
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
         self.status = Some(status);
         self.inner.write_json(status, value).await
@@ -511,6 +555,7 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
         self.inner.start_event_stream().await
     }
     async fn write_event(&mut self, event: &Value) -> Result<()> {
+        observe_lifecycle_response_failure(event);
         self.inner.write_event(event).await
     }
     async fn finish_event_stream(&mut self) -> Result<()> {

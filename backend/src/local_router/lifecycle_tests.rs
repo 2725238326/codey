@@ -333,11 +333,11 @@ async fn official_history_is_sanitized_after_websocket_reconnect_and_http_fallba
     }
 }
 
-async fn invoke(
+async fn invoke<D: ResponsesDownstream + ?Sized>(
     server: &RouterServer,
     model: &str,
     stream: bool,
-    downstream: &mut CapturedDownstream,
+    downstream: &mut D,
 ) -> Result<()> {
     let body = json!({"model":model,"stream":stream,"input":[{"type":"reasoning","encrypted_content":"test","summary":[]},{"role":"user","content":"test"}]});
     let encoded = serde_json::to_vec_pretty(&body).unwrap();
@@ -694,4 +694,56 @@ async fn lifecycle_http_and_network_errors_finish_failed() {
     let terminal = terminal(&mut events).await;
     assert_eq!(terminal.0, "request.failed");
     assert_eq!(terminal.1["status"], 424);
+}
+
+#[tokio::test]
+async fn lifecycle_stream_failures_are_not_reported_as_completed() {
+    for protocol in [
+        UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+        UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    ] {
+        let (url, upstream, _) = super::retry_contract_tests::error_upstream(
+            200,
+            format!("data: {}\n\n", json!({"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"limited"}})),
+            "text/event-stream",
+        ).await;
+        let (mut config, provider, model) = super::tests::router_config(url);
+        config.profiles[0].upstream_protocol = protocol.into();
+        config.profiles[0].normalize();
+        let server = test_server(&config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let mut downstream = HttpResponsesDownstream::new(socket);
+        downstream.set_streaming_errors(true);
+        let (plugin, mut events) = recording_plugin(|_, _| json!({"action":"continue"}));
+        let _ = with_test_plugins(
+            vec![plugin],
+            invoke(
+                &server,
+                &model_alias(&provider, &model),
+                true,
+                &mut downstream,
+            ),
+        )
+        .await;
+        drop(downstream);
+        assert!(
+            String::from_utf8(reader.await.unwrap())
+                .unwrap()
+                .contains("response.failed")
+        );
+        let terminal = terminal(&mut events).await;
+        assert_eq!(terminal.0, "request.failed", "{protocol}");
+        assert_eq!(terminal.1["status"], 429, "{protocol}: {}", terminal.1);
+        upstream.abort();
+    }
 }

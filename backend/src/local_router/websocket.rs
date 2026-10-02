@@ -619,24 +619,7 @@ impl WebSocketResponsesDownstream {
                                 probe.mark_upstream_error_summary(error_summary);
                             }
                             raw_json_text = None;
-                            // Codex consumes terminal failures as
-                            // `response.failed`; a bare upstream `error`
-                            // event otherwise leaves the turn in progress.
-                            if event.get("type").and_then(Value::as_str) == Some("error") {
-                                let error = event.get("error").cloned().unwrap_or(Value::Null);
-                                event = json!({
-                                    "type": "response.failed",
-                                    "response": {
-                                        "id": format!("resp_codey_{}", Uuid::new_v4()),
-                                        "object": "response",
-                                        "created_at": current_unix_timestamp(),
-                                        "status": "failed",
-                                        "output": [],
-                                        "error": error,
-                                        "incomplete_details": Value::Null
-                                    }
-                                });
-                            }
+                            normalize_response_failure(&mut event, None);
                         }
                         if let Some(probe) = probe {
                             probe.observe_event(&event);
@@ -1057,22 +1040,18 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
         message: String,
         route: Option<&RouteTarget>,
     ) -> Result<()> {
-        self.write_event(&websocket_response_failed_event(
-            status, code, &message, route,
-        ))
-        .await
+        self.write_response_failure(&ResponsesFailure::new(status, code, message, route))
+            .await
+    }
+
+    async fn write_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        self.write_event(&failure.normalized_event()).await
     }
 
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
         if !(200..300).contains(&status) {
-            let message = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("Codey 本地路由返回错误")
-                .to_string();
             return self
-                .write_error(status, "local_router_error", message, None)
+                .write_response_failure(&ResponsesFailure::from_json(status, value))
                 .await;
         }
         self.start_event_stream().await?;
@@ -1087,16 +1066,17 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
     }
 
     async fn write_event(&mut self, event: &Value) -> Result<()> {
-        if responses_event_is_terminal(event) {
+        let event = normalized_response_event(event);
+        if responses_event_is_terminal(&event) {
             if self.terminal_started {
                 return Ok(());
             }
             self.terminal_started = true;
-            self.native_history.observe(event);
+            self.native_history.observe(&event);
         }
         let encoded = encode_responses_websocket_event(
-            event,
-            self.event_needs_stream_id(event).then(|| {
+            &event,
+            self.event_needs_stream_id(&event).then(|| {
                 self.stream_id
                     .as_deref()
                     .expect("stream id must exist when insertion is required")
@@ -1130,52 +1110,14 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
     }
 }
 
-pub(crate) fn websocket_response_failed_event(
-    status: u16,
-    code: &str,
-    message: &str,
-    route: Option<&RouteTarget>,
-) -> Value {
-    let mut codey =
-        serde_json::Map::from_iter([("httpStatus".to_string(), Value::Number(status.into()))]);
-    if let Some(route) = route {
-        codey.insert(
-            "routeId".to_string(),
-            Value::String(route.provider_id.clone()),
-        );
-        codey.insert(
-            "routeName".to_string(),
-            Value::String(route.route_name.clone()),
-        );
-    }
-    if let Some(request_id) = current_router_request_id() {
-        codey.insert("requestId".to_string(), Value::String(request_id));
-    }
-    json!({
-        "type":"response.failed",
-        "response":{
-            "id":format!("resp_codey_{}", Uuid::new_v4()),
-            "object":"response",
-            "created_at":current_unix_timestamp(),
-            "status":"failed",
-            "output":[],
-            "error":{
-                "type":"codey_route_error",
-                "code":code,
-                "message":message,
-                "codey":codey,
-            },
-            "incomplete_details":Value::Null,
-        }
-    })
-}
-
 pub(crate) async fn proxy_native_response_to_websocket(
     downstream: &mut WebSocketResponsesDownstream,
     response: reqwest::Response,
     probe: Option<&RouteRequestLogProbe>,
 ) -> Result<()> {
     let status = response.status().as_u16();
+    let retry_advice = ResponseRetryAdvice::from_headers(response.headers());
+    let upstream_request_id = upstream_request_id_from_headers(response.headers());
     let xai_fix = current_xai_response_fix();
     let mut prepared = await_upstream(
         downstream,
@@ -1211,6 +1153,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
                 }
                 let mut event = serde_json::from_str::<Value>(&data)
                     .context("Responses HTTP 上游 SSE data 不是有效 JSON")?;
+                normalize_response_failure(&mut event, retry_advice.as_ref());
                 if let Some(fix) = xai_fix.as_ref() {
                     fix.apply(&mut event);
                 }
@@ -1233,6 +1176,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
             }
         }
         if !done
+            && !terminal
             && !buffer[cursor.consumed..]
                 .iter()
                 .all(u8::is_ascii_whitespace)
@@ -1241,6 +1185,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
         {
             let mut event = serde_json::from_str::<Value>(&data)
                 .context("Responses HTTP 上游 SSE 末尾 data 不是有效 JSON")?;
+            normalize_response_failure(&mut event, retry_advice.as_ref());
             if let Some(fix) = xai_fix.as_ref() {
                 fix.apply(&mut event);
             }
@@ -1287,6 +1232,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
         }
         downstream.start_event_stream().await?;
         for mut event in events {
+            normalize_response_failure(&mut event, retry_advice.as_ref());
             if let Some(fix) = xai_fix.as_ref() {
                 fix.apply(&mut event);
             }
@@ -1309,6 +1255,15 @@ pub(crate) async fn proxy_native_response_to_websocket(
             }
             if let Some(probe) = probe {
                 probe.observe_response(status, &value);
+            }
+            if !(200..300).contains(&status) {
+                let mut failure = ResponsesFailure::from_json(status, &value);
+                failure.retry_advice = retry_advice;
+                if let Some(request_id) = upstream_request_id {
+                    failure.event["response"]["error"]["codey"]["upstreamRequestId"] =
+                        request_id.into();
+                }
+                return downstream.write_response_failure(&failure).await;
             }
             let result = downstream.write_json(status, &value).await;
             if result.is_ok()
@@ -1384,6 +1339,19 @@ pub(crate) async fn write_text_error_response<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    write_text_error_response_with_retry_after(stream, status, code, message, None).await
+}
+
+pub(crate) async fn write_text_error_response_with_retry_after<W>(
+    stream: &mut W,
+    status: u16,
+    code: &str,
+    message: impl AsRef<str>,
+    retry_after: Option<&str>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let body = if let Some(request_id) = current_router_request_id() {
         format!(
             "{}（错误码：{code}；请求 ID：{request_id}）\n",
@@ -1394,8 +1362,12 @@ where
     };
     let reason = reason_phrase(status);
     let request_id_header = router_request_id_header();
+    let retry_header = retry_after
+        .filter(|value| HeaderValue::from_str(value).is_ok())
+        .map(|value| format!("retry-after: {value}\r\n"))
+        .unwrap_or_default();
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\n{request_id_header}connection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\n{request_id_header}{retry_header}connection: close\r\n\r\n",
         body.len()
     );
     write_all_with_timeout(stream, header.as_bytes(), "写入本地路由错误响应头失败").await?;

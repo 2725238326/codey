@@ -42,6 +42,7 @@ pub(crate) fn upstream_response_body_deadline() -> tokio::time::Instant {
 }
 
 pub(crate) struct PreparedUpstreamResponse {
+    pub(crate) retry_advice: Option<ResponseRetryAdvice>,
     pub(crate) response: reqwest::Response,
     pub(crate) prefix: VecDeque<Bytes>,
     pub(crate) is_sse: bool,
@@ -55,6 +56,7 @@ pub(crate) async fn prepare_upstream_response(
     operation: &'static str,
     probe: Option<&RouteRequestLogProbe>,
 ) -> Result<PreparedUpstreamResponse> {
+    let retry_advice = ResponseRetryAdvice::from_headers(response.headers());
     let deadline = upstream_response_body_deadline();
     if let Some(probe) = probe {
         probe.set_upstream_response_headers(&super::responses::format_upstream_response_headers(
@@ -68,6 +70,7 @@ pub(crate) async fn prepare_upstream_response(
         .is_some_and(is_sse_content_type)
     {
         return Ok(PreparedUpstreamResponse {
+            retry_advice,
             response,
             prefix: VecDeque::new(),
             is_sse: true,
@@ -88,6 +91,7 @@ pub(crate) async fn prepare_upstream_response(
         .map_err(|_| anyhow::Error::new(UpstreamResponseDeadline))??
         else {
             return Ok(PreparedUpstreamResponse {
+                retry_advice,
                 response,
                 prefix,
                 is_sse: false,
@@ -104,6 +108,7 @@ pub(crate) async fn prepare_upstream_response(
         prefix.push_back(chunk);
         if let Some(is_sse) = classify_upstream_sse_prefix(&sniff) {
             return Ok(PreparedUpstreamResponse {
+                retry_advice,
                 response,
                 prefix,
                 is_sse,
@@ -114,6 +119,7 @@ pub(crate) async fn prepare_upstream_response(
         }
         if sniff.len() == UPSTREAM_SSE_SNIFF_BYTES {
             return Ok(PreparedUpstreamResponse {
+                retry_advice,
                 response,
                 prefix,
                 is_sse: false,
@@ -332,6 +338,7 @@ pub(crate) async fn write_proxy_response(
 ) -> Result<()> {
     let status = response.status().as_u16();
     let reason = reason_phrase(status);
+    let retry_advice = ResponseRetryAdvice::from_headers(response.headers());
     let original_content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -374,10 +381,10 @@ pub(crate) async fn write_proxy_response(
         probe.mark_response_started(status);
     }
     let xai_fix = current_xai_response_fix();
-    let mut sse_rewriter = xai_fix
-        .as_ref()
-        .filter(|_| upstream_is_sse)
-        .map(XaiSseRewriter::new);
+    let mut sse_rewriter =
+        (upstream_is_sse && (validate_responses || xai_fix.is_some())).then(|| {
+            ResponsesSseRewriter::new(xai_fix.as_ref(), validate_responses, retry_advice.as_ref())
+        });
     let mut buffered_json = xai_fix
         .as_ref()
         .filter(|_| !upstream_is_sse)
@@ -480,6 +487,123 @@ pub(crate) const REQUEST_LOG_USAGE_NESTING_DEPTH: usize = 64;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn proxy_sse_for_test(
+        body: &[u8],
+        validate_responses: bool,
+        retry_after: Option<&str>,
+    ) -> (Vec<u8>, Result<()>) {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let body = body.to_vec();
+        let retry_header = retry_after
+            .map(|value| format!("retry-after: {value}\r\n"))
+            .unwrap_or_default();
+        let upstream_server = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            stream.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n{retry_header}connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{upstream_address}/responses"))
+            .send()
+            .await
+            .unwrap();
+        let downstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let downstream_address = downstream_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = downstream_listener.accept().await.unwrap();
+            write_proxy_response(&mut stream, response, None, validate_responses).await
+        });
+        let mut stream = TcpStream::connect(downstream_address).await.unwrap();
+        let mut wire = Vec::new();
+        stream.read_to_end(&mut wire).await.unwrap();
+        upstream_server.await.unwrap();
+        let result = proxy.await.unwrap();
+        let header_end = wire
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert!(wire.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let mut cursor = header_end;
+        let mut output = Vec::new();
+        while cursor < wire.len() {
+            let prefix_len = wire[cursor..]
+                .windows(2)
+                .position(|bytes| bytes == b"\r\n")
+                .unwrap();
+            let length = usize::from_str_radix(
+                std::str::from_utf8(&wire[cursor..cursor + prefix_len]).unwrap(),
+                16,
+            )
+            .unwrap();
+            cursor += prefix_len + 2;
+            if length == 0 {
+                break;
+            }
+            output.extend_from_slice(&wire[cursor..cursor + length]);
+            cursor += length + 2;
+        }
+        (output, result)
+    }
+
+    #[tokio::test]
+    async fn native_sse_proxy_normalizes_failures_without_changing_image_streams() {
+        let body = b"id: failure\r\nevent: error\r\ndata: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"invalid model\"}}\r\n\r\n";
+        let (output, result) = proxy_sse_for_test(body, true, None).await;
+        result.unwrap();
+        assert!(output.starts_with(b"id: failure\r\nevent: response.failed\r\n"));
+        let mut cursor = SseCursor::default();
+        let frame = take_next_sse_frame(&output, &mut cursor).unwrap();
+        let event: Value = serde_json::from_str(&sse_frame_data(frame).unwrap().unwrap()).unwrap();
+        assert_eq!(event["response"]["error"]["code"], "invalid_prompt");
+        assert_eq!(
+            event["response"]["error"]["codey"]["originalCode"],
+            "invalid_request_error"
+        );
+        let (output, result) = proxy_sse_for_test(body, false, None).await;
+        result.unwrap();
+        assert_eq!(output, body);
+    }
+
+    #[tokio::test]
+    async fn native_sse_proxy_preserves_normal_tail_and_rejects_missing_terminal() {
+        let complete =
+            b"\xef\xbb\xbfdata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\"}}";
+        let (output, result) = proxy_sse_for_test(complete, true, None).await;
+        result.unwrap();
+        assert_eq!(output, complete);
+        let incomplete = b"data: {\"type\":\"response.created\"}\n\n";
+        let (output, result) = proxy_sse_for_test(incomplete, true, None).await;
+        assert_eq!(output, incomplete);
+        assert!(result.unwrap_err().to_string().contains("终态事件前断开"));
+    }
+
+    #[tokio::test]
+    async fn native_sse_proxy_preserves_retry_after_advice_for_stream_errors() {
+        let body = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"busy\"}}\n\n";
+        let (output, result) = proxy_sse_for_test(body, true, Some("2")).await;
+        result.unwrap();
+        let mut cursor = SseCursor::default();
+        let frame = take_next_sse_frame(&output, &mut cursor).unwrap();
+        let event: Value = serde_json::from_str(&sse_frame_data(frame).unwrap().unwrap()).unwrap();
+        let error = &event["response"]["error"];
+        assert_eq!(error["code"], "rate_limit_exceeded");
+        assert!(error["codey"]["retryAfterMs"].as_u64().unwrap() <= 2000);
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Please try again in ")
+        );
+    }
 
     #[test]
     fn chunk_size_uses_lowercase_hex() {

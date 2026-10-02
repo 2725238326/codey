@@ -1148,7 +1148,7 @@ function ModelSectionComponent({
 
             <div className="route-auxiliary-retry">
               <div className="local-router-toggle route-retry-toggle">
-                <Tooltip content="流式会话中断后自动重新连接的次数，保存并重启 Codex 后生效" position="top">
+                <Tooltip content="每轮请求的流式错误重试次数；切换传输方式时可能另行计数，不等于总请求上限。保存并重启 Codex 后生效" position="top">
                   <span className="route-retry-label cursor-help">
                     <strong>会话重试</strong>
                     <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />

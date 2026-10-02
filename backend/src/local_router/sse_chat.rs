@@ -303,10 +303,7 @@ impl ChatSseAccumulator {
     }
 
     pub(crate) fn ingest(&mut self, chunk: &Value) -> Result<()> {
-        check_context_length_error(chunk)?;
-        if let Some(error) = chunk.get("error") {
-            anyhow::bail!("Chat Completions 流返回错误：{error}");
-        }
+        check_upstream_stream_failure(chunk)?;
         if let Some(id) = chunk
             .get("id")
             .and_then(Value::as_str)
@@ -531,6 +528,7 @@ where
     D: ResponsesDownstream + ?Sized,
 {
     let mut output = ResponsesSseState::new(model, tool_bridge);
+    let retry_advice = prepared.retry_advice.clone();
     prepared.retained.get_or_insert_with(Default::default);
     output.start(downstream).await?;
     let mut accumulator = ChatSseAccumulator::for_streaming(model);
@@ -616,8 +614,13 @@ where
             return Err(error);
         }
         observe_upstream_stream_error(request_log_probe.as_ref(), &error, route);
-        let (code, message) = streaming_failure_message(&error, route);
-        let _ = output.fail(downstream, code, &message).await;
+        let failure = streaming_response_failure(&error, route, retry_advice);
+        let _ = output
+            .fail_with_error(
+                downstream,
+                failure.normalized_event()["response"]["error"].clone(),
+            )
+            .await;
         return Err(error);
     }
     Ok(())
@@ -698,7 +701,7 @@ where
     D: ResponsesDownstream + ?Sized,
 {
     let mut events = Vec::new();
-    check_context_length_error(event)?;
+    check_upstream_stream_failure(event)?;
     let Some(choices) = event.get("choices").and_then(Value::as_array) else {
         return Ok(());
     };

@@ -292,6 +292,8 @@ fn normalize(value: &mut Value, ids: &mut HashMap<String, String>) {
             for (key, value) in object {
                 if key == "created_at" {
                     *value = json!(0);
+                } else if key == "requestId" {
+                    *value = json!("fixture-request");
                 } else {
                     normalize(value, ids);
                 }
@@ -351,6 +353,12 @@ async fn long_response_tail_preserves_events_tools_and_errors() {
             let response = &events.last().unwrap()["response"];
             if fixture.success {
                 assert_eq!(response["output_text"], "x".repeat(fixture.text_bytes));
+            } else {
+                assert_eq!(response["status"], "failed");
+                assert_eq!(
+                    response["error"]["codey"]["errorCode"],
+                    "upstream_stream_error"
+                );
             }
             if case == "mixed" {
                 let output = response["output"].as_array().unwrap();
@@ -385,14 +393,10 @@ async fn long_response_tail_preserves_events_tools_and_errors() {
     if let Ok(path) = std::env::var("CODEY_TAIL_SNAPSHOT") {
         std::fs::write(path, &encoded).unwrap();
     }
-    // Baseline from f396fabc, updated for cache_write_tokens added in 9833dde.
-    // codey 直接启用 serde_json preserve_order，单独构建与 workspace 构建使用同一键序。
-    // Removing those six usage fields reproduces the original transcript digest.
-    // CODEY_TAIL_SNAPSHOT exports them for inspection when this assertion fails.
     use sha2::Digest;
     assert_eq!(
         format!("{:x}", sha2::Sha256::digest(&encoded)),
-        "b8f0d7e93687b32b80886fad9b117cdea5a1229b08db21fb733de925b857e4f9"
+        "8462a36796e52e6fa959bea2c8349536991fea1d9d6115b1ac99a5ab372f9f70"
     );
 }
 

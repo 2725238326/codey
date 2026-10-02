@@ -16,6 +16,8 @@ pub(crate) trait ResponsesDownstream: Send {
         false
     }
 
+    fn set_streaming_errors(&mut self, _enabled: bool) {}
+
     fn request_log_probe(&self) -> Option<&RouteRequestLogProbe> {
         None
     }
@@ -49,6 +51,16 @@ pub(crate) trait ResponsesDownstream: Send {
 
     async fn write_text_error(&mut self, status: u16, code: &str, message: String) -> Result<()> {
         self.write_error(status, code, message, None).await
+    }
+
+    async fn write_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        self.write_error(
+            failure.status,
+            &failure.code,
+            failure.message().into(),
+            None,
+        )
+        .await
     }
 
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()>;
@@ -185,6 +197,10 @@ where
         self.inner.event_stream_started()
     }
 
+    fn set_streaming_errors(&mut self, enabled: bool) {
+        self.inner.set_streaming_errors(enabled);
+    }
+
     fn request_log_probe(&self) -> Option<&RouteRequestLogProbe> {
         self.probe.as_ref()
     }
@@ -231,6 +247,15 @@ where
             probe.mark_error(status, code);
         }
         let result = self.inner.write_text_error(status, code, message).await;
+        self.finish_result(&result, "downstream_error_write_failed");
+        result
+    }
+
+    async fn write_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        if let Some(probe) = self.probe.as_ref() {
+            probe.mark_error(failure.status, &failure.code);
+        }
+        let result = self.inner.write_response_failure(failure).await;
         self.finish_result(&result, "downstream_error_write_failed");
         result
     }
@@ -343,6 +368,7 @@ where
 pub(crate) struct HttpResponsesDownstream {
     pub(crate) stream: TcpStream,
     event_stream_started: bool,
+    streaming_errors: bool,
 }
 
 impl HttpResponsesDownstream {
@@ -350,6 +376,7 @@ impl HttpResponsesDownstream {
         Self {
             stream,
             event_stream_started: false,
+            streaming_errors: false,
         }
     }
 }
@@ -358,6 +385,10 @@ impl HttpResponsesDownstream {
 impl ResponsesDownstream for HttpResponsesDownstream {
     fn event_stream_started(&self) -> bool {
         self.event_stream_started
+    }
+
+    fn set_streaming_errors(&mut self, enabled: bool) {
+        self.streaming_errors = enabled;
     }
 
     async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
@@ -379,11 +410,48 @@ impl ResponsesDownstream for HttpResponsesDownstream {
         message: String,
         route: Option<&RouteTarget>,
     ) -> Result<()> {
+        if self.streaming_errors || self.event_stream_started {
+            return self
+                .write_response_failure(&ResponsesFailure::new(status, code, message, route))
+                .await;
+        }
         write_error_response(&mut self.stream, status, code, message, route).await
     }
 
     async fn write_text_error(&mut self, status: u16, code: &str, message: String) -> Result<()> {
+        if self.streaming_errors || self.event_stream_started {
+            return self.write_error(status, code, message, None).await;
+        }
         write_text_error_response(&mut self.stream, status, code, message).await
+    }
+
+    async fn write_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        if self.streaming_errors || self.event_stream_started {
+            self.start_event_stream().await?;
+            self.write_event(&failure.normalized_event()).await?;
+            self.finish_event_stream().await
+        } else if failure.code == CONTEXT_LENGTH_EXCEEDED {
+            write_json_response(
+                &mut self.stream,
+                failure.status,
+                &json!({
+                    "error": failure.event["response"]["error"],
+                }),
+            )
+            .await
+        } else {
+            write_text_error_response_with_retry_after(
+                &mut self.stream,
+                failure.status,
+                &failure.code,
+                failure.message(),
+                failure
+                    .retry_advice
+                    .as_ref()
+                    .map(|advice| advice.header.as_str()),
+            )
+            .await
+        }
     }
 
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
@@ -391,6 +459,9 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     }
 
     async fn start_event_stream(&mut self) -> Result<()> {
+        if self.event_stream_started {
+            return Ok(());
+        }
         let header = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\n{}connection: close\r\n\r\n",
             router_request_id_header()
@@ -406,7 +477,8 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     }
 
     async fn write_event(&mut self, event: &Value) -> Result<()> {
-        write_responses_sse_event(&mut self.stream, event).await
+        let event = normalized_response_event(event);
+        write_responses_sse_event(&mut self.stream, &event).await
     }
 
     async fn finish_event_stream(&mut self) -> Result<()> {
