@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import json
 from pathlib import Path
+import platform
 import tempfile
 import zipfile
 
@@ -115,12 +116,20 @@ def verify_library(library):
     print("Native ABI: single/multiple keys, retry, 600 concurrent calls, invalid config PASS")
 
 
-def verify_package(path):
+def verify_package(path, library=None):
     with zipfile.ZipFile(path) as package:
         manifest = json.loads(package.read("manifest.json"))
         assert set(package.namelist()) == {"manifest.json", "config.json", manifest["entry"]}
         assert manifest["abiVersion"] == 1
-        assert manifest["platform"] == "windows" and manifest["arch"] == "x86_64"
+        extensions = {"windows": ".dll", "macos": ".dylib", "linux": ".so"}
+        assert manifest["platform"] in extensions
+        assert manifest["arch"] in ("x86_64", "aarch64")
+        assert Path(manifest["entry"]).suffix == extensions[manifest["platform"]]
+        if library is not None:
+            native_platform = {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}[platform.system()]
+            native_arch = {"arm64": "aarch64", "AMD64": "x86_64"}.get(platform.machine(), platform.machine())
+            assert manifest["platform"] == native_platform and manifest["arch"] == native_arch
+            assert package.read(manifest["entry"]) == library.read_bytes()
         assert hashlib.sha256(package.read(manifest["entry"])).hexdigest() == manifest["librarySha256"]
         assert set(manifest["capabilities"]) == {"provider.route.v1", "request.lifecycle.v1", "request.lifecycle.api_key"}
         assert manifest["apiKeyUrls"] == ["https://token.sensenova.cn/v1/responses", "https://token.sensenova.cn/v1/responses/compact"]
@@ -139,4 +148,4 @@ if __name__ == "__main__":
     if args.library:
         verify_library(args.library.resolve())
     if args.package:
-        verify_package(args.package)
+        verify_package(args.package, args.library.resolve() if args.library else None)

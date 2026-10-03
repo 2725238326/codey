@@ -65,7 +65,11 @@ for value in args.api_key_url:
                 or not (parsed.scheme == "https" or parsed.scheme == "http" and loopback)
                 or parsed.path not in ("/responses", "/responses/compact", "/v1/responses", "/v1/responses/compact")):
             raise ValueError()
-        host = host.encode("idna").decode("ascii").lower()
+        # Python's built-in IDNA codec can map a domain to a different target
+        # than the host's URL parser. Require explicit ASCII/Punycode instead.
+        if not host.isascii():
+            parser.error("API Key URL 的域名必须使用 ASCII 或 Punycode，避免改变授权目标")
+        host = host.lower()
         authority = f"[{host}]" if ":" in host else host
         if port is not None and port != (443 if parsed.scheme == "https" else 80):
             authority += f":{port}"
