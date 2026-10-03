@@ -270,7 +270,7 @@ export async function main(command = process.argv[2]) {
     await writeFile(buildFile, `${JSON.stringify(build)}\n`);
   } else if (command === "prepare-version") {
     const build = await loadBuild();
-    if (build.action !== "build" || build.artifact_run_id) throw new Error("只有首次构建允许注入发布版本");
+    if (build.action !== "build" || build.artifact_run_id) throw new Error("只有完整打包任务允许注入发布版本");
     await prepareReleaseVersion(build);
   } else if (command === "artifacts-ready") {
     const build = await loadBuild();

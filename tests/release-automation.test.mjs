@@ -173,12 +173,12 @@ test("claim rejects inconsistent or invalid source versions without writing a cl
 
 test("prepare-version rejects maintenance and artifact reuse before changing manifests", async () => {
   for (const action of ["notes", "delete"]) await sandboxBuild(action, async () => {
-    await assert.rejects(main("prepare-version"), /首次构建/);
+    await assert.rejects(main("prepare-version"), /完整打包任务/);
   });
   await sandboxBuild("build", async () => {
     process.env.RELEASE_ARTIFACT_RUN_ID = "123";
     await writeFile(".release-build.json", JSON.stringify({ ...build, artifact_run_id: 123 }));
-    await assert.rejects(main("prepare-version"), /首次构建/);
+    await assert.rejects(main("prepare-version"), /完整打包任务/);
   });
 });
 
