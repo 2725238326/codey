@@ -1,8 +1,8 @@
 //! 可选的通用请求生命周期。原生回调超时只能停止等待，不能强制终止原生代码。
 use super::{HeaderPatch, Manifest, Native, allowed_header_name, validate_patches};
 use codey_plugin_sdk::lifecycle::{
-    AUTH_CAPABILITY, Action, CAPABILITY, METHOD_AFTER_HEADERS, METHOD_BEFORE_SEND,
-    METHOD_CANCELLED, METHOD_COMPLETED, METHOD_FAILED, METHOD_RESUME,
+    API_KEY_CAPABILITY, AUTH_CAPABILITY, Action, CAPABILITY, METHOD_AFTER_HEADERS,
+    METHOD_BEFORE_SEND, METHOD_CANCELLED, METHOD_COMPLETED, METHOD_FAILED, METHOD_RESUME,
 };
 pub use codey_plugin_sdk::lifecycle::{Response as LifecycleResponse, Stage as LifecycleStage};
 use serde_json::{Value, json};
@@ -61,6 +61,8 @@ pub(super) struct LifecyclePlugin {
     request_headers: Vec<String>,
     response_headers: Vec<String>,
     auth: bool,
+    api_key_capability: bool,
+    api_key_urls: Vec<reqwest::Url>,
     continue_on_failure: bool,
     max_wait: Duration,
     invoke_timeout: Duration,
@@ -82,6 +84,15 @@ impl LifecyclePlugin {
             request_headers: manifest.header_names.clone(),
             response_headers: manifest.response_header_names.clone(),
             auth: manifest.capabilities.iter().any(|s| s == AUTH_CAPABILITY),
+            api_key_capability: manifest
+                .capabilities
+                .iter()
+                .any(|s| s == API_KEY_CAPABILITY),
+            api_key_urls: manifest
+                .api_key_urls
+                .iter()
+                .filter_map(|url| super::package::api_key_url(url).ok())
+                .collect(),
             continue_on_failure: manifest.lifecycle_failure_policy.as_deref() == Some("continue"),
             max_wait: Duration::from_millis(manifest.lifecycle_max_wait_ms.unwrap_or(30_000)),
             invoke_timeout: Duration::from_secs(3),
@@ -233,6 +244,11 @@ pub struct LifecycleRequest {
     entries: Vec<EntryState>,
     finished: bool,
     remaining_wait: Duration,
+    // Host-owned identity and actual send URL, never derived from incoming headers.
+    transport: Option<(bool, bool)>,
+    upstream_url: Option<reqwest::Url>,
+    // No Debug/serialization: the selected credential stays private to this request.
+    selected_api_key: Option<(String, reqwest::header::HeaderValue)>,
 }
 
 impl LifecycleRequest {
@@ -255,6 +271,9 @@ impl LifecycleRequest {
                 .collect(),
             finished: false,
             remaining_wait: Duration::from_secs(600),
+            transport: None,
+            upstream_url: None,
+            selected_api_key: None,
         }
     }
 
@@ -265,10 +284,63 @@ impl LifecycleRequest {
             entries: Vec::new(),
             finished: false,
             remaining_wait: Duration::from_secs(600),
+            transport: None,
+            upstream_url: None,
+            selected_api_key: None,
         }
     }
     pub fn is_active(&self) -> bool {
         !self.finished && !self.entries.is_empty()
+    }
+
+    pub(crate) fn set_transport_context(&mut self, official_account: bool, native_responses: bool) {
+        self.transport = Some((official_account, native_responses));
+    }
+
+    pub(crate) fn set_upstream_target(&mut self, url: &reqwest::Url) -> Result<(), LifecycleError> {
+        if self.selected_api_key.is_some() && self.upstream_url.as_ref() != Some(url) {
+            return Err(failure("plugin_api_key_target_changed"));
+        }
+        self.upstream_url = Some(url.clone());
+        Ok(())
+    }
+
+    pub(crate) fn apply_api_key(
+        &self,
+        headers: &mut reqwest::header::HeaderMap,
+    ) -> Result<(), LifecycleError> {
+        if let Some((owner, value)) = &self.selected_api_key {
+            if !self
+                .entries
+                .iter()
+                .any(|entry| entry.plugin.id == *owner && self.api_key_authorized(&entry.plugin))
+            {
+                return Err(failure("plugin_api_key_unauthorized"));
+            }
+            // Remove competing credentials when the host installs the selected Bearer.
+            for name in [
+                "api-key",
+                "x-api-key",
+                "proxy-authorization",
+                "cookie",
+                "chatgpt-account-id",
+                "openai-organization",
+                "openai-project",
+            ] {
+                headers.remove(name);
+            }
+            headers.insert(reqwest::header::AUTHORIZATION, value.clone());
+        }
+        Ok(())
+    }
+
+    fn api_key_authorized(&self, plugin: &LifecyclePlugin) -> bool {
+        self.transport == Some((false, true))
+            && plugin.api_key_capability
+            && self
+                .upstream_url
+                .as_ref()
+                .is_some_and(|url| plugin.api_key_urls.contains(url))
     }
 
     pub async fn dispatch(
@@ -286,6 +358,8 @@ impl LifecycleRequest {
             .map(|(k, v)| (k.to_ascii_lowercase(), v))
             .collect();
         let mut patches = Vec::new();
+        let transport = self.transport;
+        let upstream_url = self.upstream_url.clone();
         for entry in &mut self.entries {
             let plugin = entry.plugin.clone();
             let selected = selected_headers(&visible, &plugin.request_headers);
@@ -293,7 +367,41 @@ impl LifecycleRequest {
                 json!({"status":response.status,
                 "headers":selected_headers(&response.headers, &plugin.response_headers)})
             });
-            let mut params = json!({"metadata":self.metadata,"requestId":self.metadata.get("requestId"),
+            let mut metadata = self.metadata.clone();
+            if let Some(object) = metadata.as_object_mut() {
+                for name in [
+                    "apiKeyAuthorized",
+                    "apiKeySelected",
+                    "upstreamUrl",
+                    "officialAccount",
+                ] {
+                    object.remove(name);
+                }
+                if plugin.api_key_capability {
+                    let authorized = transport == Some((false, true))
+                        && upstream_url
+                            .as_ref()
+                            .is_some_and(|url| plugin.api_key_urls.contains(url));
+                    object.insert("apiKeyAuthorized".into(), json!(authorized));
+                    object.insert(
+                        "apiKeySelected".into(),
+                        json!(
+                            self.selected_api_key
+                                .as_ref()
+                                .is_some_and(|(owner, _)| owner == &plugin.id)
+                        ),
+                    );
+                    object.insert(
+                        "upstreamUrl".into(),
+                        json!(upstream_url.as_ref().map(reqwest::Url::as_str)),
+                    );
+                    object.insert(
+                        "officialAccount".into(),
+                        json!(transport.map(|(official, _)| official)),
+                    );
+                }
+            }
+            let mut params = json!({"metadata":metadata,"requestId":self.metadata.get("requestId"),
                 "stage":stage,"attempt":attempt,"headers":selected,"response":selected_response});
             if plugin.auth
                 && let Some(credentials) = &self.credentials
@@ -309,11 +417,29 @@ impl LifecycleRequest {
             self.remaining_wait = self.remaining_wait.saturating_sub(started.elapsed());
             let action = match result {
                 Ok(action) => action,
-                Err(_) if plugin.continue_on_failure => continue,
+                Err(error)
+                    if plugin.continue_on_failure && !error.code.starts_with("plugin_api_key_") =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             match action {
-                ParsedAction::Continue(next) => {
+                ParsedAction::Continue(next, api_key) => {
+                    if let Some(api_key) = api_key {
+                        if let Some((owner, _)) = &self.selected_api_key {
+                            return Err(failure(if owner == &plugin.id {
+                                "plugin_api_key_already_selected"
+                            } else {
+                                "plugin_api_key_conflict"
+                            }));
+                        }
+                        let mut value =
+                            reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                                .map_err(|_| failure("plugin_api_key_invalid"))?;
+                        value.set_sensitive(true);
+                        self.selected_api_key = Some((plugin.id.clone(), value));
+                    }
                     for patch in &next {
                         match &patch.value {
                             Some(value) => {
@@ -343,6 +469,7 @@ impl LifecycleRequest {
             return;
         }
         self.finished = true;
+        self.selected_api_key.take();
         let method = match outcome {
             LifecycleOutcome::Completed => METHOD_COMPLETED,
             LifecycleOutcome::Failed => METHOD_FAILED,
@@ -359,6 +486,12 @@ impl LifecycleRequest {
                 params.as_object_mut().unwrap().remove("credentials");
                 params.as_object_mut().unwrap().remove("headers");
                 params.as_object_mut().unwrap().remove("response");
+                if let Some(metadata) = params.get_mut("metadata").and_then(Value::as_object_mut) {
+                    metadata.remove("apiKeyAuthorized");
+                    metadata.remove("apiKeySelected");
+                    metadata.remove("upstreamUrl");
+                    metadata.remove("officialAccount");
+                }
                 params["status"] = json!(status);
                 params["code"] = json!(code);
                 if let Some(_guard) =
@@ -395,7 +528,7 @@ fn selected_headers(
 }
 
 enum ParsedAction {
-    Continue(Vec<HeaderPatch>),
+    Continue(Vec<HeaderPatch>, Option<String>),
     Retry(Vec<HeaderPatch>),
     Wait(String, Duration),
     Abort(LifecycleError),
@@ -408,8 +541,25 @@ fn parse_action(
     let action: Action =
         serde_json::from_value(value).map_err(|_| failure("plugin_invalid_action"))?;
     match action {
-        Action::Continue { headers: patches } => {
-            parse_header_action(patches, stage, headers, false)
+        Action::Continue {
+            headers: patches,
+            api_key,
+        } => {
+            if let Some(key) = &api_key {
+                if stage != LifecycleStage::BeforeSend {
+                    return Err(failure("plugin_api_key_invalid_stage"));
+                }
+                if key.is_empty() || key.len() > 8192 || !key.bytes().all(|b| b.is_ascii_graphic())
+                {
+                    return Err(failure("plugin_api_key_invalid"));
+                }
+            }
+            let ParsedAction::Continue(patches, _) =
+                parse_header_action(patches, stage, headers, false)?
+            else {
+                unreachable!()
+            };
+            Ok(ParsedAction::Continue(patches, api_key))
         }
         Action::Retry { headers: patches } => parse_header_action(patches, stage, headers, true),
         Action::Wait {
@@ -465,7 +615,7 @@ fn parse_header_action(
     Ok(if retry {
         ParsedAction::Retry(patches)
     } else {
-        ParsedAction::Continue(patches)
+        ParsedAction::Continue(patches, None)
     })
 }
 
@@ -502,7 +652,39 @@ async fn dispatch_one(
             }
             Err(error) => return Err(error),
         };
-        let action = parse_action(value, stage, &plugin.request_headers)?;
+        if value.get("apiKey").is_some() {
+            if !plugin.api_key_capability
+                || entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context["metadata"]["apiKeyAuthorized"].as_bool())
+                    != Some(true)
+            {
+                return Err(failure("plugin_api_key_unauthorized"));
+            }
+            if method != METHOD_BEFORE_SEND
+                || stage != LifecycleStage::BeforeSend
+                || value["action"] != "continue"
+                || entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context["attempt"].as_u64())
+                    != Some(0)
+            {
+                return Err(failure("plugin_api_key_invalid_stage"));
+            }
+            if !value["apiKey"].is_string() {
+                return Err(failure("plugin_api_key_invalid"));
+            }
+        }
+        let sensitive_action = value.get("apiKey").is_some();
+        let action = parse_action(value, stage, &plugin.request_headers).map_err(|error| {
+            if sensitive_action && !error.code.starts_with("plugin_api_key_") {
+                failure("plugin_api_key_invalid_action")
+            } else {
+                error
+            }
+        })?;
         match action {
             ParsedAction::Wait(next_token, delay) => {
                 if token.as_ref().is_some_and(|token| token != &next_token) {
@@ -567,11 +749,23 @@ impl TestPlugin {
                 request_headers: vec!["x-test".into()],
                 response_headers: vec!["x-test".into(), "content-type".into()],
                 auth: false,
+                api_key_capability: false,
+                api_key_urls: Vec::new(),
                 continue_on_failure: false,
                 max_wait: Duration::from_millis(300),
                 invoke_timeout: Duration::from_millis(100),
             }),
         }
+    }
+
+    pub(crate) fn with_api_key_urls(mut self, urls: &[&str]) -> Self {
+        let plugin = Arc::get_mut(&mut self.plugin).unwrap();
+        plugin.api_key_capability = true;
+        plugin.api_key_urls = urls
+            .iter()
+            .map(|url| super::package::api_key_url(url).unwrap())
+            .collect();
+        self
     }
 }
 #[cfg(test)]
@@ -605,6 +799,283 @@ mod tests {
             ("x-test".into(), "original".into()),
             ("authorization".into(), "private".into()),
         ])
+    }
+
+    const API_URL: &str = "https://token.sensenova.cn/v1/responses";
+    fn api_request(url: &str, official: bool, native: bool) -> LifecycleRequest {
+        let mut request = request();
+        request.set_transport_context(official, native);
+        request
+            .set_upstream_target(&reqwest::Url::parse(url).unwrap())
+            .unwrap();
+        request
+    }
+
+    #[tokio::test]
+    async fn api_key_requires_scope_native_protocol_and_the_initial_before_send() {
+        for case in [
+            "undeclared",
+            "wrong_url",
+            "official",
+            "chat",
+            "after",
+            "resume",
+            "invalid",
+            "changed",
+        ] {
+            let mut plugin = TestPlugin::new("a", move |method, _| {
+                if case == "resume" && method == METHOD_BEFORE_SEND {
+                    Ok(json!({"action":"wait","token":"job","pollAfterMs":50}))
+                } else {
+                    Ok(
+                        json!({"action":"continue","apiKey":if case == "invalid" { "bad\nkey" } else { "private-test-key" }}),
+                    )
+                }
+            });
+            if case != "undeclared" {
+                plugin = plugin.with_api_key_urls(&[API_URL]);
+            }
+            Arc::get_mut(&mut plugin.plugin)
+                .unwrap()
+                .continue_on_failure = true;
+            with_test_plugins(vec![plugin], async {
+                let mut request = api_request(
+                    if case == "wrong_url" {
+                        "https://example.com/v1/responses"
+                    } else {
+                        API_URL
+                    },
+                    case == "official",
+                    case != "chat",
+                );
+                let stage = if case == "after" { after() } else { before() };
+                if case == "changed" {
+                    request
+                        .dispatch(before(), 0, headers(), None)
+                        .await
+                        .unwrap();
+                }
+                let error = request
+                    .dispatch(stage, 0, headers(), None)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    match case {
+                        "after" | "resume" => "plugin_api_key_invalid_stage",
+                        "invalid" => "plugin_api_key_invalid",
+                        "changed" => "plugin_api_key_already_selected",
+                        _ => "plugin_api_key_unauthorized",
+                    }
+                );
+                assert!(!error.to_string().contains("private-test-key"));
+                request.finish(LifecycleOutcome::Failed, None, Some(&error.code));
+            })
+            .await;
+        }
+        for key in [
+            "".to_owned(),
+            " ".into(),
+            "café".into(),
+            "bad\u{007f}".into(),
+            "x".repeat(8193),
+        ] {
+            assert_eq!(
+                parse_action(json!({"action":"continue","apiKey":key}), before(), &[])
+                    .err()
+                    .unwrap()
+                    .code,
+                "plugin_api_key_invalid"
+            );
+        }
+        assert!(
+            parse_action(
+                json!({"action":"continue","apiKey":"x".repeat(8192)}),
+                before(),
+                &[]
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_cannot_select_a_key_that_was_not_selected_initially() {
+        let plugin = TestPlugin::new("a", |method, params| {
+            Ok(if method == METHOD_BEFORE_SEND && params["attempt"] == 1 {
+                json!({"action":"continue", "apiKey":"private-retry-key"})
+            } else if method == METHOD_AFTER_HEADERS {
+                json!({"action":"retry"})
+            } else {
+                json!({"action":"continue"})
+            })
+        })
+        .with_api_key_urls(&[API_URL]);
+        with_test_plugins(vec![plugin], async {
+            let mut request = api_request(API_URL, false, true);
+            request
+                .dispatch(before(), 0, headers(), None)
+                .await
+                .unwrap();
+            assert!(matches!(
+                request.dispatch(after(), 0, headers(), None).await.unwrap(),
+                LifecycleDecision::Retry(_)
+            ));
+            let error = request
+                .dispatch(before(), 1, headers(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "plugin_api_key_invalid_stage");
+            assert!(!error.to_string().contains("private-retry-key"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn api_key_is_pinned_for_retry_and_is_not_broadcast_or_logged() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let plugin = TestPlugin::new("a", move |method, params| {
+            let selected = params["metadata"]["apiKeySelected"] == true;
+            tx.send((method.to_owned(), params.clone())).unwrap();
+            Ok(if method == METHOD_BEFORE_SEND && !selected {
+                json!({"action":"continue","apiKey":"private-test-key"})
+            } else {
+                json!({"action":"continue"})
+            })
+        })
+        .with_api_key_urls(&[API_URL]);
+        let ordinary = TestPlugin::new("b", |_, params| {
+            assert!(params["metadata"].get("apiKeySelected").is_none());
+            assert!(params["metadata"].get("apiKeyAuthorized").is_none());
+            assert!(params["metadata"].get("upstreamUrl").is_none());
+            assert!(!params.to_string().contains("private-test-key"));
+            Ok(json!({"action":"continue"}))
+        });
+        with_test_plugins(vec![plugin, ordinary], async {
+            let mut request = api_request(API_URL, false, true);
+            request
+                .dispatch(before(), 0, headers(), None)
+                .await
+                .unwrap();
+            let (_, first) = rx.recv().await.unwrap();
+            assert_eq!(first["metadata"]["apiKeyAuthorized"], true);
+            assert_eq!(first["metadata"]["apiKeySelected"], false);
+            assert_eq!(first["metadata"]["upstreamUrl"], API_URL);
+            let mut outgoing = reqwest::header::HeaderMap::new();
+            for name in [
+                "authorization",
+                "api-key",
+                "x-api-key",
+                "cookie",
+                "chatgpt-account-id",
+            ] {
+                outgoing.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    reqwest::header::HeaderValue::from_static("old"),
+                );
+            }
+            request.apply_api_key(&mut outgoing).unwrap();
+            assert_eq!(outgoing["authorization"], "Bearer private-test-key");
+            assert!(outgoing["authorization"].is_sensitive());
+            assert_eq!(outgoing.len(), 1);
+            request
+                .dispatch(before(), 1, headers(), None)
+                .await
+                .unwrap();
+            let (_, second) = rx.recv().await.unwrap();
+            assert_eq!(second["metadata"]["apiKeySelected"], true);
+            request.apply_api_key(&mut outgoing).unwrap();
+            assert_eq!(outgoing["authorization"], "Bearer private-test-key");
+            assert_eq!(
+                request
+                    .set_upstream_target(
+                        &reqwest::Url::parse("https://example.com/v1/responses").unwrap()
+                    )
+                    .unwrap_err()
+                    .code,
+                "plugin_api_key_target_changed"
+            );
+            request.finish(LifecycleOutcome::Completed, Some(200), None);
+            let (_, terminal) = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!terminal.to_string().contains("private-test-key"));
+            assert!(terminal["metadata"].get("apiKeySelected").is_none());
+            assert!(request.selected_api_key.is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn competing_api_key_overrides_fail_closed() {
+        let plugins = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                TestPlugin::new(id, |_, _| {
+                    Ok(json!({"action":"continue","apiKey":"private-test-key"}))
+                })
+                .with_api_key_urls(&[API_URL])
+            })
+            .collect();
+        with_test_plugins(plugins, async {
+            let mut request = api_request(API_URL, false, true);
+            assert_eq!(
+                request
+                    .dispatch(before(), 0, headers(), None)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "plugin_api_key_conflict"
+            );
+            request.finish(LifecycleOutcome::Failed, None, None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_api_key_selection_advances_once_per_request() {
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = next.clone();
+        let plugin = TestPlugin::new("a", move |method, params| {
+            Ok(if method == METHOD_BEFORE_SEND && params["metadata"]["apiKeySelected"] == false {
+                json!({"action":"continue","apiKey":format!("test-key-{}",counter.fetch_add(1, Ordering::Relaxed))})
+            } else { json!({"action":"continue"}) })
+        }).with_api_key_urls(&[API_URL]);
+        with_test_plugins(vec![plugin], async {
+            let mut first = api_request(API_URL, false, true);
+            let mut second = api_request(API_URL, false, true);
+            let mut third = api_request(API_URL, false, true);
+            let (a, b, c) = tokio::join!(
+                first.dispatch(before(), 0, headers(), None),
+                second.dispatch(before(), 0, headers(), None),
+                third.dispatch(before(), 0, headers(), None)
+            );
+            a.unwrap();
+            b.unwrap();
+            c.unwrap();
+            let mut values = Vec::new();
+            for request in [&mut first, &mut second, &mut third] {
+                request
+                    .dispatch(before(), 1, headers(), None)
+                    .await
+                    .unwrap();
+                let mut outgoing = reqwest::header::HeaderMap::new();
+                request.apply_api_key(&mut outgoing).unwrap();
+                values.push(outgoing["authorization"].to_str().unwrap().to_owned());
+                request.finish(LifecycleOutcome::Completed, Some(200), None);
+            }
+            values.sort();
+            assert_eq!(
+                values,
+                [
+                    "Bearer test-key-0",
+                    "Bearer test-key-1",
+                    "Bearer test-key-2"
+                ]
+            );
+            assert_eq!(next.load(Ordering::Relaxed), 3);
+        })
+        .await;
     }
 
     #[tokio::test]

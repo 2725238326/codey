@@ -16,11 +16,13 @@
 }
 ```
 
-`headerNames` 控制可读取和修改的请求头；`responseHeaderNames` 控制可读取的响应头，各最多 32 项且名称不能重复。认证、Cookie 和宿主内部头不能通过这两个列表授权。响应头只读，可声明读取 Content-Type 等传输信息。空名单有效；请求体、URL、路由和认证头不能由此协议修改。
+`headerNames` 控制可读取和修改的请求头；`responseHeaderNames` 控制可读取的响应头，各最多 32 项且名称不能重复。认证、Cookie 和宿主内部头不能通过这两个列表授权。响应头只读，可声明读取 Content-Type 等传输信息。空名单有效；请求体、URL和路由不能由此协议修改。
 
 失败策略默认为 `abort`：回调错误、无效动作、实例停用、执行忙或超时会终止本次请求。选择 `continue` 时跳过本阶段出错的插件；插件主动返回的 `abort` 始终生效。等待上限默认为 30000 毫秒，允许 1–600000。这些字段及 `request.lifecycle.auth` 都要求同时声明 `request.lifecycle.v1`。
 
 需要官方账号认证上下文的可信插件可额外声明 `request.lifecycle.auth`。仅在官方线路且已解析到令牌时，控制事件带 `credentials: {accessToken, upstreamAccountId}`；其他情况下省略。该信息只经过后端内存，插件不得放入错误消息、管理方法输出或日志。原生插件本身并不处于沙箱中。
+
+需要为非官方原生 Responses 线路轮换 Key 的可信插件必须同时声明 `request.lifecycle.v1`、`request.lifecycle.api_key` 与非空 `apiKeyUrls`。该列表最多 32 个精确 HTTPS endpoint，回环 mock 允许 HTTP；路径仅允许 `/responses`、`/responses/compact` 及其 `/v1` 前缀形式。禁止通配符、用户信息、query、fragment、重复规范 URL 和任意其他路径。旧 manifest 不声明该能力时默认空列表；列表与能力缺一会被拒绝。此权限独立于官方认证上下文，普通头名单始终不能授权 Authorization。
 
 ## 事件与顺序
 
@@ -65,6 +67,8 @@
 
 `requestId` 在整个逻辑请求内不变，`attempt` 首次为 0，重发时为 1；`stage` 仅为 `beforeSend` 或 `afterHeaders`，轮询仍使用原阶段。`response` 在发送前为 null。请求模型是最终上游模型名。`officialAccountId` 是 Codey 的稳定本地账号 ID，`upstreamAccountId` 是实际上游身份，不能混用。`officialAccountEmail` 是官方线路关联的本地账号记录中的登录邮箱，随路由快照读取，不接受客户端请求头提供的邮箱；非官方线路或记录缺少邮箱时为 null。`accountType` 仅在官方令牌有套餐声明时提供；缺失值为 null，插件应自行判断能否处理。`requestKind` 为 `responses` 或 `responses_compact`。
 
+仅声明 API Key 能力的当前插件会收到宿主建立的 `metadata.upstreamUrl`、`officialAccount`、`apiKeyAuthorized` 与 `apiKeySelected`。URL 来自实际 HTTP 目标解析；授权要求精确匹配 scope、非官方线路和宿主原生 Responses HTTP 传输（不含 provider.transport.v1）。`apiKeySelected` 仅表示当前插件已为该逻辑请求选定 Key，不携带 Key 值；重发时为 true，插件应直接返回 continue。普通插件与终态事件不接收这些标记。
+
 ## 控制动作
 
 使用 `codey_plugin_sdk::lifecycle::Action` 构造结果，或返回对应 JSON：
@@ -74,6 +78,8 @@
 ```
 
 发送前可修改声明过的请求头，`value: null` 表示删除；后面的插件能看到已通过校验的修改。请求头值不能包含控制字符或 DEL，单项不超过 16384 字节，一次修改合计不超过 32768 字节。无法写入 HTTP 头的修改会拒绝本次动作，不会静默丢弃同一次已经通过校验的其他修改。响应头阶段的 `continue` 只能返回空头列表，不能修改已发出的请求。
+
+已授权插件仅可在首次 `request.beforeSend` 的 `continue` 返回独立的 `apiKey` 字符串。值必须为非空可见 ASCII，最长 8192 字节。宿主在最终发送前安装敏感 Bearer HeaderValue，并移除竞争认证头；它不经过 HeaderPatch、插件广播或请求日志。同一插件实例的 SDK 回调互斥，Key 选择与轮询游标推进可在一个回调中完成。一个逻辑请求选定后固定，重试复用；再选、多个插件覆盖、未授权目标、官方线路、协议转换、响应头阶段及 resume 均拒绝，敏感校验失败不受 continue 失败策略放行。原生传输仍处理原始正文与 SSE，不提供转发网关或协议转换；上游客户端不跟随重定向。SDK Action 不实现 Debug，避免打印 Key。
 
 ```json
 {"action":"wait","token":"job-7","pollAfterMs":100}
@@ -105,6 +111,6 @@ WebSocket 下游关闭可中断等待。HTTP 的 FIN 与合法写半关闭无法
 
 ## 打包
 
-打包脚本支持 `--capability request.lifecycle.v1`、重复的 `--header` 与 `--response-header`、`--lifecycle-failure-policy` 和 `--lifecycle-max-wait-ms`。头名单及生命周期参数必须显式搭配生命周期能力，缺失时直接报错。需要认证上下文时另加 `--capability request.lifecycle.auth`。安装包必须包含 `config.json`；打包时省略 `--config` 会生成空对象模板。
+打包脚本支持 `--capability request.lifecycle.v1`、重复的 `--header` 与 `--response-header`、`--lifecycle-failure-policy` 和 `--lifecycle-max-wait-ms`。头名单及生命周期参数必须显式搭配生命周期能力，缺失时直接报错。需要认证上下文时另加 `--capability request.lifecycle.auth`；需要选取 API Key 时另加 `--capability request.lifecycle.api_key` 及重复的 `--api-key-url` 精确授权地址。安装包必须包含 `config.json`；打包时省略 `--config` 会生成空对象模板。
 
 此协议只提供请求控制。账号卡片、代理管理等界面需要独立的前端扩展接口，生命周期声明不会自动挂载插件界面。
