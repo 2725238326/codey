@@ -2402,10 +2402,12 @@ impl RouterServer {
         let Some(response) = upstream_response else {
             return write_upstream_http_error(
                 downstream,
-                upstream_status,
-                upstream_request_id.as_deref(),
-                retry_advice,
-                preloaded_error_body.as_deref().unwrap_or_default(),
+                UpstreamHttpErrorResponse {
+                    status: upstream_status,
+                    upstream_request_id: upstream_request_id.as_deref(),
+                    retry_advice,
+                    body: preloaded_error_body.as_deref().unwrap_or_default(),
+                },
                 &resolved,
                 bridge,
                 request_kind,
@@ -2427,10 +2429,12 @@ impl RouterServer {
                     Ok(Ok(body)) => {
                         write_upstream_http_error(
                             downstream,
-                            upstream_status,
-                            upstream_request_id.as_deref(),
-                            retry_advice,
-                            &body,
+                            UpstreamHttpErrorResponse {
+                                status: upstream_status,
+                                upstream_request_id: upstream_request_id.as_deref(),
+                                retry_advice,
+                                body: &body,
+                            },
                             &resolved,
                             bridge,
                             request_kind,
