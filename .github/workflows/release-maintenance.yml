@@ -1,0 +1,177 @@
+name: Maintain platform releases
+run-name: "Codey ${{ inputs.action }} ${{ inputs.build_id }} #${{ inputs.attempt }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        required: true
+        type: choice
+        options:
+          - notes
+          - delete
+      build_id:
+        required: true
+        type: string
+      attempt:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      base_sha:
+        type: string
+      base_tag:
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codey-release-automation
+  cancel-in-progress: false
+
+env:
+  RELEASE_BUILD_ID: ${{ inputs.build_id }}
+  RELEASE_ATTEMPT: ${{ inputs.attempt }}
+  RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_BASE_SHA: ${{ inputs.base_sha }}
+  RELEASE_BASE_TAG: ${{ inputs.base_tag }}
+  RELEASE_ACTION: ${{ inputs.action }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Claim maintenance operation
+        id: claim
+        env:
+          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
+          RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
+        run: node scripts/release-automation.mjs claim
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-build-context
+          path: .release-build.json
+          include-hidden-files: true
+          if-no-files-found: error
+
+  notes:
+    if: inputs.action == 'notes'
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-context
+      - name: Install Copilot CLI
+        continue-on-error: true
+        run: npm install --global @github/copilot@1.0.91
+      - name: Generate evidence-backed release notes
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/release-automation.mjs notes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-evidence
+          path: release-notes.json
+          if-no-files-found: error
+
+  sync:
+    if: inputs.action == 'notes'
+    needs: [prepare, notes]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
+      RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
+      CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
+      CLOUDFLARE_R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-context
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes-evidence
+      - name: Synchronize draft release notes
+        run: node scripts/release-automation.mjs sync-notes
+
+  delete:
+    if: inputs.action == 'delete'
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-context
+      - name: Delete owned GitHub resources and request R2 cleanup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
+          RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
+        run: node scripts/release-automation.mjs delete
+
+  report-failure:
+    if: always() && needs.prepare.outputs.claimed == 'true' && needs.sync.result != 'success' && needs.delete.result != 'success'
+    needs: [prepare, notes, sync, delete]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Report failed maintenance without hiding job failures
+        continue-on-error: true
+        env:
+          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
+          RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
+          RELEASE_ERROR: 更新日志同步或资源清理失败，请查看本次 GitHub Actions 日志并从平台重试
+        run: node scripts/release-automation.mjs failed
