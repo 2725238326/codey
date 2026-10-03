@@ -67,6 +67,59 @@ pub fn valid_id(id: &str) -> bool {
         && !id.ends_with('.')
 }
 
+/// Normalize exact scopes using the same URL parser as the HTTP sender.
+pub(super) fn api_key_url(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value).map_err(|_| "apiKeyUrls URL 无效")?;
+    let raw_path = value
+        .split_once("://")
+        .and_then(|(_, rest)| rest.find('/').map(|start| &rest[start..]));
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if value.is_empty()
+        || value.len() > 2048
+        || value.contains('*')
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host().is_none()
+        || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+        || ![
+            "/responses",
+            "/responses/compact",
+            "/v1/responses",
+            "/v1/responses/compact",
+        ]
+        .contains(&url.path())
+        || !raw_path.is_some_and(|path| {
+            [
+                "/responses",
+                "/responses/compact",
+                "/v1/responses",
+                "/v1/responses/compact",
+            ]
+            .contains(&path)
+        })
+        || value.contains('\\')
+        || value.contains("/../")
+        || value.contains("/./")
+        || value.split_once("://").is_none_or(|(_, rest)| {
+            rest.split('/')
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+    {
+        return Err("apiKeyUrls 必须是精确的 HTTPS Responses URL（回环测试允许 HTTP）".into());
+    }
+    Ok(url)
+}
+
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     if !valid_id(&manifest.id) {
         return Err("插件 ID 无效".into());
@@ -123,6 +176,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             codey_plugin_sdk::appserver::CAPABILITY,
             codey_plugin_sdk::lifecycle::CAPABILITY,
             codey_plugin_sdk::lifecycle::AUTH_CAPABILITY,
+            codey_plugin_sdk::lifecycle::API_KEY_CAPABILITY,
             codey_plugin_sdk::provider::CAPABILITY,
             codey_plugin_sdk::transport::CAPABILITY,
             codey_plugin_sdk::transport::ACCOUNT_CAPABILITY,
@@ -151,6 +205,27 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             "插件传输须同时声明 provider.route.v1、provider.transport.v1 和 provider.account.v1"
                 .into(),
         );
+    }
+    let api_key = manifest
+        .capabilities
+        .iter()
+        .any(|s| s == codey_plugin_sdk::lifecycle::API_KEY_CAPABILITY);
+    if api_key && (!lifecycle || manifest.api_key_urls.is_empty())
+        || !api_key && !manifest.api_key_urls.is_empty()
+    {
+        return Err(
+            "apiKeyUrls 需要 request.lifecycle.v1 和 request.lifecycle.api_key，且授权列表不能为空"
+                .into(),
+        );
+    }
+    let mut urls = HashSet::new();
+    if manifest.api_key_urls.len() > 32 {
+        return Err("apiKeyUrls 最多声明 32 项".into());
+    }
+    for value in &manifest.api_key_urls {
+        if !urls.insert(api_key_url(value)?.to_string()) {
+            return Err("apiKeyUrls 不能重复".into());
+        }
     }
     if manifest
         .header_names
@@ -302,6 +377,62 @@ pub fn read(path: &Path) -> Result<Package, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn api_key_manifest_scopes_are_exact_explicit_and_bounded() {
+        let mut manifest = super::super::tests::fixture_package().inspection.manifest;
+        assert!(manifest.api_key_urls.is_empty());
+        validate_manifest(&manifest).unwrap(); // legacy default
+        manifest.api_key_urls = vec!["https://token.sensenova.cn/v1/responses".into()];
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.capabilities = vec![codey_plugin_sdk::lifecycle::API_KEY_CAPABILITY.into()];
+        assert!(validate_manifest(&manifest).is_err());
+        manifest
+            .capabilities
+            .push(codey_plugin_sdk::lifecycle::CAPABILITY.into());
+        validate_manifest(&manifest).unwrap();
+        manifest.api_key_urls.clear();
+        assert!(validate_manifest(&manifest).is_err());
+        for url in [
+            "http://token.sensenova.cn/v1/responses",
+            "https://user@token.sensenova.cn/v1/responses",
+            "https://@token.sensenova.cn/v1/responses",
+            "https://token.sensenova.cn/v1/responses?",
+            "https://token.sensenova.cn/v1/responses#fragment",
+            "https://*.sensenova.cn/v1/responses",
+            "https://token.sensenova.cn/v1/chat/completions",
+            "https://token.sensenova.cn/anything/responses",
+            "https://token.sensenova.cn/v1/responses/",
+            "https://token.sensenova.cn/foo/../responses",
+            "https://token.sensenova.cn/foo/%2e%2e/responses",
+            "https://token.sensenova.cn/v1/%72esponses",
+            "ftp://localhost/responses",
+            "not-a-url",
+        ] {
+            manifest.api_key_urls = vec![url.into()];
+            assert!(validate_manifest(&manifest).is_err(), "{url}");
+        }
+        for url in [
+            "http://127.0.0.1:8765/v1/responses",
+            "http://[::1]:8765/responses/compact",
+            "http://localhost/responses",
+            "https://token.sensenova.cn/v1/responses/compact",
+        ] {
+            manifest.api_key_urls = vec![url.into()];
+            validate_manifest(&manifest).unwrap();
+        }
+        manifest.api_key_urls = vec![
+            "https://TOKEN.sensenova.cn:443/v1/responses".into(),
+            "https://token.sensenova.cn/v1/responses".into(),
+        ];
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.api_key_urls = (0..33)
+            .map(|port| format!("https://example.com:{}/responses", port + 9000))
+            .collect();
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.api_key_urls = vec!["https://token.sensenova.cn/v1/responses".into()];
+        manifest.header_names = vec!["authorization".into()];
+        assert!(validate_manifest(&manifest).is_err());
+    }
     #[test]
     fn lifecycle_manifest_dependencies_and_header_lists_are_checked() {
         let base = serde_json::to_value(super::super::tests::fixture_package().inspection.manifest)

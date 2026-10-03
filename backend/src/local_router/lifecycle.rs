@@ -161,7 +161,12 @@ pub(super) fn request_lifecycle(
             })
         })
         .flatten();
-    LifecycleRequest::new(metadata, credentials)
+    let mut lifecycle = LifecycleRequest::new(metadata, credentials);
+    lifecycle.set_transport_context(
+        resolved.route.official_account,
+        bridge == ProtocolBridge::NativeResponses && resolved.route.plugin_transport.is_none(),
+    );
+    lifecycle
 }
 
 fn official_account_email(route: &RouteTarget) -> Option<&str> {
@@ -320,6 +325,8 @@ where
     D: ResponsesDownstream + ?Sized,
     F: FnMut() + Send,
 {
+    let url = reqwest::Url::parse(url)?;
+    lifecycle.set_upstream_target(&url)?;
     let mut retained_body = Some(body);
     loop {
         let decision = await_upstream(
@@ -345,6 +352,7 @@ where
                 .into());
             }
         }
+        lifecycle.apply_api_key(headers)?;
         if let Some(probe) = downstream.request_log_probe() {
             probe.set_upstream_request_headers(&format_upstream_headers(headers));
         }
@@ -361,7 +369,7 @@ where
                 plugin,
                 codey_plugin_sdk::transport::Operation::Responses,
                 client,
-                url,
+                url.as_str(),
                 headers,
                 payload,
                 timeout,

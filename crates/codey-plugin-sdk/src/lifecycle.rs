@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 pub const CAPABILITY: &str = "request.lifecycle.v1";
 pub const AUTH_CAPABILITY: &str = "request.lifecycle.auth";
+pub const API_KEY_CAPABILITY: &str = "request.lifecycle.api_key";
 
 /// 只由宿主在请求生命周期中调用。管理接口必须拒绝这些方法名。
 pub const METHOD_BEFORE_SEND: &str = "request.beforeSend";
@@ -74,12 +75,15 @@ pub struct TerminalEvent {
     pub code: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Action {
     Continue {
         #[serde(default)]
         headers: Vec<HeaderPatch>,
+        /// Sensitive; only an authorized initial beforeSend may select a key.
+        #[serde(default, rename = "apiKey", skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
     },
     Wait {
         token: String,
@@ -106,7 +110,30 @@ pub enum Action {
 
 #[cfg(test)]
 mod tests {
-    use super::HOST_METHODS;
+    use super::{Action, HOST_METHODS};
+
+    #[test]
+    fn continue_preserves_legacy_shape_and_only_continue_accepts_api_key() {
+        let legacy: Action = serde_json::from_str(r#"{"action":"continue"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            serde_json::json!({"action":"continue","headers":[]})
+        );
+        let selected: Action =
+            serde_json::from_str(r#"{"action":"continue","apiKey":"test-key"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(selected).unwrap()["apiKey"],
+            "test-key"
+        );
+        for action in ["retry", "wait", "abort"] {
+            assert!(
+                serde_json::from_value::<Action>(
+                    serde_json::json!({"action":action,"apiKey":"test-key","token":"job"})
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn host_methods_match_the_lifecycle_protocol() {

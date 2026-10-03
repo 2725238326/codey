@@ -40,6 +40,8 @@ pub struct Manifest {
     pub header_names: Vec<String>,
     #[serde(default)]
     pub response_header_names: Vec<String>,
+    #[serde(default)]
+    pub api_key_urls: Vec<String>,
     #[serde(
         default,
         deserialize_with = "deserialize_present",

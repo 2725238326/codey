@@ -1,6 +1,6 @@
 use super::*;
 use crate::codey_plugins::lifecycle::{
-    LifecycleRequest, TestPlugin, has_plugins, with_test_plugins,
+    LifecycleRequest, LifecycleStage, TestPlugin, has_plugins, with_test_plugins,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -107,7 +107,10 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
         websocket_backoffs: Arc::default(),
         native_history_cache: Arc::default(),
         idle_downstreams: Arc::default(),
-        client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        client: super::server::upstream_http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap(),
         proxied_clients: Mutex::default(),
         official_auth_path: PathBuf::from("/nonexistent/codey-lifecycle-test-auth"),
         account_usage_cache: Arc::default(),
@@ -745,5 +748,211 @@ async fn lifecycle_stream_failures_are_not_reported_as_completed() {
         assert_eq!(terminal.0, "request.failed", "{protocol}");
         assert_eq!(terminal.1["status"], 429, "{protocol}: {}", terminal.1);
         upstream.abort();
+    }
+}
+
+#[tokio::test]
+async fn api_key_override_preserves_native_responses_body_and_sse_across_retry() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let endpoint = format!("{url}/responses");
+    let sse = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"native-response\",\"status\":\"completed\",\"output\":[]}}\n\n";
+    let upstream = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut socket).await.unwrap());
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", sse.len()).as_bytes()).await.unwrap();
+            socket.write_all(sse).await.unwrap();
+        }
+        requests
+    });
+    let (config, provider, model) = super::tests::router_config(url);
+    let server = test_server(&config);
+    let selections = Arc::new(AtomicUsize::new(0));
+    let selected = selections.clone();
+    let endpoint_for_event = endpoint.clone();
+    let (plugin, mut events) = recording_plugin(move |method, params| {
+        if method == "request.beforeSend" {
+            assert_eq!(params["metadata"]["upstreamUrl"], endpoint_for_event);
+            assert_eq!(params["metadata"]["officialAccount"], false);
+            assert_eq!(params["metadata"]["protocol"], "OpenAI Responses");
+            assert_eq!(params["metadata"]["apiKeyAuthorized"], true);
+            assert_eq!(params["metadata"]["apiKeySelected"], params["attempt"] == 1);
+            assert!(params["headers"].get("authorization").is_none());
+            if params["metadata"]["apiKeySelected"] == false {
+                selected.fetch_add(1, Ordering::SeqCst);
+                return json!({"action":"continue","apiKey":"mock-selected-key"});
+            }
+        }
+        if method == "request.afterHeaders" && params["attempt"] == 0 {
+            json!({"action":"retry"})
+        } else {
+            json!({"action":"continue"})
+        }
+    });
+    let plugin = plugin.with_api_key_urls(&[&endpoint]);
+    let mut downstream = CapturedDownstream::default();
+    with_test_plugins(
+        vec![plugin],
+        invoke(
+            &server,
+            &model_alias(&provider, &model),
+            true,
+            &mut downstream,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(downstream.status, Some(200));
+    assert_eq!(downstream.body, sse);
+    let requests = upstream.await.unwrap();
+    assert_eq!(requests[0].body, requests[1].body);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body["input"],
+        json!([{"type":"reasoning","encrypted_content":"test","summary":[]},{"role":"user","content":"test"}])
+    );
+    assert_eq!(body["stream"], true);
+    assert_eq!(selections.load(Ordering::SeqCst), 1);
+    for request in requests {
+        assert_eq!(
+            incoming_header(&request, "authorization"),
+            Some("Bearer mock-selected-key")
+        );
+        assert!(incoming_header(&request, "x-api-key").is_none());
+        assert!(incoming_header(&request, "api-key").is_none());
+    }
+    let terminal = terminal(&mut events).await;
+    assert_eq!(terminal.0, "request.completed");
+    assert!(!terminal.1.to_string().contains("mock-selected-key"));
+    assert!(terminal.1["metadata"].get("apiKeySelected").is_none());
+    let mut sensitive = HeaderMap::new();
+    let mut key = HeaderValue::from_static("Bearer mock-selected-key");
+    key.set_sensitive(true);
+    sensitive.insert(AUTHORIZATION, key);
+    assert!(!super::responses::format_upstream_headers(&sensitive).contains("mock-selected-key"));
+}
+
+#[tokio::test]
+async fn selected_api_key_does_not_follow_a_redirect_to_another_path() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{address}/v1/responses");
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut socket).await.unwrap();
+        assert_eq!(
+            incoming_header(&request, "authorization"),
+            Some("Bearer mock-key")
+        );
+        socket.write_all(format!("HTTP/1.1 302 Found\r\nlocation: http://{address}/v1/responses/compact\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let plugin = TestPlugin::new("redirect", |method, _| {
+        Ok(if method == "request.beforeSend" {
+            json!({"action":"continue","apiKey":"mock-key"})
+        } else {
+            json!({"action":"continue"})
+        })
+    })
+    .with_api_key_urls(&[&endpoint]);
+    with_test_plugins(vec![plugin], async {
+        let mut lifecycle = LifecycleRequest::new(json!({"requestId":"redirect-test"}), None);
+        lifecycle.set_transport_context(false, true);
+        let client = super::server::upstream_http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        let mut downstream = CapturedDownstream::default();
+        let response = send_lifecycle_http(
+            &mut downstream,
+            &mut lifecycle,
+            &client,
+            &endpoint,
+            &mut headers,
+            Bytes::from_static(b"{\"input\":\"original\"}"),
+            &mut || {},
+            &mut 0,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        lifecycle.finish(
+            crate::codey_plugins::lifecycle::LifecycleOutcome::Completed,
+            Some(302),
+            None,
+        );
+    })
+    .await;
+    upstream.await.unwrap();
+}
+
+#[tokio::test]
+async fn api_key_scope_excludes_plugin_transport_even_for_a_matching_url() {
+    const ENDPOINT: &str = "https://token.sensenova.cn/v1/responses";
+    for plugin_transport in [false, true] {
+        let (config, _, model) = super::tests::router_config(ENDPOINT.into());
+        let snapshot = RouterSnapshot::from_config(&config);
+        let mut resolved = snapshot.target_for_model(&model).unwrap();
+        if plugin_transport {
+            Arc::make_mut(&mut resolved.route).plugin_transport =
+                Some(plugin_transport::Target::new(
+                    "test.transport".into(),
+                    codey_plugin_sdk::transport::TransportOptions {
+                        account_email: "user@example.com".into(),
+                        models: BTreeMap::new(),
+                        image_generation: false,
+                        image_edit: false,
+                    },
+                ));
+        }
+        let plugin = TestPlugin::new("scope-test", move |method, params| {
+            if method == "request.beforeSend" {
+                assert_eq!(params["metadata"]["apiKeyAuthorized"], !plugin_transport);
+                assert_eq!(params["metadata"]["officialAccount"], false);
+                // Returning a key on the transport route must fail closed.
+                return Ok(json!({"action":"continue","apiKey":"mock-key"}));
+            }
+            Ok(json!({}))
+        })
+        .with_api_key_urls(&[ENDPOINT]);
+        with_test_plugins(vec![plugin], async {
+            let mut lifecycle = request_lifecycle(
+                &HeaderMap::new(),
+                &resolved,
+                ProtocolBridge::NativeResponses,
+                ResponsesRequestKind::Create,
+                true,
+                false,
+            );
+            lifecycle
+                .set_upstream_target(&reqwest::Url::parse(ENDPOINT).unwrap())
+                .unwrap();
+            let result = lifecycle
+                .dispatch(LifecycleStage::BeforeSend, 0, BTreeMap::new(), None)
+                .await;
+            let mut outgoing = HeaderMap::new();
+            outgoing.insert(AUTHORIZATION, HeaderValue::from_static("Bearer original"));
+            if plugin_transport {
+                assert_eq!(result.unwrap_err().code, "plugin_api_key_unauthorized");
+                lifecycle.apply_api_key(&mut outgoing).unwrap();
+                assert_eq!(outgoing[AUTHORIZATION], "Bearer original");
+            } else {
+                result.unwrap();
+                lifecycle.apply_api_key(&mut outgoing).unwrap();
+                assert_eq!(outgoing[AUTHORIZATION], "Bearer mock-key");
+            }
+        })
+        .await;
     }
 }

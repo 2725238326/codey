@@ -3,11 +3,13 @@
 import argparse
 import hashlib
 import json
+import ipaddress
 import pathlib
 import platform
 import sys
 from typing import Union, cast
 import zipfile
+from urllib.parse import urlsplit, urlunsplit
 
 
 reconfigure = getattr(sys.stderr, "reconfigure", None)
@@ -24,7 +26,8 @@ parser.add_argument("--version", required=True)
 parser.add_argument("--platform", choices=["macos", "windows", "linux"], default={"Darwin":"macos", "Windows":"windows", "Linux":"linux"}.get(platform.system()))
 parser.add_argument("--arch", default={"arm64":"aarch64", "AMD64":"x86_64"}.get(platform.machine(), platform.machine()))
 parser.add_argument("--header", action="append", default=[])
-parser.add_argument("--capability", action="append", default=[], choices=["request.lifecycle.v1", "request.lifecycle.auth", "provider.route.v1", "provider.transport.v1", "provider.account.v1", "appserver.call.v1"])
+parser.add_argument("--capability", action="append", default=[], choices=["request.lifecycle.v1", "request.lifecycle.auth", "request.lifecycle.api_key", "provider.route.v1", "provider.transport.v1", "provider.account.v1", "appserver.call.v1"])
+parser.add_argument("--api-key-url", action="append", default=[], help="精确授权的 HTTPS Responses endpoint（回环测试允许 HTTP）")
 parser.add_argument("--response-header", action="append", default=[])
 parser.add_argument("--lifecycle-failure-policy", choices=["abort", "continue"])
 parser.add_argument("--lifecycle-max-wait-ms", type=int)
@@ -38,9 +41,44 @@ if (transport and "provider.route.v1" not in capabilities) or (("provider.accoun
 if len(set(capabilities)) != len(capabilities):
     parser.error("扩展能力不能重复声明")
 lifecycle = "request.lifecycle.v1" in capabilities
-if not lifecycle and ("request.lifecycle.auth" in capabilities or args.response_header
+if not lifecycle and ("request.lifecycle.auth" in capabilities or "request.lifecycle.api_key" in capabilities or args.response_header
                       or args.lifecycle_failure_policy is not None or args.lifecycle_max_wait_ms is not None):
     parser.error("生命周期参数需要 --capability request.lifecycle.v1")
+api_key = "request.lifecycle.api_key" in capabilities
+if api_key != bool(args.api_key_url):
+    parser.error("--api-key-url 与 --capability request.lifecycle.api_key 必须同时声明，授权列表不能为空")
+if len(args.api_key_url) > 32:
+    parser.error("API Key URL 最多声明 32 项")
+api_key_urls = []
+for value in args.api_key_url:
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+        loopback = host == "localhost"
+        try:
+            loopback = loopback or (host is not None and ipaddress.ip_address(host).is_loopback)
+        except ValueError:
+            pass
+        if (not host or len(value.encode("utf-8")) > 2048 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)
+                or any(c in value for c in ("*", "\\", "?", "#")) or "@" in parsed.netloc
+                or not (parsed.scheme == "https" or parsed.scheme == "http" and loopback)
+                or parsed.path not in ("/responses", "/responses/compact", "/v1/responses", "/v1/responses/compact")):
+            raise ValueError()
+        # Python's built-in IDNA codec can map a domain to a different target
+        # than the host's URL parser. Require explicit ASCII/Punycode instead.
+        if not host.isascii():
+            parser.error("API Key URL 的域名必须使用 ASCII 或 Punycode，避免改变授权目标")
+        host = host.lower()
+        authority = f"[{host}]" if ":" in host else host
+        if port is not None and port != (443 if parsed.scheme == "https" else 80):
+            authority += f":{port}"
+        normalized = urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
+    except (ValueError, UnicodeError):
+        parser.error("API Key URL 必须是精确的 HTTPS Responses URL（回环测试允许 HTTP）")
+    if normalized in api_key_urls:
+        parser.error("API Key URL 不能重复")
+    api_key_urls.append(normalized)
 if args.lifecycle_max_wait_ms is not None and not 1 <= args.lifecycle_max_wait_ms <= 600000:
     parser.error("生命周期等待上限必须是 1–600000 毫秒")
 if args.header and not lifecycle:
@@ -91,6 +129,8 @@ manifest = {
 }
 if lifecycle:
     manifest["responseHeaderNames"] = args.response_header
+    if api_key:
+        manifest["apiKeyUrls"] = api_key_urls
     if args.lifecycle_failure_policy is not None:
         manifest["lifecycleFailurePolicy"] = args.lifecycle_failure_policy
     if args.lifecycle_max_wait_ms is not None:

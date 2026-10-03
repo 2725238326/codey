@@ -1,0 +1,4 @@
+{
+  "apiKeys": ["REPLACE_WITH_KEY_1", "REPLACE_WITH_KEY_2", "REPLACE_WITH_KEY_3"],
+  "models": ["deepseek-v4-flash"]
+}
