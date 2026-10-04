@@ -208,7 +208,7 @@ test("delete cleans the owned Release before tag and asks backend to clean R2 la
       if (path.endsWith("/git/ref/tags/v1.2.3")) return hasTag ? Response.json({ object: { type: "tag", sha: "tag-sha" } }) : new Response(null, { status: 404 });
       if (path.endsWith("/git/tags/tag-sha")) return Response.json({ object: { type: "commit", sha: build.source_sha }, message: `<!-- codey-build:${build.id} -->` });
       if (path.endsWith("/releases/tags/v1.2.3")) return hasRelease ? Response.json({ id: 10, tag_name: build.tag, body: `<!-- codey-build:${build.id} -->` }) : new Response(null, { status: 404 });
-      if (path.endsWith("/repos/owner/codey/")) return Response.json({ id: 1 });
+      if (path === "/repos/owner/codey") return Response.json({ id: 1 });
       assert.fail(`unexpected request ${url}`);
     };
     await main("delete");
@@ -226,7 +226,7 @@ test("delete refuses a tag pointing at a different commit before any mutation", 
       const path = new URL(url).pathname;
       if (path.endsWith("/git/ref/tags/v1.2.3")) return Response.json({ object: { type: "tag", sha: "tag-sha" } });
       if (path.endsWith("/git/tags/tag-sha")) return Response.json({ object: { type: "commit", sha: "c".repeat(40) }, message: `<!-- codey-build:${build.id} -->` });
-      if (path.endsWith("/repos/owner/codey/")) return Response.json({ id: 1 });
+      if (path === "/repos/owner/codey") return Response.json({ id: 1 });
       assert.fail(`unexpected request ${url}`);
     };
     await assert.rejects(main("delete"), /归属或提交不一致/);
@@ -244,7 +244,7 @@ test("delete leaves remaining resources visible when GitHub deletion fails", asy
       if (path.endsWith("/git/ref/tags/v1.2.3")) return Response.json({ object: { type: "tag", sha: "tag-sha" } });
       if (path.endsWith("/git/tags/tag-sha")) return Response.json({ object: { type: "commit", sha: build.source_sha }, message: `<!-- codey-build:${build.id} -->` });
       if (path.endsWith("/releases/tags/v1.2.3")) return Response.json({ id: 10, tag_name: build.tag, body: `<!-- codey-build:${build.id} -->` });
-      if (path.endsWith("/repos/owner/codey/")) return Response.json({ id: 1 });
+      if (path === "/repos/owner/codey") return Response.json({ id: 1 });
       assert.fail(`unexpected request ${url}`);
     };
     await assert.rejects(main("delete"), /403/);
@@ -264,6 +264,24 @@ test("first release without baseline preserves a manual-notes result without usi
     assert.equal(result.notes_status, "manual_required");
     assert.match(result.reason, /首次发布/);
     assert.equal(result.notes, "");
+  });
+});
+
+test("managed publication checks the canonical repository URL before reading release notes", async () => {
+  await sandboxBuild("build", async () => {
+    Object.assign(process.env, {
+      CLOUDFLARE_R2_BUCKET: "codey-updates", CLOUDFLARE_R2_PUBLIC_BASE_URL: "https://r2.example.com",
+      CLOUDFLARE_ACCOUNT_ID: "test-account", CLOUDFLARE_API_TOKEN: "test-token",
+    });
+    const requests = [];
+    globalThis.fetch = async (url, options) => {
+      requests.push(url);
+      assert.equal(options.method, "GET");
+      assert.equal(options.headers.authorization, "Bearer test-token");
+      return url === "https://api.github.com/repos/owner/codey" ? Response.json({ id: 1 }) : new Response(null, { status: 404 });
+    };
+    await assert.rejects(main("publish"), error => error.code === "ENOENT" && error.path === "release-notes.json");
+    assert.deepEqual(requests, ["https://api.github.com/repos/owner/codey"]);
   });
 });
 
