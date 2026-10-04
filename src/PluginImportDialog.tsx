@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { IconAlertTriangle, IconFilePlus, IconFolderOpen, IconPuzzle } from "@tabler/icons-react";
+import { IconAlertTriangle, IconFilePlus, IconFolderOpen, IconPuzzle, IconRefresh } from "@tabler/icons-react";
+import { cn } from "@heroui/react";
 import {
   Button,
   Dialog,
@@ -25,6 +26,10 @@ export function PluginImportDialog({
   preview,
   upgrading,
   error,
+  step = "",
+  dragActive = false,
+  fileName = "",
+  onRetry,
   onClose,
   onSelectFile,
   onInspectPath,
@@ -38,6 +43,10 @@ export function PluginImportDialog({
   preview: CodeyPluginPreview | null;
   upgrading?: CodeyPlugin;
   error: string;
+  step?: "checking" | "installing" | "";
+  dragActive?: boolean;
+  fileName?: string;
+  onRetry?: () => void;
   onClose: () => void;
   onSelectFile: () => void;
   onInspectPath: (path: string) => void;
@@ -51,6 +60,7 @@ export function PluginImportDialog({
     else if (preview?.path) setPath(preview.path);
   }, [open, preview?.path]);
 
+  const duplicate = Boolean(preview && upgrading?.version === preview.manifest.version);
   const capabilities = [
     ...(preview?.manifest.capabilities ?? []),
     ...(preview?.manifest.permissions ?? []),
@@ -81,22 +91,28 @@ export function PluginImportDialog({
             <div className="min-w-0 flex-1 space-y-1">
               <DialogTitle>导入插件包</DialogTitle>
               <DialogDescription>
-                选择本地 .codey-plugin 文件，确认信息后导入。安装后默认停用。
+                选择或拖入本地 .codey-plugin 文件，确认信息后导入。新安装的插件默认停用。
               </DialogDescription>
             </div>
           </div>
         </DialogHeader>
 
-        <div className="space-y-3.5 pt-2 text-xs">
-          <div className="rounded-xl border border-dashed border-black/[0.12] bg-black/[0.02] p-3.5 dark:border-white/[0.12] dark:bg-white/[0.03]">
+        <div className="space-y-3.5 pt-2 text-xs" data-codey-plugin-drop-zone="">
+          <div className={cn(
+            "rounded-xl border border-dashed p-3.5 transition-colors",
+            dragActive
+              ? "border-blue-500 bg-blue-500/10 ring-2 ring-blue-500/20"
+              : "border-black/[0.12] bg-black/[0.02] dark:border-white/[0.12] dark:bg-white/[0.03]",
+          )}>
+            <p className="mb-3 mt-0 font-medium text-foreground">{dragActive ? "松开文件，检查并导入插件包" : "可将 .codey-plugin 文件拖到此处"}</p>
             {nativePicker ? (
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="font-medium text-foreground">
-                    {preview ? packageFileName(preview.path) : "尚未选择插件包"}
+                    {fileName || (preview ? packageFileName(preview.path) : "尚未选择插件包")}
                   </div>
                   <p className="mb-0 mt-0.5 truncate font-mono text-[11px] text-muted">
-                    {preview ? preview.path : "支持 .codey-plugin 安装包"}
+                    {fileName ? "已拖入本地插件包" : preview ? preview.path : "支持 .codey-plugin 安装包，最大 64 MiB"}
                   </p>
                 </div>
                 <Button
@@ -106,7 +122,7 @@ export function PluginImportDialog({
                   onClick={onSelectFile}
                 >
                   <IconFolderOpen size={14} aria-hidden="true" />
-                  <span>{preview ? "重新选择" : "选择文件"}</span>
+                  <span>{preview || error || fileName ? "重新选择" : "选择文件"}</span>
                 </Button>
               </div>
             ) : (
@@ -120,7 +136,7 @@ export function PluginImportDialog({
                     disabled={busy}
                     onChange={(event) => {
                       setPath(event.target.value);
-                      if (preview) onClearPreview();
+                      if (preview || error || fileName) onClearPreview();
                     }}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && path.trim() && !busy) {
@@ -142,6 +158,10 @@ export function PluginImportDialog({
               </div>
             )}
           </div>
+          {step && <div role="status" aria-live="polite" className="flex items-center gap-2 text-muted">
+            <IconRefresh size={15} className="animate-spin" aria-hidden="true" />
+            {step === "installing" ? "正在导入插件，请稍候…" : "正在读取并检查插件包，请稍候…"}
+          </div>}
 
           {preview ? (
             <div className="space-y-3">
@@ -160,7 +180,7 @@ export function PluginImportDialog({
                         : `v${preview.manifest.version}`}
                     </span>
                     <span className="rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
-                      {upgrading ? "升级" : "新安装"}
+                      {duplicate ? "已安装" : upgrading ? "升级" : "新安装"}
                     </span>
                   </div>
                   <p className="mt-0.5 mb-0 truncate font-mono text-[11px] text-muted">
@@ -212,6 +232,9 @@ export function PluginImportDialog({
               </div>
             </div>
           ) : null}
+          {duplicate && <div role="alert" className="rounded-xl border border-amber-500/25 bg-amber-500/10 p-3 text-amber-800 dark:text-amber-300">
+            此插件的 v{preview?.manifest.version} 已安装，无需重复导入。请选择更高版本的插件包升级；现有插件不会被覆盖。
+          </div>}
 
           {error ? (
             <div
@@ -219,7 +242,13 @@ export function PluginImportDialog({
               className="flex items-start gap-2 rounded-xl border border-red-200/60 bg-red-50/70 p-3 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
             >
               <IconAlertTriangle size={15} className="mt-0.5 shrink-0" />
-              <div className="min-w-0 flex-1 break-words">{error}</div>
+              <div className="min-w-0 flex-1 space-y-2 break-words">
+                <div>{error}</div>
+                {onRetry && !duplicate && <Button size="xs" variant="outline" disabled={busy} onClick={onRetry}>
+                  <IconRefresh size={13} aria-hidden="true" />
+                  {preview ? "重试导入" : "重试检查"}
+                </Button>}
+              </div>
             </div>
           ) : null}
         </div>
@@ -230,10 +259,11 @@ export function PluginImportDialog({
           </Button>
           <Button
             size="sm"
-            disabled={busy || !preview}
+            disabled={busy || !preview || duplicate}
+            loading={busy && step === "installing"}
             onClick={onConfirm}
           >
-            {upgrading ? "确认升级" : "确认导入"}
+            {step === "installing" ? "正在导入…" : error && preview && !duplicate ? "重试导入" : upgrading ? "确认升级" : "确认导入"}
           </Button>
         </DialogFooter>
       </DialogContent>
