@@ -69,7 +69,7 @@ async function loadBuild() {
 }
 
 async function github(path, method = "GET", body, missing = false) {
-  const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/${path}`, {
+  const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}${path ? `/${path}` : ""}`, {
     method, redirect: "error", signal: AbortSignal.timeout(30_000),
     headers: { authorization: `Bearer ${process.env.GH_TOKEN}`, accept: "application/vnd.github+json", "content-type": "application/json", "x-github-api-version": "2026-03-10" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
