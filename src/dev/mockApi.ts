@@ -552,6 +552,7 @@ if (import.meta.env.DEV) {
     const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
     const extensionsPreview = createCodexExtensionsPreview(previewClientPlatform);
     let computerUseReady = false;
+    const previewPackageUploads = new Map<string, { name: string; size: number; signature: string }>();
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
       // Wait a tiny bit to simulate network delay
@@ -627,13 +628,35 @@ if (import.meta.env.DEV) {
       }
       if (command === "select_codey_plugin_package") return structuredClone(previewPluginPackage);
       if (command === "inspect_codey_plugin") {
+        if (typeof args?.discardUpload === "string") {
+          previewPackageUploads.delete(args.discardUpload);
+          return { status: "ok" };
+        }
+        if (args?.upload) {
+          const chunk = args.upload as { id?: string; name: string; offset: number; contentBase64: string; complete: boolean };
+          if (typeof chunk.name !== "string" || !chunk.name.endsWith(".codey-plugin")) throw new Error("仅支持 .codey-plugin 安装包");
+          const content = atob(chunk.contentBase64);
+          const uploadId = chunk.id ?? crypto.randomUUID();
+          const upload = chunk.id ? previewPackageUploads.get(chunk.id) : { name: chunk.name, size: 0, signature: content.slice(0, 4) };
+          if (!upload || upload.name !== chunk.name || upload.size !== chunk.offset) throw new Error("插件包上传顺序无效，请重新检查");
+          upload.size += content.length;
+          if (upload.size > 64 * 1024 * 1024) throw new Error("插件包超过 64 MiB");
+          previewPackageUploads.set(uploadId, upload);
+          if (!chunk.complete) return { uploadId };
+          if (upload.signature !== "PK\x03\x04") {
+            previewPackageUploads.delete(uploadId);
+            throw new Error("预览：ZIP 格式无效，请选择完整的插件包");
+          }
+          return { ...structuredClone(previewPluginPackage), path: `/preview/imports/${uploadId}.codey-plugin`, uploadId };
+        }
         const path = typeof args?.path === "string" ? args.path.trim() : "";
-        if (!path.toLowerCase().endsWith(".codey-plugin")) throw new Error("请选择 .codey-plugin 安装包");
+        if (!path.endsWith(".codey-plugin")) throw new Error("请选择 .codey-plugin 安装包");
         return { ...structuredClone(previewPluginPackage), path };
       }
       if (command === "install_codey_plugin") {
         if (args?.sha256 !== previewPluginPackage.sha256) throw new Error("插件包在检查后发生变化，请重新检查");
         const installed = previewPlugins.find(item => item.id === previewPluginPackage.manifest.id);
+        if (installed?.version === previewPluginPackage.manifest.version) throw new Error("仅允许安装更高版本；相同版本不可覆盖");
         if (installed) {
           installed.version = previewPluginPackage.manifest.version;
           installed.capabilities = [...previewPluginPackage.manifest.capabilities];

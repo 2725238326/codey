@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use super::{argument, optional_argument, string_argument};
 use crate::codey_plugins;
 
+mod package_upload;
+
 pub(super) async fn invoke(command: &str, args: &Value) -> Result<Value, String> {
     match command {
         "list_codey_plugins" => blocking(codey_plugins::list).await,
@@ -15,8 +17,15 @@ pub(super) async fn invoke(command: &str, args: &Value) -> Result<Value, String>
         }
         "select_codey_plugin_package" => select_package().await,
         "inspect_codey_plugin" => {
-            let path = PathBuf::from(string_argument(args, "path")?);
-            blocking(move || codey_plugins::inspect(&path)).await
+            if let Some(id) = optional_argument::<String>(args, "discardUpload")? {
+                blocking(move || package_upload::discard(&id)).await
+            } else if let Some(upload) = args.get("upload") {
+                let upload = upload.clone();
+                blocking(move || package_upload::receive(upload)).await
+            } else {
+                let path = PathBuf::from(string_argument(args, "path")?);
+                blocking(move || codey_plugins::inspect(&path)).await
+            }
         }
         "install_codey_plugin" => {
             let path = PathBuf::from(string_argument(args, "path")?);
@@ -121,6 +130,9 @@ mod tests {
                 json!({"path":"/tmp/demo.codey-plugin"}),
             ),
             ("save_codey_plugin_config_file", json!({"pluginId":"demo"})),
+            ("inspect_codey_plugin", json!({"discardUpload":42})),
+            ("inspect_codey_plugin", json!({"upload":{}})),
+            ("inspect_codey_plugin", json!({})),
             ("get_codey_plugin_config_file", json!({"pluginId":42})),
             (
                 "uninstall_codey_plugin",

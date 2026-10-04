@@ -39,6 +39,7 @@ import {
 } from "./codeyPlugins";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { formatBytes } from "./formatters";
+import { installPluginFileDrop, uploadPluginPackage, validateDroppedPluginFiles } from "./pluginPackageImport";
 
 export function CodeyPluginsSection({ container }: { container?: HTMLElement | null }) {
   const [result, setResult] = useState<CodeyPluginsResult | null>(null);
@@ -55,6 +56,10 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const [importOpen, setImportOpen] = useState(false);
   const [importError, setImportError] = useState("");
   const [preview, setPreview] = useState<CodeyPluginPreview | null>(null);
+  const [importStep, setImportStep] = useState<"checking" | "installing" | "">("");
+  const [importFileName, setImportFileName] = useState("");
+  const [importResult, setImportResult] = useState("");
+  const [dragActive, setDragActive] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{ kind: "enable" | "uninstall"; plugin: CodeyPlugin } | null>(null);
   const [removeData, setRemoveData] = useState(false);
@@ -71,6 +76,14 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const epoch = useRef(0);
   const configurationSaved = useRef(false);
   const importTimer = useRef(0);
+  const retrySource = useRef<{ file: File } | { path: string } | null>(null);
+  const uploadedPackage = useRef<string | null>(null);
+  const uploadAbort = useRef<AbortController | null>(null);
+  const discardUploadedPackage = useCallback(() => {
+    const uploadId = uploadedPackage.current;
+    uploadedPackage.current = null;
+    if (uploadId) void invoke("inspect_codey_plugin", { discardUpload: uploadId }).catch(() => undefined);
+  }, []);
 
   const accept = useCallback((data: unknown) => {
     try {
@@ -170,7 +183,12 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
     };
   }, [accept]);
 
-  useEffect(() => () => window.clearTimeout(importTimer.current), []);
+  useEffect(() => () => {
+    window.clearTimeout(importTimer.current);
+    uploadAbort.current?.abort();
+    discardUploadedPackage();
+    ++epoch.current;
+  }, [discardUploadedPackage]);
 
   const togglePlugin = useCallback(async (plugin: CodeyPlugin, enabled: boolean) => {
     await mutate("set_codey_plugin_enabled", { pluginId: plugin.id, enabled });
@@ -179,48 +197,131 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   }, [mutate]);
 
   const closeImport = useCallback(() => {
+    if (pending.current) return;
     window.clearTimeout(importTimer.current);
+    discardUploadedPackage();
+    retrySource.current = null;
     setImportOpen(false);
     setPreview(null);
     setImportError("");
-  }, []);
+    setImportFileName("");
+  }, [discardUploadedPackage]);
 
   const openImport = useCallback(() => {
+    discardUploadedPackage();
+    retrySource.current = null;
     setPreview(null);
     setImportError("");
+    setImportFileName("");
+    setImportResult("");
     setConfirm(null);
     window.clearTimeout(importTimer.current);
     importTimer.current = window.setTimeout(() => setImportOpen(true), 0);
-  }, []);
+  }, [discardUploadedPackage]);
+
+  const inspectImport = useCallback((source: { file: File } | { path: string }) => {
+    void run(async () => {
+      discardUploadedPackage();
+      retrySource.current = source;
+      setPreview(null);
+      setImportError("");
+      setImportResult("");
+      setImportFileName("file" in source ? source.file.name : "");
+      setImportStep("checking");
+      const controller = new AbortController();
+      uploadAbort.current = controller;
+      try {
+        const inspected = "file" in source
+          ? await uploadPluginPackage(source.file, args => invoke("inspect_codey_plugin", args), controller.signal)
+          : await invoke<CodeyPluginPreview>("inspect_codey_plugin", { path: source.path });
+        if (controller.signal.aborted) return;
+        if ("uploadId" in inspected) uploadedPackage.current = inspected.uploadId as string;
+        setPreview(inspected);
+      } catch (cause) {
+        if (!controller.signal.aborted) setImportError(`检查插件包失败：${errorText(cause)} 请修正文件后重试，或重新选择插件包。`);
+      } finally {
+        if (!controller.signal.aborted) setImportStep("");
+      }
+    }, true);
+  }, [run, discardUploadedPackage]);
 
   const handleSelectPackage = useCallback(() => {
     void run(async () => {
+      setImportStep("checking");
+      setImportError("");
       try {
         const selected = await invoke<CodeyPluginPreview | null>("select_codey_plugin_package");
         if (selected) {
+          discardUploadedPackage();
+          retrySource.current = { path: selected.path };
+          setImportFileName("");
           setPreview(selected);
-          setImportError("");
         }
       } catch (cause) {
         setPreview(null);
-        setImportError(errorText(cause));
+        setImportError(`检查插件包失败：${errorText(cause)} 请重新选择插件包。`);
+      } finally {
+        setImportStep("");
       }
     }, true);
-  }, [run]);
+  }, [run, discardUploadedPackage]);
 
   const handleInspectPath = useCallback((path: string) => {
-    if (!path.trim()) return;
+    if (path.trim()) inspectImport({ path: path.trim() });
+  }, [inspectImport]);
+
+  const handleDroppedFiles = useCallback((files: File[]) => {
+    if (pending.current || loading || !known) return;
+    window.clearTimeout(importTimer.current);
+    setImportOpen(true);
+    setConfirm(null);
+    setImportResult("");
+    const invalid = validateDroppedPluginFiles(files);
+    if (invalid) {
+      discardUploadedPackage();
+      retrySource.current = files.length === 1 ? { file: files[0] } : null;
+      setPreview(null);
+      setImportFileName(files.length === 1 ? files[0].name : "");
+      setImportError(invalid);
+      return;
+    }
+    inspectImport({ file: files[0] });
+  }, [inspectImport, discardUploadedPackage, loading, known]);
+
+  useEffect(() => installPluginFileDrop(
+    window, handleDroppedFiles, setDragActive,
+    busy || loading || !known || Boolean(editId || confirm || clearLogsPlugin),
+    () => Boolean(sectionEl?.getClientRects().length),
+  ), [handleDroppedFiles, busy, loading, known, editId, confirm, clearLogsPlugin, sectionEl]);
+
+  const handleConfirmImport = useCallback(() => {
+    if (!preview) return;
+    const selected = preview;
+    const installed = result?.plugins.find(plugin => plugin.id === selected.manifest.id);
+    if (installed?.version === selected.manifest.version) return;
     void run(async () => {
+      setImportStep("installing");
+      setImportError("");
       try {
-        const inspected = await invoke<CodeyPluginPreview>("inspect_codey_plugin", { path: path.trim() });
-        setPreview(inspected);
-        setImportError("");
-      } catch (cause) {
+        if (!known) await refresh();
+        await mutate("install_codey_plugin", { path: selected.path, sha256: selected.sha256 });
+        discardUploadedPackage();
+        retrySource.current = null;
+        setImportOpen(false);
         setPreview(null);
-        setImportError(errorText(cause));
+        setSearchQuery("");
+        const message = installed
+          ? `插件「${selected.manifest.name}」升级成功。`
+          : `插件「${selected.manifest.name}」安装成功，默认处于停用状态。`;
+        setImportResult(message);
+        setNotice(message);
+      } catch (cause) {
+        setImportError(`导入插件失败：${errorText(cause)} 可重试导入或重新选择插件包。`);
+      } finally {
+        setImportStep("");
       }
     }, true);
-  }, [run]);
+  }, [preview, result, run, known, refresh, mutate, discardUploadedPackage, setNotice]);
 
   const filteredPlugins = useMemo(() => {
     if (!result?.plugins) return [];
@@ -241,7 +342,7 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const editing = result?.plugins.find((p) => p.id === editId);
 
   return (
-    <section ref={setSectionEl} className="secondary-section codey-plugins-section" aria-labelledby="codey-plugins-title">
+    <section ref={setSectionEl} className="secondary-section codey-plugins-section" aria-labelledby="codey-plugins-title" data-codey-plugin-drop-zone="">
       <SettingsPageHeader
         id="codey-plugins-title"
         title="Codey 插件"
@@ -271,6 +372,27 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
           </div>
         }
       />
+
+      <div
+        role="region"
+        aria-label="插件文件拖放区域"
+        aria-busy={Boolean(importStep)}
+        className={cn(
+          "mb-4 flex items-center gap-3 rounded-xl border border-dashed p-4 text-xs transition-colors",
+          dragActive
+            ? "border-blue-500 bg-blue-500/10 text-blue-600 ring-2 ring-blue-500/20 dark:text-blue-400"
+            : "border-default bg-default/20 text-muted",
+        )}
+      >
+        {importStep ? <IconRefresh size={22} className="shrink-0 animate-spin" aria-hidden="true" /> : <IconFilePlus size={22} className="shrink-0" aria-hidden="true" />}
+        <div className="min-w-0" role="status" aria-live="polite">
+          <div className="font-medium text-foreground">
+            {importStep === "installing" ? "正在导入插件…" : importStep === "checking" ? "正在读取并检查插件包…" : dragActive ? "松开文件，检查并导入插件包" : "将插件包拖到此页面，或点击「导入插件包」"}
+          </div>
+          <p className="mb-0 mt-1">仅支持 .codey-plugin · 一次一个文件 · 最大 64 MiB · 检查后确认安装</p>
+        </div>
+      </div>
+      {importResult && <div role="status" className="mb-4 rounded-xl border border-green-500/25 bg-green-500/10 p-3 text-xs text-green-700 dark:text-green-300">{importResult}</div>}
 
       {/* 顶部统计与工具栏 */}
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -589,28 +711,23 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
         preview={preview}
         upgrading={upgrading}
         error={importError}
+        step={importStep}
+        dragActive={dragActive}
+        fileName={importFileName}
+        onRetry={preview ? handleConfirmImport : retrySource.current ? () => {
+          if (retrySource.current) inspectImport(retrySource.current);
+        } : undefined}
         onClose={closeImport}
         onSelectFile={handleSelectPackage}
         onInspectPath={handleInspectPath}
         onClearPreview={() => {
+          discardUploadedPackage();
           setPreview(null);
           setImportError("");
+          setImportFileName("");
+          retrySource.current = null;
         }}
-        onConfirm={() => {
-          if (!preview) return;
-          const selected = preview;
-          void run(async () => {
-            try {
-              await mutate("install_codey_plugin", { path: selected.path, sha256: selected.sha256 });
-              setImportOpen(false);
-              setPreview(null);
-              setImportError("");
-              setNotice(`插件「${selected.manifest.name}」安装成功，默认处于停用状态。`);
-            } catch (cause) {
-              setImportError(errorText(cause));
-            }
-          });
-        }}
+        onConfirm={handleConfirmImport}
       />
       ) : null}
 

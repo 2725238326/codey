@@ -11,6 +11,7 @@ mod package;
 
 use native::Native;
 pub use package::Inspection;
+pub(crate) use package::MAX_PACKAGE;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
