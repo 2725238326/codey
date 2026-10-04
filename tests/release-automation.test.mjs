@@ -86,19 +86,21 @@ test("AI notes require file and literal code evidence from actual differences", 
   assert.throws(() => validateNotes({ notes: "无证据的性能提升", evidence: [] }, patches), /证据/);
 });
 
-test("managed workflows isolate AI permissions and wait for every build gate before failure reporting", async () => {
-  const workflow = await readFile(new URL("../.github/workflows/build-desktop.yml", import.meta.url), "utf8");
-  const notes = workflow.slice(workflow.indexOf("\n  notes:"), workflow.indexOf("\n  macos:"));
-  assert.match(notes, /contents: read\s+copilot-requests: write/);
-  assert.doesNotMatch(notes, /RELEASE_ADMIN_CALLBACK_SECRET|CLOUDFLARE_API_TOKEN|contents: write/);
-  assert.match(notes, /persist-credentials: false/);
-  const managedPublish = workflow.slice(workflow.indexOf("\n  managed-publish:"), workflow.indexOf("\n  report-failure:"));
-  for (const gate of ["prepare", "notes", "macos", "macos-check", "windows", "windows-check"]) assert.match(managedPublish, new RegExp(`- ${gate}\\n`));
-  const failure = workflow.slice(workflow.indexOf("\n  report-failure:"));
-  assert.match(failure, /needs.prepare.outputs.claimed == 'true'/);
-  assert.match(failure, /needs.managed-publish.result != 'success'/);
-  for (const gate of ["prepare", "notes", "macos", "macos-check", "windows", "windows-check", "managed-publish"]) assert.match(failure, new RegExp(`- ${gate}\\n`));
-});
+for (const [lineEndingName, lineEnding] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
+  test(`managed workflows isolate AI permissions and wait for every build gate before failure reporting (${lineEndingName})`, async () => {
+    const workflow = (await readFile(new URL("../.github/workflows/build-desktop.yml", import.meta.url), "utf8")).replace(/\r?\n/g, lineEnding);
+    const notes = workflow.slice(workflow.indexOf("\n  notes:"), workflow.indexOf("\n  macos:"));
+    assert.match(notes, /contents: read\s+copilot-requests: write/);
+    assert.doesNotMatch(notes, /RELEASE_ADMIN_CALLBACK_SECRET|CLOUDFLARE_API_TOKEN|contents: write/);
+    assert.match(notes, /persist-credentials: false/);
+    const managedPublish = workflow.slice(workflow.indexOf("\n  managed-publish:"), workflow.indexOf("\n  report-failure:"));
+    for (const gate of ["prepare", "notes", "macos", "macos-check", "windows", "windows-check"]) assert.match(managedPublish, new RegExp(`- ${gate}\\r?\\n`));
+    const failure = workflow.slice(workflow.indexOf("\n  report-failure:"));
+    assert.match(failure, /needs.prepare.outputs.claimed == 'true'/);
+    assert.match(failure, /needs.managed-publish.result != 'success'/);
+    for (const gate of ["prepare", "notes", "macos", "macos-check", "windows", "windows-check", "managed-publish"]) assert.match(failure, new RegExp(`- ${gate}\\r?\\n`));
+  });
+}
 
 test("managed platform builds inject claimed versions before Rust caches without changing legacy or artifact-reuse paths", async () => {
   const workflow = await readFile(new URL("../.github/workflows/build-desktop.yml", import.meta.url), "utf8");

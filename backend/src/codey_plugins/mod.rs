@@ -1215,7 +1215,7 @@ fn verify_library(path: &Path, expected_sha256: &str) -> Result<(), String> {
         return Err("插件动态库必须是普通文件，不能是符号链接".into());
     }
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > package::MAX_PACKAGE || package::digest(&bytes) != expected_sha256 {
+    if bytes.len() as u64 > MAX_PACKAGE || package::digest(&bytes) != expected_sha256 {
         return Err("已安装动态库校验失败".into());
     }
     Ok(())
