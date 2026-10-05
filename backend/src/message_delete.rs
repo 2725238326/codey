@@ -184,6 +184,7 @@ fn delete_messages_once(
         &home.join(THREAD_HISTORY_DB),
         &history_session_id,
         &message_ids,
+        has_rollout,
     ) {
         Ok(Some(found)) => deleted_ids.extend(found),
         Ok(None) if home.join(THREAD_HISTORY_DB).exists() => result
@@ -1198,6 +1199,7 @@ fn delete_from_thread_history(
     path: &Path,
     session_id: &str,
     message_ids: &[String],
+    has_rollout: bool,
 ) -> Result<Option<HashSet<String>>> {
     if !path.exists() {
         return Ok(None);
@@ -1213,6 +1215,20 @@ fn delete_from_thread_history(
     if tables.len() != 2 {
         return Ok(None);
     }
+
+    let projection_columns =
+        crate::sqlite_util::table_columns(&connection, "thread_history_projection_state")?;
+    let invalidate_projection = has_rollout
+        && [
+            "thread_id",
+            "next_rollout_byte_offset",
+            "next_rollout_ordinal",
+        ]
+        .iter()
+        .all(|column| projection_columns.contains(*column));
+    let has_realtime_projection = invalidate_projection
+        && crate::sqlite_util::table_columns(&connection, "thread_realtime_items")?
+            .contains("thread_id");
 
     let placeholders = std::iter::repeat_n("?", message_ids.len())
         .collect::<Vec<_>>()
@@ -1232,10 +1248,32 @@ fn delete_from_thread_history(
                 .collect::<rusqlite::Result<Vec<String>>>()?
         };
         found.extend(matched);
+        if invalidate_projection {
+            // Removing rollout records invalidates byte positions for surviving
+            // turns too. Rebuild this thread's derived history from its source,
+            // including when startup replays an already-applied tombstone.
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE thread_id = ?"),
+                [session_id],
+            )?;
+        } else {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE {filter}"),
+                params_from_iter(values.iter()),
+            )?;
+        }
+    }
+    if invalidate_projection {
         transaction.execute(
-            &format!("DELETE FROM {table} WHERE {filter}"),
-            params_from_iter(values.iter()),
+            "DELETE FROM thread_history_projection_state WHERE thread_id = ?",
+            [session_id],
         )?;
+        if has_realtime_projection {
+            transaction.execute(
+                "DELETE FROM thread_realtime_items WHERE thread_id = ?",
+                [session_id],
+            )?;
+        }
     }
     transaction.commit()?;
     Ok(Some(found))
@@ -1596,6 +1634,146 @@ mod tests {
                     )
                     .unwrap(),
                 1
+            );
+        }
+    }
+
+    fn create_projection_history(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, rollout_byte_offset INTEGER, rollout_end_byte_offset INTEGER);\
+             CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, item_id TEXT);\
+             CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER NOT NULL, next_rollout_ordinal INTEGER NOT NULL);\
+             CREATE TABLE thread_realtime_items (thread_id TEXT, item_id TEXT);",
+        ).unwrap();
+        for thread_id in ["s1", "other"] {
+            connection
+                .execute(
+                    "INSERT INTO thread_turns VALUES (?1, 't1', 100, 200), (?1, 't2', 200, 300)",
+                    [thread_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO thread_items VALUES (?1, 't1', 'm1'), (?1, 't2', 'm2')",
+                    [thread_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO thread_history_projection_state VALUES (?1, 300, 10)",
+                    [thread_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO thread_realtime_items VALUES (?1, 'r1')",
+                    [thread_id],
+                )
+                .unwrap();
+        }
+        connection
+    }
+
+    #[test]
+    fn rollout_deletion_invalidates_only_its_thread_projection_and_replay_repairs_old_cursors() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/10/01");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-test.jsonl");
+        fs::write(&rollout, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t2\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\"}}\n",
+        )).unwrap();
+        let catalog = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        catalog
+            .execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+            .unwrap();
+        catalog
+            .execute(
+                "INSERT INTO threads VALUES ('s1', ?1)",
+                [rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let history = create_projection_history(&home.path().join(THREAD_HISTORY_DB));
+
+        let result = delete_messages_persistently(home.path(), "s1", &["t1".into()]).unwrap();
+        assert_eq!(result.deleted, 1);
+        assert!(fs::read_to_string(&rollout).unwrap().contains("t2"));
+        for (table, other_count) in [
+            ("thread_turns", 2),
+            ("thread_items", 2),
+            ("thread_history_projection_state", 1),
+            ("thread_realtime_items", 1),
+        ] {
+            let count = |thread_id: &str| {
+                history
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = ?1"),
+                        [thread_id],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(count("s1"), 0, "{table}");
+            assert_eq!(count("other"), other_count, "{table}");
+        }
+
+        // An old deletion can leave a cursor even after the selected turn has
+        // disappeared from both the rollout and the projected turn rows.
+        history
+            .execute_batch(
+                "INSERT INTO thread_turns VALUES ('s1', 't2', 200, 300);\
+             INSERT INTO thread_items VALUES ('s1', 't2', 'm2');\
+             INSERT INTO thread_history_projection_state VALUES ('s1', 300, 10);",
+            )
+            .unwrap();
+        let replay = reapply_persisted_deletions(home.path()).unwrap();
+        assert!(replay.failures.is_empty());
+        assert_eq!(replay.deleted, 0);
+        for table in [
+            "thread_turns",
+            "thread_items",
+            "thread_history_projection_state",
+        ] {
+            assert_eq!(
+                history
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = 's1'"),
+                        [],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_without_a_rollout_preserves_the_remaining_projected_history() {
+        let home = tempdir().unwrap();
+        let history = create_projection_history(&home.path().join(THREAD_HISTORY_DB));
+        let result = delete_messages_persistently(home.path(), "s1", &["t1".into()]).unwrap();
+        assert_eq!(result.deleted, 1);
+        for table in [
+            "thread_turns",
+            "thread_items",
+            "thread_history_projection_state",
+            "thread_realtime_items",
+        ] {
+            assert_eq!(
+                history
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = 's1'"),
+                        [],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{table}"
             );
         }
     }
