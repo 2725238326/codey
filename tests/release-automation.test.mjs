@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { analyzeNotePatches, assertSameAssets, callback, collectNotePatches, generateNotes, identity, main, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
@@ -380,7 +380,7 @@ test("Git diff collection preserves a file above 2 MB and treats special paths l
     const execute = promisify(execFile);
     const git = args => execute("git", args);
     await git(["init", "--quiet"]);
-    const file = ":literal[测试].txt";
+    const file = process.platform === "win32" ? "literal[测试].txt" : ":literal[测试].txt";
     await writeFile(file, "old\n");
     await git(["add", "."]);
     const commit = () => git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "test"]);
@@ -413,7 +413,7 @@ test("managed publication checks the canonical repository URL before reading rel
       assert.equal(options.headers.authorization, "Bearer test-token");
       return url === "https://api.github.com/repos/owner/codey" ? Response.json({ id: 1 }) : new Response(null, { status: 404 });
     };
-    await assert.rejects(main("publish"), error => error.code === "ENOENT" && error.path === "release-notes.json");
+    await assert.rejects(main("publish"), error => error.code === "ENOENT" && typeof error.path === "string" && resolve(error.path) === resolve("release-notes.json"));
     assert.deepEqual(requests, ["https://api.github.com/repos/owner/codey"]);
   });
 });

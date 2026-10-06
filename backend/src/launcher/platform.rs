@@ -1014,6 +1014,32 @@ pub(crate) fn windows_process_in_session(
     }
 }
 
+/// Machine-level services and the elevated sandbox installer are outside
+/// desktop cleanup ownership, even when their session or image path cannot be
+/// read: retry snapshots also extend descendants without session filtering.
+/// Exact names avoid exempting ordinary app helpers with service-like names.
+#[cfg(any(windows, test))]
+const WINDOWS_CODEX_SERVICE_EXECUTABLE_NAMES: &[&str] = &[
+    "codex-windows-sandbox-service.exe",
+    "codex-windows-sandbox-setup.exe",
+    "elevation_service.exe",
+    "elevated_tracing_service.exe",
+];
+
+#[cfg(any(windows, test))]
+fn windows_executable_name_is_codex_service(name: &str) -> bool {
+    WINDOWS_CODEX_SERVICE_EXECUTABLE_NAMES
+        .iter()
+        .any(|service| name.eq_ignore_ascii_case(service))
+}
+
+#[cfg(any(windows, test))]
+fn windows_executable_is_codex_service(path: &Path) -> bool {
+    normalized_windows_path(path)
+        .rsplit_once('\\')
+        .is_some_and(|(_, name)| windows_executable_name_is_codex_service(name))
+}
+
 #[cfg(any(windows, test))]
 pub(super) fn windows_owned_process_ids_from_snapshot<'a>(
     app_dir: &Path,
@@ -1025,7 +1051,10 @@ pub(super) fn windows_owned_process_ids_from_snapshot<'a>(
         .iter()
         .filter(|(candidate_process_id, _, executable_path)| {
             Some(*candidate_process_id) == process_id
-                || executable_path.is_some_and(|path| windows_path_is_within(path, app_dir))
+                || executable_path.is_some_and(|path| {
+                    windows_path_is_within(path, app_dir)
+                        && !windows_executable_is_codex_service(path)
+                })
         })
         .map(|(candidate_process_id, _, _)| *candidate_process_id)
         .collect::<HashSet<_>>();
@@ -1041,8 +1070,10 @@ pub(super) fn windows_extend_tracked_descendants_from_snapshot<'a>(
     let processes = processes.into_iter().collect::<Vec<_>>();
     loop {
         let previous_len = process_ids.len();
-        for (candidate_process_id, parent_process_id, _) in &processes {
-            if process_ids.contains(parent_process_id) {
+        for (candidate_process_id, parent_process_id, executable_path) in &processes {
+            if process_ids.contains(parent_process_id)
+                && !executable_path.is_some_and(windows_executable_is_codex_service)
+            {
                 process_ids.insert(*candidate_process_id);
             }
         }
@@ -1084,10 +1115,12 @@ async fn terminate_windows_codex_processes_with_snapshot(
     mut snapshot: impl FnMut() -> Result<Vec<codey_runtime_core::WindowsProcessInfo>>,
 ) -> Result<()> {
     let current_session = codey_runtime_core::windows_process_session_id(std::process::id());
+    // Toolhelp names remain available when a service's image path is unreadable.
     let processes = snapshot()
         .context("检测待停止的 Windows Codex 进程失败")?
         .into_iter()
         .filter(|process| windows_process_in_session(process.session_id, current_session))
+        .filter(|process| !windows_executable_name_is_codex_service(&process.exe_file))
         .collect::<Vec<_>>();
     let mut process_ids = windows_owned_process_ids_from_snapshot(
         app_dir,
@@ -1150,7 +1183,11 @@ async fn terminate_windows_codex_processes_with_snapshot(
     }
     let deadline = tokio::time::Instant::now() + stop_timeout;
     loop {
-        let current_processes = snapshot().context("确认 Windows Codex 进程清理结果失败")?;
+        let current_processes = snapshot()
+            .context("确认 Windows Codex 进程清理结果失败")?
+            .into_iter()
+            .filter(|process| !windows_executable_name_is_codex_service(&process.exe_file))
+            .collect::<Vec<_>>();
         let previous_process_ids = process_ids.clone();
         windows_extend_tracked_descendants_from_snapshot(
             &mut process_ids,
@@ -1408,6 +1445,92 @@ mod compatibility_tests {
         assert!(windows_process_in_session(Some(0), None));
     }
 
+    // 【自动化测试】Windows 清理 - 沙箱服务的 session id 读不到时，按可执行文件名也不能进停止集合
+    #[test]
+    fn codex_service_executables_are_not_cleanup_targets() {
+        let app_dir = Path::new(r"E:\Agent_tools\Codex_gpt\app");
+        for executable in [
+            r"resources\codex-windows-sandbox-service.exe",
+            r"resources\Codex-Windows-Sandbox-Service.EXE",
+            r"resources\codex-windows-sandbox-setup.exe",
+            "elevation_service.exe",
+            "elevated_tracing_service.exe",
+        ] {
+            let path = app_dir.join(executable);
+            assert!(
+                windows_owned_process_ids_from_snapshot(
+                    app_dir,
+                    None,
+                    [(10, 4, Some(path.as_path()))],
+                )
+                .is_empty(),
+                "unexpected cleanup target: {executable}",
+            );
+            assert!(
+                windows_codex_instances_from_snapshot(app_dir, [(10, Some(path.as_path()))])
+                    .is_empty(),
+                "unexpected desktop instance: {executable}",
+            );
+        }
+        for executable in [
+            "Codex.exe",
+            "ChatGPT.exe",
+            r"resources\Codex.exe",
+            r"resources\ChatGPT.exe",
+            r"resources\node.exe",
+            r"resources\rg.exe",
+            r"resources\codex-command-runner.exe",
+            r"resources\codex-code-mode-host.exe",
+            r"resources\extension-host.exe",
+            r"resources\tectonic.exe",
+            r"resources\winpty-agent.exe",
+            "chrome_proxy.exe",
+            "notification_helper.exe",
+            r"resources\ordinary-service.exe",
+        ] {
+            let path = app_dir.join(executable);
+            assert_eq!(
+                windows_owned_process_ids_from_snapshot(
+                    app_dir,
+                    None,
+                    [(10, 4, Some(path.as_path()))],
+                ),
+                HashSet::from([10]),
+                "missing cleanup target: {executable}",
+            );
+        }
+    }
+
+    // 【自动化测试】Windows 清理 - 沙箱服务挂为子孙也要跳过，且不能借它把它的子进程桥接进来
+    #[test]
+    fn codex_service_executables_do_not_extend_cleanup_targets() {
+        let app_dir = Path::new(r"E:\Agent_tools\Codex_gpt\app");
+        let codex = app_dir.join("Codex.exe");
+        let service = app_dir.join(r"resources\codex-windows-sandbox-service.exe");
+        let mut process_ids = windows_owned_process_ids_from_snapshot(
+            app_dir,
+            None,
+            [
+                (10, 4, Some(codex.as_path())),
+                (11, 10, Some(service.as_path())),
+                (12, 11, None),
+                (13, 10, None),
+            ],
+        );
+        assert_eq!(process_ids, HashSet::from([10, 13]));
+
+        let outside_service = Path::new(r"D:\Shared\codex-windows-sandbox-service.exe");
+        windows_extend_tracked_descendants_from_snapshot(
+            &mut process_ids,
+            [
+                (14, 10, Some(outside_service)),
+                (15, 14, None),
+                (16, 13, None),
+            ],
+        );
+        assert_eq!(process_ids, HashSet::from([10, 13, 16]));
+    }
+
     #[test]
     fn codex_instance_summary_lists_a_few_processes() {
         let instances = (1..=4)
@@ -1440,6 +1563,104 @@ mod compatibility_tests {
             drop(child);
             // 259 is STILL_ACTIVE only for a running process; it is also a valid exit code.
             assert_eq!(process.exit_code().unwrap(), Some(code));
+        }
+    }
+
+    // Known services stay outside cleanup even if a stale root PID names one.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cleanup_snapshot_with_only_codex_service_succeeds() {
+        let app_dir = Path::new(r"C:\CodeyTestApp");
+        let service = codey_runtime_core::WindowsProcessInfo {
+            process_id: u32::MAX,
+            parent_process_id: 4,
+            exe_file: "codex-windows-sandbox-service.exe".to_string(),
+            executable_path: Some(app_dir.join(r"resources\codex-windows-sandbox-service.exe")),
+            creation_time: Some(1),
+            session_id: None,
+        };
+        for (executable_path, process_id) in [
+            (service.executable_path.clone(), None),
+            (service.executable_path.clone(), Some(service.process_id)),
+            (None, Some(service.process_id)),
+        ] {
+            let service = codey_runtime_core::WindowsProcessInfo {
+                executable_path,
+                ..service.clone()
+            };
+            let mut calls = 0;
+            let result = terminate_windows_codex_processes_with_snapshot(
+                app_dir,
+                process_id,
+                Duration::ZERO,
+                || {
+                    calls += 1;
+                    Ok(vec![service.clone()])
+                },
+            )
+            .await;
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(calls, 2);
+        }
+    }
+
+    // Toolhelp names identify unreadable services; other unreadable children
+    // must still prevent cleanup from being reported as successful.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cleanup_snapshot_filters_unreadable_services_but_keeps_other_descendants() {
+        let app_dir = Path::new(r"C:\CodeyTestApp");
+        let root = codey_runtime_core::WindowsProcessInfo {
+            process_id: u32::MAX - 2,
+            parent_process_id: 4,
+            exe_file: "Codex.exe".to_string(),
+            executable_path: Some(app_dir.join("Codex.exe")),
+            creation_time: None,
+            session_id: None,
+        };
+        for (exe_file, expected_success) in [
+            ("Codex-Windows-Sandbox-Service.EXE", true),
+            ("ordinary-service.exe", false),
+        ] {
+            let descendant = codey_runtime_core::WindowsProcessInfo {
+                process_id: u32::MAX - 1,
+                parent_process_id: root.process_id,
+                exe_file: exe_file.to_string(),
+                executable_path: None,
+                ..root.clone()
+            };
+            let child = codey_runtime_core::WindowsProcessInfo {
+                process_id: u32::MAX,
+                parent_process_id: descendant.process_id,
+                exe_file: "worker.exe".to_string(),
+                ..descendant.clone()
+            };
+            for present_initially in [true, false] {
+                let mut calls = 0;
+                let result = terminate_windows_codex_processes_with_snapshot(
+                    app_dir,
+                    Some(root.process_id),
+                    Duration::ZERO,
+                    || {
+                        calls += 1;
+                        let mut processes = vec![descendant.clone(), child.clone()];
+                        if calls == 1 {
+                            if !present_initially {
+                                processes.clear();
+                            }
+                            processes.push(root.clone());
+                        }
+                        Ok(processes)
+                    },
+                )
+                .await;
+                assert_eq!(
+                    result.is_ok(),
+                    expected_success,
+                    "{exe_file}, present_initially={present_initially}: {result:?}",
+                );
+                assert_eq!(calls, 2);
+            }
         }
     }
 
