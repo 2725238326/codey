@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
-import { assertSameAssets, callback, identity, main, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
+import { analyzeNotePatches, assertSameAssets, callback, collectNotePatches, generateNotes, identity, main, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
 
 const environment = {
   RELEASE_BUILD_ID: "build_test-123", RELEASE_ATTEMPT: "2", GITHUB_RUN_ID: "456", RELEASE_ACTION: "build",
@@ -84,6 +86,55 @@ test("AI notes require file and literal code evidence from actual differences", 
   assert.throws(() => validateNotes({ ...valid, evidence: [{ ...valid.evidence[0], note: '额外结论' }] }, patches), /无法核实/);
   assert.throws(() => validateNotes({ ...valid, notes: valid.notes + '\n- 无证据的性能提升' }, patches), /每条日志/);
   assert.throws(() => validateNotes({ notes: "无证据的性能提升", evidence: [] }, patches), /证据/);
+  assert.equal(validateNotes(valid, [{ file: "retry.js", diff: "+const first = true;" }, ...patches]).notes_status, "generated");
+  assert.throws(() => validateNotes(valid, [{ file: "retry.js", diff: " context +const retries = 3;" }]), /无法核实/);
+});
+
+function largeNotePatches() {
+  return Array.from({ length: 125 }, (_, index) => ({ file: `src/file-${index}.js`, diff: `@@ -1 +1,101 @@\n${Array.from({ length: 100 }, (_, line) => `+const value_${index}_${line} = ${line};\n`).join("")}` }));
+}
+
+function batchNote(batch, note) {
+  const patch = batch.find(item => item.diff.split("\n").some(line => /^\+const/.test(line)));
+  return { notes: `- ${note}`, evidence: [{ note, file: patch.file, excerpt: patch.diff.split("\n").find(line => /^\+const/.test(line)) }] };
+}
+
+test("all large-diff batches are analyzed before validated notes are merged", async () => {
+  const patches = largeNotePatches();
+  const seen = [];
+  const result = await analyzeNotePatches(patches, build, async (batch, context, index, total) => {
+    assert.equal(context.source_sha, build.source_sha);
+    assert.equal(context.base_sha, build.base_sha);
+    assert.ok(total > 1);
+    seen.push(...batch);
+    return batchNote(batch, `批次 ${index + 1} 的代码变更`);
+  });
+  assert.equal(result.notes_status, "generated");
+  assert.ok(result.evidence.length > 1);
+  for (const patch of patches) assert.equal(seen.filter(item => item.file === patch.file).map(item => item.diff).join(""), patch.diff);
+});
+
+test("batch evidence cannot cite changes from another batch", async () => {
+  const patches = largeNotePatches();
+  await assert.rejects(analyzeNotePatches(patches, build, async () => batchNote([patches.at(-1)], "引用其他批次")), /第 1\/.*无法核实/);
+});
+
+test("all patches are checked for secrets and binaries before the first AI request", async () => {
+  for (const unsafe of [
+    { file: ".env.production", diff: "+TOKEN=value\n" },
+    { file: "src/secret.js", diff: `+const token = 'ghp_${"a".repeat(40)}';\n` },
+    { file: "src/private.txt", diff: "+-----BEGIN PRIVATE KEY-----\n" },
+    { file: "image.png", diff: "Binary files a/image.png and b/image.png differ\n" },
+  ]) {
+    await assert.rejects(analyzeNotePatches([...largeNotePatches(), unsafe], build, () => assert.fail("AI must not receive any batch before preflight")), /凭据|密钥|二进制/);
+  }
+});
+
+test("empty batch summaries are allowed but an entirely empty release requires manual notes", async () => {
+  let calls = 0;
+  const result = await analyzeNotePatches(largeNotePatches(), build, async batch => ++calls === 1 ? batchNote(batch, "确认代码变更") : { notes: "", evidence: [] });
+  assert.equal(result.evidence.length, 1);
+  await assert.rejects(analyzeNotePatches([{ file: "internal.js", diff: "+const internal = true;\n" }], build, async () => ({ notes: "", evidence: [] })), /缺少有效日志/);
 });
 
 for (const [lineEndingName, lineEnding] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
@@ -127,6 +178,23 @@ test("delete maintenance uses the same lock and has no R2 credentials", async ()
   const deletion = workflow.slice(workflow.indexOf("\n  delete:"), workflow.indexOf("\n  report-failure:"));
   assert.doesNotMatch(deletion, /CLOUDFLARE|copilot/);
   assert.match(deletion, /release-automation.mjs delete/);
+});
+
+test("notes retry uses fixed workflow tools while retaining the original source and baseline", async () => {
+  for (const name of ["build-desktop.yml", "release-maintenance.yml"]) {
+    const workflow = await readFile(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8");
+    const notes = workflow.slice(workflow.indexOf("\n  notes:"), workflow.indexOf(name === "build-desktop.yml" ? "\n  macos:" : "\n  sync:"));
+    assert.match(notes, /ref: \$\{\{ inputs.source_sha \}\}\s+fetch-depth: 0\s+persist-credentials: false/);
+    assert.match(notes, /ref: \$\{\{ github.sha \}\}\s+path: .release-tools\s+persist-credentials: false/);
+    assert.match(notes, /run: node \.release-tools\/scripts\/release-automation.mjs notes/);
+    assert.doesNotMatch(notes, /working-directory|RELEASE_ADMIN_CALLBACK_SECRET|CLOUDFLARE_API_TOKEN|contents: write/);
+    assert.match(workflow, /RELEASE_BASE_SHA: \$\{\{ inputs.base_sha \}\}/);
+    assert.match(workflow, /RELEASE_SOURCE_SHA: \$\{\{ inputs.source_sha \}\}/);
+    if (name === "release-maintenance.yml") {
+      const sync = workflow.slice(workflow.indexOf("\n  sync:"), workflow.indexOf("\n  delete:"));
+      assert.match(sync, /ref: \$\{\{ github.sha \}\}/);
+    }
+  }
 });
 
 async function sandboxBuild(action, handler) {
@@ -287,6 +355,48 @@ test("first release without baseline preserves a manual-notes result without usi
     assert.equal(result.notes_status, "manual_required");
     assert.match(result.reason, /首次发布/);
     assert.equal(result.notes, "");
+  });
+});
+
+test("a failed batch discards every partial note and masks command prompts", async () => {
+  await sandboxBuild("notes", async () => {
+    let calls = 0;
+    await generateNotes({ collect: async () => largeNotePatches(), analyze: async batch => {
+      if (++calls === 2) throw Object.assign(new Error("prompt with source and credentials"), { cmd: "copilot --prompt sensitive" });
+      return batchNote(batch, "不应保存的部分日志");
+    } });
+    const result = JSON.parse(await readFile("release-notes.json", "utf8"));
+    assert.equal(calls, 2);
+    assert.equal(result.notes_status, "manual_required");
+    assert.equal(result.notes, "");
+    assert.deepEqual(result.evidence, []);
+    assert.match(result.reason, /第 2\/.*AI 调用失败/);
+    assert.doesNotMatch(result.reason, /sensitive|credentials|prompt with/);
+  });
+});
+
+test("Git diff collection preserves a file above 2 MB and treats special paths literally", async () => {
+  await sandboxBuild("notes", async () => {
+    const execute = promisify(execFile);
+    const git = args => execute("git", args);
+    await git(["init", "--quiet"]);
+    const file = ":literal[测试].txt";
+    await writeFile(file, "old\n");
+    await git(["add", "."]);
+    const commit = () => git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "test"]);
+    await commit();
+    const base = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    const contents = `${"const largeLine = '中文内容'; ".repeat(12)}\n`.repeat(10000);
+    assert.ok(Buffer.byteLength(contents) > 2 * 1024 * 1024);
+    await writeFile(file, contents);
+    await git(["add", "."]);
+    await commit();
+    const source = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    const patches = await collectNotePatches({ base_sha: base, source_sha: source });
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].file, file);
+    assert.ok(Buffer.byteLength(patches[0].diff) > 2 * 1024 * 1024);
+    assert.equal(patches[0].diff.split("\n").filter(line => line.startsWith("+const largeLine")).length, 10000);
   });
 });
 

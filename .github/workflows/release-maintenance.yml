@@ -82,6 +82,12 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Check out release analysis tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -94,7 +100,7 @@ jobs:
       - name: Generate evidence-backed release notes
         env:
           COPILOT_GITHUB_TOKEN: ${{ github.token }}
-        run: node scripts/release-automation.mjs notes
+        run: node .release-tools/scripts/release-automation.mjs notes
       - uses: actions/upload-artifact@v4
         with:
           name: release-notes-evidence
@@ -118,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
