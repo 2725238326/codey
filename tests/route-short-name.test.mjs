@@ -8,13 +8,14 @@ const shortNames = await loadTypeScriptModule(
   new URL("../src/routeShortNames.ts", import.meta.url),
 );
 
-test("third-party route short names are required and limited to two characters", () => {
-  assert.equal(shortNames.MAX_ROUTE_SHORT_NAME_CHARACTERS, 2);
+test("third-party route short names are required and limited to four characters", () => {
+  assert.equal(shortNames.MAX_ROUTE_SHORT_NAME_CHARACTERS, 4);
   assert.equal(shortNames.validateThirdPartyRouteShortName(""), "请输入短名称");
   assert.equal(shortNames.validateThirdPartyRouteShortName("中转"), "");
+  assert.equal(shortNames.validateThirdPartyRouteShortName("中转线路"), "");
   assert.equal(
-    shortNames.validateThirdPartyRouteShortName("中转线"),
-    "短名称最多 2 个字符",
+    shortNames.validateThirdPartyRouteShortName("中转线路名"),
+    "短名称最多 4 个字符",
   );
   assert.equal(
     shortNames.validateThirdPartyRouteShortName("官"),
@@ -53,7 +54,7 @@ test("model labels use the default official prefix or a custom route short name"
   assert.equal(shortNames.prefixedRouteModelName(officialDefault, "gpt-5.6-sol"), "[官] gpt-5.6-sol");
   assert.equal(shortNames.prefixedRouteModelName(officialCustom, "gpt-5.6-sol"), "[官1] gpt-5.6-sol");
   assert.equal(shortNames.prefixedRouteModelName(relay, "claude-opus"), "[备] claude-opus");
-  assert.equal(shortNames.fallbackRouteShortName(" 备用中转 "), "备用");
+  assert.equal(shortNames.fallbackRouteShortName(" 备用中转 "), "备用中转");
 });
 
 test("the third-party route editor exposes the route-name and short-name fields with maxLength", async () => {
@@ -94,9 +95,10 @@ test("official route short names may stay empty and only conflict with third-par
   assert.equal(shortNames.validateOfficialRouteShortName(""), "");
   assert.equal(shortNames.validateOfficialRouteShortName("   "), "");
   assert.equal(shortNames.validateOfficialRouteShortName("自"), "");
+  assert.equal(shortNames.validateOfficialRouteShortName("官方线路"), "");
   assert.equal(
-    shortNames.validateOfficialRouteShortName("官方线"),
-    "短名称最多 2 个字符",
+    shortNames.validateOfficialRouteShortName("官方线路名"),
+    "短名称最多 4 个字符",
   );
   assert.equal(
     shortNames.validateOfficialRouteShortName("中转", profiles),

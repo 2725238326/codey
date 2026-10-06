@@ -283,6 +283,7 @@ fn wait_snapshot_never_settles_unreported_ledger_siblings() {
     write_test_runtime_policy(root);
     for task in ["reader_a", "reader_b"] {
         let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(format!("/repo-{task}"));
         spawn.turn_id = Some("root-turn".to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -1524,6 +1525,7 @@ fn bound_root_turn_can_finish_batch_dispatch_while_other_turns_fail_closed() {
     write_test_runtime_policy(root);
     let spawn_input = |task: &str, turn: &str| {
         let mut spawn = input("PreToolUse", "turn-bound-session");
+        spawn.cwd = Some(format!("/repo-{task}"));
         spawn.turn_id = Some(turn.to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -2059,6 +2061,7 @@ fn missing_id_stop_settles_only_a_unique_active_ledger_candidate() {
 
     let spawn_agent = |session_id: &str, task_id: &str, now_ms: u64| {
         let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(format!("/repo-{task_id}"));
         spawn.turn_id = Some("root-turn-a".to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -2179,7 +2182,7 @@ fn subagent_stop_releases_root_and_stop_hook_cannot_finish_early() {
 }
 
 #[test]
-fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
+fn analysis_roles_do_not_open_a_read_only_root_window() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write_test_runtime_policy(root);
@@ -2193,6 +2196,7 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
                        contract: Value,
                        now_ms: u64| {
         let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(format!("/repo-{task_id}"));
         spawn.turn_id = Some(root_turn.to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -2277,14 +2281,17 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         "mcp__cms_database__describe_table",
     ] {
         assert_eq!(
-            handle_hook_for_runtime_at(
-                &root_tool(read_session, root_turn, tool_name),
-                root,
-                runtime_id,
-                base + 30,
+            permission(
+                &handle_hook_for_runtime_at(
+                    &root_tool(read_session, root_turn, tool_name),
+                    root,
+                    runtime_id,
+                    base + 30,
+                )
+                .unwrap()
             )
-            .unwrap(),
-            json!({}),
+            .as_deref(),
+            Some("deny"),
             "{tool_name}"
         );
     }
@@ -2293,8 +2300,9 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         "sql": "WITH columns AS (SELECT * FROM information_schema.columns) SELECT * FROM columns;"
     }));
     assert_eq!(
-        handle_hook_for_runtime_at(&sql_read, root, runtime_id, base + 30).unwrap(),
-        json!({})
+        permission(&handle_hook_for_runtime_at(&sql_read, root, runtime_id, base + 30).unwrap())
+            .as_deref(),
+        Some("deny")
     );
     for tool_name in [
         "mcp__codey_fastctx__replace",
@@ -2358,8 +2366,7 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
     assert_eq!(continuation["decision"].as_str(), Some("block"));
     let reason = continuation["reason"].as_str().unwrap();
     assert!(reason.contains("仍有 1 个子代理"));
-    assert!(reason.contains("数据库 schema/只读 SQL"));
-    assert!(reason.contains("写入、命令、视觉"));
+    assert!(!reason.contains("数据库 schema/只读 SQL"));
     assert!(
         !agent_marker_path(
             &session_state_dir(root, read_session),
@@ -2377,14 +2384,17 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         .exists()
     );
     assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_tool(read_session, root_turn, "mcp__codey_fastctx__grep"),
-            root,
-            runtime_id,
-            base + 41,
+        permission(
+            &handle_hook_for_runtime_at(
+                &root_tool(read_session, root_turn, "mcp__codey_fastctx__grep"),
+                root,
+                runtime_id,
+                base + 41,
+            )
+            .unwrap()
         )
-        .unwrap(),
-        json!({})
+        .as_deref(),
+        Some("deny")
     );
 
     remove_active_marker(root, runtime_id, read_session, "agent-reader-b").unwrap();
@@ -2428,7 +2438,7 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         base + 53,
     )
     .unwrap();
-    assert_eq!(native_readonly, json!({}));
+    assert_eq!(permission(&native_readonly).as_deref(), Some("deny"));
 
     let mut command_reader_stop = input("SubagentStop", command_session);
     command_reader_stop.agent_id = Some("agent-command-reader".to_string());
@@ -2708,7 +2718,7 @@ fn mixed_full_list_settles_only_the_terminal_ledger_marker() {
     let spawn = |task_id: &str, agent_id: &str, now_ms: u64| {
         let mut request = input("PreToolUse", session_id);
         request.turn_id = Some("root-turn-a".to_string());
-        request.cwd = Some("/repo".to_string());
+        request.cwd = Some(format!("/repo-{task_id}"));
         request.tool_name = Some("agents.spawn_agent".to_string());
         request.tool_input = Some(json!({
             "task_name": task_id,

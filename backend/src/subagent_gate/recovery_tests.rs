@@ -7,6 +7,7 @@ fn start_recovery_child(root: &Path, session: &str) {
 fn start_recovery_child_named(root: &Path, session: &str, task_name: &str) {
     write_test_runtime_policy(root);
     let mut spawn = input("PreToolUse", session);
+    spawn.cwd = Some(format!("/repo-{task_name}"));
     spawn.turn_id = Some("root-turn-a".into());
     spawn.tool_name = Some("agents.spawn_agent".into());
     spawn.tool_input = Some(json!({

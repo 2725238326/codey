@@ -19,11 +19,12 @@ use crate::codex_config_guidance::{
     ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
     SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
     append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
-    remove_subagent_guidance, subagent_source_config,
+    remove_owned_guidance_paragraph, remove_subagent_guidance, subagent_source_config,
+    subagent_source_config_versions,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SUBAGENT_ROLE_VISUAL_WORKER, SUBAGENT_ROLE_WORKER, SubagentRoleConfig, default_config_path,
+    SubagentRoleConfig, default_config_path,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -71,7 +72,7 @@ const CODEY_FASTCTX_GREP_TOKEN_BUDGET: usize = 10_800;
 const CODEY_FASTCTX_GLOB_TOKEN_BUDGET: usize = 5_400;
 const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 120;
 const CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS: i64 = 300;
-const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 3;
+const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
 const APPLIED_HOOKS_JSON_FILE: &str = "applied-hooks.json";
 const CODEY_CONSTRAINTS_DIR: &str = "codex-constraints";
 const CODEY_ROOT_INSTRUCTIONS_FILE: &str = "root-instructions.md";
@@ -718,16 +719,10 @@ fn runtime_subagent_roles(
 
 fn runtime_root_instructions_for_roles(
     root_instructions: &str,
-    roles: &BTreeMap<String, SubagentRoleConfig>,
+    _roles: &BTreeMap<String, SubagentRoleConfig>,
 ) -> String {
-    let has_writable_role = roles.contains_key(SUBAGENT_ROLE_WORKER)
-        || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER)
-        || roles.contains_key(SUBAGENT_ROLE_DEFAULT);
-    if has_writable_role {
-        root_instructions.to_string()
-    } else {
-        append_constraint_text(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
-    }
+    remove_owned_guidance_paragraph(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
+        .unwrap_or_else(|| root_instructions.to_string())
 }
 
 fn prepare_runtime_agent_files(
@@ -799,7 +794,11 @@ fn plan_runtime_agent_files(
         if let Some(parent) = source_path.parent() {
             create_private_dir_all(parent)?;
         }
-        let source = read_or_create_constraint_file(&source_path, default_source)?;
+        let source = read_or_create_versioned_constraint_file(
+            &source_path,
+            default_source,
+            &subagent_source_config_versions(role).unwrap(),
+        )?;
         let runtime_path = runtime_agent_path(constraints_dir, role);
         let (contents, description) =
             render_runtime_agent(&source, role, selection, fastctx_instructions)?;
@@ -861,17 +860,11 @@ fn render_runtime_agent(
             "developer_instructions",
         )?;
     }
-    if !matches!(
-        role,
-        SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_VISUAL_WORKER | SUBAGENT_ROLE_DEFAULT
-    ) {
-        append_table_constraint_text(
-            document.as_table_mut(),
-            "developer_instructions",
-            READ_ONLY_AGENT_WRITE_GUARD,
-            "developer_instructions",
-        )?;
-    }
+    remove_guidance_from_table(
+        document.as_table_mut(),
+        "developer_instructions",
+        |current| remove_owned_guidance_paragraph(current, READ_ONLY_AGENT_WRITE_GUARD),
+    );
     append_table_constraint_text(
         document.as_table_mut(),
         "developer_instructions",

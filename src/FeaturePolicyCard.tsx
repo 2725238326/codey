@@ -1,7 +1,6 @@
 import { memo, useState, type CSSProperties } from "react";
 import {
   IconAdjustments,
-  IconAlertTriangle,
   IconCode,
   IconDeviceDesktopCode,
   IconFocus2,
@@ -52,10 +51,6 @@ const REASONING_EFFORT_LABELS: Record<string, string> = {
   max: "最大",
   ultra: "超高",
 };
-const SUBAGENT_ACCESS_LABELS = {
-  readOnly: "只读",
-  write: "可写",
-} as const;
 const DEFAULT_SUBAGENT_TASK = {
   id: "default",
   name: "默认子代理",
@@ -66,50 +61,45 @@ const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_quick_scan",
     name: "快速定位",
-    access: "readOnly",
+    kind: "analysis",
     icon: IconFocus2,
-    description: "默认只读；用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
+    description: "用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
   },
   {
     id: "codey_deep_research",
     name: "深度检索",
-    access: "readOnly",
+    kind: "analysis",
     icon: IconWorldSearch,
-    description: "默认只读；用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
+    description: "用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
   },
   {
     id: "codey_visual_analysis",
     name: "视觉分析",
-    access: "readOnly",
+    kind: "analysis",
     icon: IconPhotoSearch,
-    description: "默认只读；仅用于必须读取截图、页面、GUI、PDF 或渲染结果的视觉证据分析。",
+    description: "用于截图、页面、GUI、PDF 或渲染结果的视觉证据分析。",
   },
   {
     id: "codey_worker",
     name: "代码实施",
-    access: "write",
+    kind: "implementation",
     icon: IconCode,
-    description: "默认可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
+    description: "用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
   },
   {
     id: "codey_visual_worker",
     name: "视觉实施",
-    access: "write",
+    kind: "implementation",
     icon: IconDeviceDesktopCode,
-    description: "默认可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
+    description: "用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
   },
 ] as const satisfies ReadonlyArray<{
   id: SubagentRoleId;
   name: string;
-  access: "readOnly" | "write";
+  kind: "analysis" | "implementation";
   icon: typeof IconFocus2;
   description: string;
 }>;
-
-const WRITABLE_SUBAGENT_ROLE_IDS = [
-  "codey_worker",
-  "codey_visual_worker",
-] as const satisfies ReadonlyArray<SubagentRoleId>;
 
 export type SubagentPolicyCardProps = {
   config: Config;
@@ -136,28 +126,16 @@ export function SubagentPolicyCardComponent({
   const enabledRoleCount = SUBAGENT_TASK_TYPES.filter(
     ({ id }) => config.subagentRoles[id]?.enabled !== false,
   ).length;
-  const writableRolesDisabled = WRITABLE_SUBAGENT_ROLE_IDS.every(
-    (role) => config.subagentRoles[role]?.enabled === false,
+  const analysisTasks = SUBAGENT_TASK_TYPES.filter(
+    (task) => task.kind === "analysis",
   );
-  const enabledReadOnlyRoleNames = SUBAGENT_TASK_TYPES.filter(
-    ({ id, access }) =>
-      access === "readOnly" && config.subagentRoles[id]?.enabled !== false,
-  ).map(({ name }) => name);
-  const writableRolesDisabledMessage =
-    enabledReadOnlyRoleNames.length > 0
-      ? `可写子代理已全部关闭；${enabledReadOnlyRoleNames.join("、")}仍可使用。`
-      : "可写子代理已全部关闭；请先启用至少一个只读角色。";
-
-  const readOnlyTasks = SUBAGENT_TASK_TYPES.filter(
-    (task) => task.access === "readOnly",
+  const implementationTasks = SUBAGENT_TASK_TYPES.filter(
+    (task) => task.kind === "implementation",
   );
-  const writeTasks = SUBAGENT_TASK_TYPES.filter(
-    (task) => task.access === "write",
-  );
-  const enabledReadOnlyCount = readOnlyTasks.filter(
+  const enabledAnalysisCount = analysisTasks.filter(
     ({ id }) => config.subagentRoles[id]?.enabled !== false,
   ).length;
-  const enabledWriteCount = writeTasks.filter(
+  const enabledImplementationCount = implementationTasks.filter(
     ({ id }) => config.subagentRoles[id]?.enabled !== false,
   ).length;
 
@@ -345,18 +323,18 @@ export function SubagentPolicyCardComponent({
                     <span className="subagent-group-title">分析角色</span>
                     <div className="subagent-stat-badge subagent-stat-badge--readonly">
                       <span className="subagent-stat-indicator" aria-hidden="true" />
-                      <span>{SUBAGENT_ACCESS_LABELS.readOnly}分析</span>
+                      <span>已启用</span>
                       <strong>
-                        {enabledReadOnlyCount} / {readOnlyTasks.length}
+                        {enabledAnalysisCount} / {analysisTasks.length}
                       </strong>
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责小范围定位、宽范围跨文件检索及视觉证据分析，不产生写入操作
+                    负责定位、跨文件检索及视觉证据分析，可按任务授权调用工具
                   </span>
                 </div>
                 <div className="subagent-group-items">
-                  {readOnlyTasks.map(renderRoleCard)}
+                  {analysisTasks.map(renderRoleCard)}
                 </div>
               </div>
 
@@ -366,9 +344,9 @@ export function SubagentPolicyCardComponent({
                     <span className="subagent-group-title">实施角色</span>
                     <div className="subagent-stat-badge subagent-stat-badge--write">
                       <span className="subagent-stat-indicator" aria-hidden="true" />
-                      <span>{SUBAGENT_ACCESS_LABELS.write}实施</span>
+                      <span>已启用</span>
                       <strong>
-                        {enabledWriteCount} / {writeTasks.length}
+                        {enabledImplementationCount} / {implementationTasks.length}
                       </strong>
                     </div>
                   </div>
@@ -377,34 +355,20 @@ export function SubagentPolicyCardComponent({
                   </span>
                 </div>
                 <div className="subagent-group-items">
-                  {writeTasks.map(renderRoleCard)}
+                  {implementationTasks.map(renderRoleCard)}
                 </div>
               </div>
 
-              <div
-                className={`subagent-policy-callout ${
-                  writableRolesDisabled ? "subagent-policy-callout--warning" : ""
-                }`}
-              >
-                {writableRolesDisabled ? (
-                  <IconAlertTriangle
-                    size={16}
-                    className="subagent-callout-icon subagent-callout-icon--warning"
-                    aria-hidden="true"
-                  />
-                ) : (
-                  <IconInfoCircle
-                    size={16}
-                    className="subagent-callout-icon"
-                    aria-hidden="true"
-                  />
-                )}
+              <div className="subagent-policy-callout">
+                <IconInfoCircle
+                  size={16}
+                  className="subagent-callout-icon"
+                  aria-hidden="true"
+                />
                 <div className="subagent-callout-text">
                   {subagentModelOptions.length === 0
                     ? "请先在模型管理中为任一可用线路启用模型。"
-                    : writableRolesDisabled
-                      ? `${writableRolesDisabledMessage}角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。`
-                      : "可搜索并选择任意可用线路模型；角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。角色权限仍受父任务权限模式约束。"}
+                    : "各角色工具权限一致，按任务分工选择模型。角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效；实际操作受父任务权限约束。"}
                 </div>
               </div>
             </>

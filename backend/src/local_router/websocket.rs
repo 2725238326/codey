@@ -1072,8 +1072,8 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
                 return Ok(());
             }
             self.terminal_started = true;
-            self.native_history.observe(&event);
         }
+        self.native_history.observe(&event);
         let encoded = encode_responses_websocket_event(
             &event,
             self.event_needs_stream_id(&event).then(|| {

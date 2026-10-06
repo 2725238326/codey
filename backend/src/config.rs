@@ -80,7 +80,7 @@ pub const OFFICIAL_ROUTE_NAME_PREFIX: &str = "官方账号";
 /// 短名称在第 10 个账号之后使用的字母编号表，顺序对应编号 10 起的取值。
 pub const OFFICIAL_ROUTE_SHORT_NAME_LETTERS: &str =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-pub const MAX_ROUTE_SHORT_NAME_CHARS: usize = 2;
+pub const MAX_ROUTE_SHORT_NAME_CHARS: usize = 4;
 /// 线路名在界面、线路列表和模型选择器里都要能完整显示，前后端共用同一个上限。
 /// 旧配置里超过上限的名称仍然可以加载，但保存时的改动会被拒绝。
 pub const MAX_ROUTE_NAME_CHARS: usize = 15;
@@ -3287,8 +3287,10 @@ mod tests {
         route.normalize();
         assert_eq!(route.validate().unwrap_err(), "线路「中转线路」缺少短名称");
 
-        route.short_name = "中转线".into();
-        assert!(route.validate().unwrap_err().contains("最多 2 个字符"));
+        route.short_name = "中转线路".into();
+        assert!(route.validate().is_ok());
+        route.short_name = "中转线路名".into();
+        assert!(route.validate().unwrap_err().contains("最多 4 个字符"));
 
         route.short_name = OFFICIAL_ROUTE_SHORT_NAME.into();
         assert!(route.validate().unwrap_err().contains("官方账号专属"));
@@ -3301,7 +3303,7 @@ mod tests {
             ..CodeyConfig::default()
         }
         .normalize();
-        assert_eq!(migrated.profiles[0].short_name, "中转");
+        assert_eq!(migrated.profiles[0].short_name, "中转线路");
         assert!(migrated.profiles[0].validate().is_ok());
     }
 
@@ -3326,8 +3328,8 @@ mod tests {
         }
         .normalize();
 
-        assert_eq!(migrated.profiles[0].short_name, "线路");
-        assert_eq!(migrated.profiles[1].short_name, "线1");
+        assert_eq!(migrated.profiles[0].short_name, "线路 A");
+        assert_eq!(migrated.profiles[1].short_name, "线路 B");
         assert!(validate_provider_profiles(&migrated.profiles).is_ok());
     }
 
@@ -3365,9 +3367,11 @@ mod tests {
         assert_eq!(route.short_name, OFFICIAL_ROUTE_SHORT_NAME);
         assert!(route.validate().is_ok());
 
-        route.short_name = "官字号".into();
+        route.short_name = "官方线路".into();
+        assert!(route.validate().is_ok());
+        route.short_name = "官方线路名".into();
         route.normalize();
-        assert!(route.validate().unwrap_err().contains("最多 2 个字符"));
+        assert!(route.validate().unwrap_err().contains("最多 4 个字符"));
     }
 
     #[test]
@@ -3376,7 +3380,7 @@ mod tests {
         assert_eq!(default_official_route_short_name(1), "官1");
         assert_eq!(default_official_route_short_name(2), "官2");
         assert_eq!(default_official_route_short_name(9), "官9");
-        // 短名称受两个字符限制，编号超过 9 之后改用字母，仍然是两个字符。
+        // 默认短名称保持两个字符，编号超过 9 之后改用字母。
         assert_eq!(default_official_route_short_name(10), "官A");
         for index in 1..=300 {
             let short_name = default_official_route_short_name(index);

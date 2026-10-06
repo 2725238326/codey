@@ -509,20 +509,208 @@ pub(crate) struct WebSocketResponsesDownstream {
     pub(crate) idle_registry: Arc<Mutex<IdleDownstreamRegistry>>,
 }
 
+/// Streaming items are retained for a later replay, so only items a replayed
+/// request can carry are worth keeping. Reasoning kept only as a summary is
+/// replayable; reasoning with nothing at all is not.
+fn replayable_streamed_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => {
+            item.get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+                || reasoning_item_has_text(item)
+                || summary_replay_text(item).is_some()
+        }
+        Some("item_reference" | "compaction") => false,
+        _ => true,
+    }
+}
+
+/// Tool calls announce their payload in a separate event, so an item whose
+/// payload has not arrived yet is not replayable.
+fn streamed_item_arguments(item: &Value) -> Option<&str> {
+    let field = match item.get("type").and_then(Value::as_str)? {
+        "function_call" => "arguments",
+        "custom_tool_call" => "input",
+        _ => return Some(""),
+    };
+    item.get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+/// Items are the same history entry when they share an item id, or, for tool
+/// calls without one, the same call id.
+/// Items are the same history entry when they describe the same tool call, or
+/// failing that share an item id. Tool calls compare by call id first because
+/// an upstream may renumber an item id while keeping the call.
+fn same_history_item(left: &Value, right: &Value) -> bool {
+    let identity = |item: &Value| {
+        item.get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("call_id:{id}"))
+            .or_else(|| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+            })
+    };
+    match (identity(left), identity(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AdaptedResponsesHistory {
     pub(crate) last: Option<(String, Vec<Value>)>,
     pub(crate) pending_input: Option<Vec<Value>>,
+    /// Items the upstream streamed for the current turn. Streaming upstreams
+    /// announce tool calls through output-item events and may omit them from
+    /// the terminal `response.output`, so the terminal array alone cannot be
+    /// trusted to describe the turn. Each entry carries whether the payload
+    /// has arrived.
+    pending_output: Vec<(usize, Value, bool)>,
     last_bytes: usize,
     budget: RetainedMemoryBudget,
 }
 
+const STREAMED_OUTPUT_ITEM_LIMIT: usize = 512;
+
 impl AdaptedResponsesHistory {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_input = None;
+        self.pending_output.clear();
         self.budget
             .resize(self.last_bytes)
             .expect("releasing retained history budget cannot fail");
+    }
+
+    /// Retain the output items of the turn being built. A streaming upstream
+    /// can report a tool call only through its output-item events while the
+    /// terminal event omits it, which would strand that call's result next
+    /// turn as an unpaired tool result.
+    pub(crate) fn record_output_item(&mut self, event: &Value) {
+        if self.pending_input.is_none() {
+            return;
+        }
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .map(|index| index as usize);
+        match kind {
+            "response.output_item.added" | "response.output_item.done" => {
+                let Some(item) = event
+                    .get("item")
+                    .filter(|item| item.is_object() && replayable_streamed_item(item))
+                else {
+                    return;
+                };
+                // A skeleton announced by `added` still needs its arguments.
+                let complete =
+                    kind == "response.output_item.done" || streamed_item_arguments(item).is_some();
+                self.store_streamed_item(
+                    index.unwrap_or(self.pending_output.len()),
+                    item.clone(),
+                    complete,
+                );
+            }
+            "response.function_call_arguments.done" | "response.custom_tool_call_input.done" => {
+                let field = if kind == "response.function_call_arguments.done" {
+                    "arguments"
+                } else {
+                    "input"
+                };
+                let Some(value) = event.get(field).filter(|value| !value.is_null()) else {
+                    return;
+                };
+                let Some(index) = index.or_else(|| self.streamed_item_index(event)) else {
+                    return;
+                };
+                let Some(existing) = self
+                    .pending_output
+                    .iter_mut()
+                    .find(|(slot, _, _)| *slot == index)
+                else {
+                    return;
+                };
+                if let Some(item) = existing.1.as_object_mut() {
+                    item.insert(field.to_string(), value.clone());
+                }
+                existing.2 = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn store_streamed_item(&mut self, index: usize, item: Value, complete: bool) {
+        if let Some(existing) = self
+            .pending_output
+            .iter_mut()
+            .find(|(slot, _, _)| *slot == index)
+        {
+            if complete || !existing.2 {
+                existing.1 = item;
+                existing.2 = complete;
+            }
+            return;
+        }
+        if self.pending_output.len() >= STREAMED_OUTPUT_ITEM_LIMIT {
+            return;
+        }
+        self.pending_output.push((index, item, complete));
+    }
+
+    /// Match an arguments/input event to an already announced item by its id.
+    fn streamed_item_index(&self, event: &Value) -> Option<usize> {
+        let item_id = event
+            .get("item_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())?;
+        self.pending_output
+            .iter()
+            .find(|(_, item, _)| item.get("id").and_then(Value::as_str) == Some(item_id))
+            .map(|(index, _, _)| *index)
+    }
+
+    pub(crate) fn has_streamed_output(&self) -> bool {
+        !self.pending_output.is_empty()
+    }
+
+    /// Merge the streamed items into the terminal array. Streamed items fill
+    /// positions the terminal event dropped; items the terminal event already
+    /// carries win. Items still missing their arguments are skipped, because a
+    /// replayed call without arguments is worse than a missing call.
+    fn take_streamed_output(&mut self, terminal: &[Value]) -> Vec<Value> {
+        let mut streamed = std::mem::take(&mut self.pending_output);
+        if streamed.is_empty() {
+            return terminal.to_vec();
+        }
+        streamed.sort_by_key(|(index, _, _)| *index);
+        let mut merged = terminal.to_vec();
+        for (index, item, complete) in streamed {
+            if !complete {
+                continue;
+            }
+            if merged
+                .iter()
+                .any(|existing| same_history_item(existing, &item))
+            {
+                continue;
+            }
+            if index < merged.len() {
+                merged.insert(index, item);
+            } else {
+                merged.push(item);
+            }
+        }
+        merged
     }
 
     pub(crate) fn prepare(&mut self, body: &mut Value) -> Result<bool> {
@@ -611,11 +799,18 @@ impl AdaptedResponsesHistory {
     }
 
     pub(crate) fn remember(&mut self, response_id: &str, output: &[Value]) -> Result<()> {
-        let Some(context) = self.pending_input.as_ref() else {
+        if self.pending_input.is_none() {
+            self.pending_output.clear();
             return Ok(());
-        };
-        let bytes = bounded_json_bytes(context, MAX_REQUEST_BYTES)?
-            .saturating_add(bounded_json_bytes(&output, MAX_REQUEST_BYTES)?);
+        }
+        let output = self.take_streamed_output(output);
+        let bytes = bounded_json_bytes(
+            self.pending_input
+                .as_ref()
+                .expect("pending input was checked"),
+            MAX_REQUEST_BYTES,
+        )?
+        .saturating_add(bounded_json_bytes(&output, MAX_REQUEST_BYTES)?);
         if bytes > MAX_REQUEST_BYTES {
             anyhow::bail!("会话历史超过上限，请先压缩上下文");
         }
@@ -625,7 +820,7 @@ impl AdaptedResponsesHistory {
             .pending_input
             .take()
             .expect("pending input was checked");
-        context.extend(output.iter().cloned());
+        context.extend(output);
         // ponytail: Codex continuations are linear; retain branches only if a client needs them.
         self.last = Some((response_id.to_string(), context));
         self.last_bytes = bytes;

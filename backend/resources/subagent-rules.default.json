@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "revision": 9,
+  "revision": 10,
   "conflictResolution": "highest_priority_deny_wins",
   "fallback": "deny",
   "roles": {
-    "codey_quick_scan": { "access": "read_only", "visual": false },
-    "codey_deep_research": { "access": "read_only", "visual": false },
-    "codey_visual_analysis": { "access": "read_only", "visual": true },
-    "codey_worker": { "access": "write", "visual": false },
+    "codey_quick_scan": { "access": "write", "visual": true },
+    "codey_deep_research": { "access": "write", "visual": true },
+    "codey_visual_analysis": { "access": "write", "visual": true },
+    "codey_worker": { "access": "write", "visual": true },
     "codey_visual_worker": { "access": "write", "visual": true },
     "default": { "access": "write", "visual": true }
   },
@@ -29,15 +29,6 @@
       "explanation": "子代理不能继续派生子代理，避免权限与预算跨层扩散。"
     },
     {
-      "id": "deny-readonly-write",
-      "priority": 900,
-      "effect": "deny",
-      "actors": ["child"],
-      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
-      "toolClasses": ["write"],
-      "explanation": "只读角色不得调用写入工具。"
-    },
-    {
       "id": "deny-child-orchestration",
       "priority": 950,
       "effect": "deny",
@@ -46,40 +37,13 @@
       "explanation": "子代理只可向根代理回报，不得等待、查看、中断或追派其他代理。"
     },
     {
-      "id": "allow-visual-capabilities",
-      "priority": 850,
-      "effect": "allow",
-      "actors": ["child"],
-      "roles": ["codey_visual_analysis", "codey_visual_worker"],
-      "toolClasses": ["visual"],
-      "explanation": "视觉角色可使用受信的图像、截图、GUI 与页面展示工具；实际操作仍受原生权限约束。"
-    },
-    {
-      "id": "allow-readonly-capabilities",
+      "id": "allow-role-capabilities",
       "priority": 800,
       "effect": "allow",
       "actors": ["child"],
-      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
-      "toolClasses": ["read", "command", "network", "collaboration"],
-      "explanation": "只读角色可使用本地与网络只读检索、显式声明的命令和协作能力；文件写入仍由角色与原生沙箱限制。"
-    },
-    {
-      "id": "allow-worker-capabilities",
-      "priority": 800,
-      "effect": "allow",
-      "actors": ["child"],
-      "roles": ["codey_worker", "codey_visual_worker"],
-      "toolClasses": ["read", "write", "command", "network", "collaboration", "unknown"],
-      "explanation": "写入角色可使用声明范围内的读写、网络读取、受沙箱约束的命令，以及未归类工具。"
-    },
-    {
-      "id": "allow-default-capabilities",
-      "priority": 800,
-      "effect": "allow",
-      "actors": ["child"],
-      "roles": ["default"],
+      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis", "codey_worker", "codey_visual_worker", "default"],
       "toolClasses": ["read", "write", "command", "network", "collaboration", "visual", "unknown"],
-      "explanation": "默认角色可调用读写、命令、网络、视觉、协作和未归类工具。"
+      "explanation": "角色仅用于任务分工和模型选择，均可调用读写、命令、网络、视觉、协作和未归类工具；实际操作仍受任务范围、生命周期与 Codex 原生权限约束。"
     },
     {
       "id": "allow-unbound-collaboration",
@@ -88,15 +52,6 @@
       "actors": ["child"],
       "toolClasses": ["collaboration"],
       "explanation": "缺少可恢复角色绑定时只保留向根代理发送消息；数据工具、副作用工具和编排工具全部 fail-closed。"
-    },
-    {
-      "id": "deny-unknown-child-tool",
-      "priority": 50,
-      "effect": "deny",
-      "actors": ["child"],
-      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
-      "toolClasses": ["unknown"],
-      "explanation": "只读角色不得调用未归类工具。"
     }
   ]
 }

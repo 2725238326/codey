@@ -251,35 +251,17 @@ mod tests {
     use crate::config::ProviderProfile;
 
     #[test]
-    fn role_policies_keep_access_and_visual_capabilities_explicit() {
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_QUICK_SCAN),
-            Some(RolePolicy {
-                access: RoleAccess::ReadOnly,
-                visual: false,
-            })
-        );
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_WORKER),
-            Some(RolePolicy {
-                access: RoleAccess::Write,
-                visual: false,
-            })
-        );
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_VISUAL_WORKER),
-            Some(RolePolicy {
-                access: RoleAccess::Write,
-                visual: true,
-            })
-        );
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_DEFAULT),
-            Some(RolePolicy {
-                access: RoleAccess::Write,
-                visual: true,
-            })
-        );
+    fn task_roles_share_tool_capabilities() {
+        for role in crate::config::SUBAGENT_ROLE_IDS {
+            assert_eq!(
+                role_policy(role),
+                Some(RolePolicy {
+                    access: RoleAccess::Write,
+                    visual: true,
+                }),
+                "{role}"
+            );
+        }
         assert_eq!(role_policy("unknown"), None);
     }
 

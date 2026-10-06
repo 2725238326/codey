@@ -198,17 +198,24 @@ impl NativeResponsesHistory {
             .pending_input
             .as_ref()
             .context("缺少完整续接历史，请重新发送完整上下文")?;
-        validate_native_tool_history(input, true)?;
+        let input = replayable_native_history(input);
+        validate_native_tool_history(&input, true)?;
         let object = body
             .as_object_mut()
             .context("Responses 请求必须是 JSON 对象")?;
-        object.insert("input".into(), Value::Array(input.clone()));
+        object.insert("input".into(), Value::Array(input));
         object.remove("previous_response_id");
         Ok(true)
     }
 
     pub(crate) fn observe(&mut self, event: &Value) {
-        if self.history.pending_input.is_none() || !responses_event_is_terminal(event) {
+        if self.history.pending_input.is_none() {
+            return;
+        }
+        if !responses_event_is_terminal(event) {
+            // A streaming upstream reports tool calls here and may still omit
+            // them from the terminal output; keep them for the replay.
+            self.history.record_output_item(event);
             return;
         }
         let response = &event["response"];
@@ -221,16 +228,18 @@ impl NativeResponsesHistory {
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty() && id.len() <= 1024);
-        if complete
-            && let (Some(id), Some(output)) = (id, response.get("output").and_then(Value::as_array))
-        {
-            // Missing/oversized terminal output makes recovery unavailable;
-            // it must not turn an already delivered generation into a retry.
-            self.unavailable = self
-                .history
-                .remember(id, output)
-                .err()
-                .map(|error| error.to_string());
+        if complete && let Some(id) = id {
+            let terminal_output = response.get("output").and_then(Value::as_array);
+            if terminal_output.is_some() || self.history.has_streamed_output() {
+                // Missing/oversized terminal output makes recovery unavailable;
+                // it must not turn an already delivered generation into a retry.
+                let output = terminal_output.map_or(&[][..], Vec::as_slice);
+                self.unavailable = self
+                    .history
+                    .remember(id, output)
+                    .err()
+                    .map(|error| error.to_string());
+            }
         }
         self.history.clear_pending();
         if self.history.last.is_some() {
@@ -254,6 +263,31 @@ fn tool_name_label(item: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Restoring history must not be stricter than the upstream itself. Codex
+/// replays reasoning items that carry only visible summaries and the upstream
+/// serves them, so requiring ciphertext would reject requests the same
+/// upstream already answered. Reasoning with nothing replayable is dropped
+/// instead; the per-route normalization that follows decides how the
+/// surviving items travel.
+fn replayable_native_history(input: &[Value]) -> Vec<Value> {
+    input
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) != Some("reasoning")
+                || replayable_reasoning_item(item)
+        })
+        .cloned()
+        .collect()
+}
+
+fn replayable_reasoning_item(item: &Value) -> bool {
+    item.get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| !content.is_empty())
+        || reasoning_item_has_text(item)
+        || summary_replay_text(item).is_some()
+}
+
 fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> {
     let mut calls = HashSet::new();
     for item in input {
@@ -262,15 +296,6 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
         match kind {
             "item_reference" | "compaction" if restoring => {
                 anyhow::bail!("历史包含无法在协议切换时展开的引用，请重新发送完整上下文");
-            }
-            "reasoning"
-                if restoring
-                    && item
-                        .get("encrypted_content")
-                        .and_then(Value::as_str)
-                        .is_none_or(str::is_empty) =>
-            {
-                anyhow::bail!("推理历史缺少可恢复内容，请重新发送完整上下文");
             }
             "function_call" | "custom_tool_call" => {
                 let id = item
@@ -671,6 +696,189 @@ mod tests {
         router.stop().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn streamed_tool_call_survives_the_next_incremental_continuation() {
+        for custom in [false, true] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (closed_tx, closed_rx) = oneshot::channel();
+            let upstream = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let first = ws.next().await.unwrap().unwrap();
+                assert!(matches!(first, WebSocketMessage::Text(_)));
+                // The call reaches the client only through streaming events; the
+                // terminal event omits it.
+                for event in [
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":{"id":"item-1",
+                                "type":if custom {"custom_tool_call"} else {"function_call"},
+                                "call_id":"call-1","name":"run","arguments":"","input":""}
+                    }),
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":{"id":"item-1",
+                                "type":if custom {"custom_tool_call"} else {"function_call"},
+                                "call_id":"call-1","name":"run",
+                                "arguments":"{\"cmd\":\"pwd\"}","input":"{\"cmd\":\"pwd\"}"}
+                    }),
+                    completed("resp-first", vec![]),
+                ] {
+                    ws.send(WebSocketMessage::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                ws.close(None).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .unwrap();
+                closed_tx.send(()).unwrap();
+                // Reconnecting the upstream WebSocket fails before any request
+                // is sent, so the continuation must arrive over HTTP expanded.
+                let (mut rejected, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_http_request(&mut rejected).await.unwrap().method,
+                    "GET"
+                );
+                rejected
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                drop(rejected);
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await.unwrap();
+                assert_eq!(request.method, "POST");
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(body.get("previous_response_id").is_none(), "{body}");
+                assert_eq!(
+                    body["input"],
+                    json!([
+                        {"role":"user","content":"original task"},
+                        {"id":"item-1",
+                         "type":if custom {"custom_tool_call"} else {"function_call"},
+                         "call_id":"call-1","name":"run",
+                         "arguments":"{\"cmd\":\"pwd\"}","input":"{\"cmd\":\"pwd\"}"},
+                        result(custom, "call-1"),
+                    ]),
+                    "{body}"
+                );
+                write_json_response(
+                    &mut socket,
+                    200,
+                    &completed("resp-second", vec![])["response"],
+                )
+                .await
+                .unwrap();
+            });
+            let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+            config.profiles[0].supports_websockets = true;
+            let router = LocalRouter::start(&config).await.unwrap();
+            let mut client = connect_router_websocket_with_headers(
+                &router.endpoint(),
+                &[("session-id", "streamed-call-session")],
+            )
+            .await;
+            let model = model_alias(&provider, &model);
+            client
+                .send(WebSocketMessage::Text(
+                    json!({"type":"response.create","model":model,"input":"original task"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut client).await["response"]["id"], "resp-first");
+            closed_rx.await.unwrap();
+            client.close(None).await.unwrap();
+            let mut client = connect_router_websocket_with_headers(
+                &router.endpoint(),
+                &[("session-id", "streamed-call-session")],
+            )
+            .await;
+            client
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type":"response.create","model":model,
+                        "previous_response_id":"resp-first",
+                        "input":[result(custom, "call-1")]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut client).await["response"]["id"], "resp-second");
+            upstream.await.unwrap();
+            client.close(None).await.unwrap();
+            router.stop().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn summary_only_reasoning_history_is_replayed_instead_of_rejected() {
+        // Codex replays reasoning that carries only visible summaries, and the
+        // upstream serves those requests. Restoring must not be stricter.
+        for reasoning in [
+            json!({"type":"reasoning","id":"rs-summary","summary":[{"type":"summary_text","text":"plan"}],"content":[]}),
+            json!({"type":"reasoning","id":"rs-plain","summary":[],"content":[{"type":"reasoning_text","text":"think"}]}),
+            json!({"type":"reasoning","id":"rs-cipher","encrypted_content":"opaque","summary":[]}),
+        ] {
+            let mut history = NativeResponsesHistory::default();
+            let key = [1; 32];
+            let mut context = vec![json!({"role":"user","content":"task"}), reasoning.clone()];
+            context.extend([call(false, "call-1"), result(false, "call-1")]);
+            history.prepare(key, &mut json!({"input": context}));
+            history.observe(&completed("resp-known", vec![call(false, "call-2")]));
+            let mut next = json!({
+                "previous_response_id":"resp-known",
+                "input":[result(false, "call-2")]
+            });
+            history.prepare(key, &mut next);
+            history.restore(key, &mut next).unwrap();
+            let input = next["input"].as_array().unwrap();
+            assert_eq!(input[1], reasoning, "{next}");
+            assert_eq!(input.len(), 6, "{next}");
+        }
+    }
+
+    #[test]
+    fn reasoning_with_nothing_to_replay_is_dropped() {
+        let mut history = NativeResponsesHistory::default();
+        let key = [1; 32];
+        history.prepare(
+            key,
+            &mut json!({"input":[
+                {"role":"user","content":"task"},
+                {"type":"reasoning","id":"rs-hollow","summary":[],"content":[]},
+                call(false, "call-1"),
+                result(false, "call-1")
+            ]}),
+        );
+        history.observe(&completed("resp-known", vec![call(false, "call-2")]));
+        let mut next = json!({
+            "previous_response_id":"resp-known",
+            "input":[result(false, "call-2")]
+        });
+        history.prepare(key, &mut next);
+        history.restore(key, &mut next).unwrap();
+        assert_eq!(
+            next["input"],
+            json!([
+                {"role":"user","content":"task"},
+                call(false, "call-1"),
+                result(false, "call-1"),
+                call(false, "call-2"),
+                result(false, "call-2")
+            ]),
+            "{next}"
+        );
+    }
+
     #[test]
     fn native_history_rejects_missing_output_identity_changes_and_orphan_results() {
         for custom in [false, true] {
@@ -696,6 +904,99 @@ mod tests {
             assert!(error.contains("工具结果缺少对应的完整调用历史"), "{error}");
             assert!(error.contains("call_id=missing-call"), "{error}");
         }
+    }
+
+    #[test]
+    fn streamed_tool_call_missing_from_terminal_output_still_pairs_its_result() {
+        for custom in [false, true] {
+            let payload_field = if custom { "input" } else { "arguments" };
+            let mut history = NativeResponsesHistory::default();
+            let key = [1; 32];
+            history.prepare(key, &mut json!({"input":"task"}));
+            // The upstream reports the call only through streaming events and
+            // then completes with an output that omits it.
+            history.observe(&json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"id":"item-1","type":if custom {"custom_tool_call"} else {"function_call"},
+                        "call_id":"call-1","name":"run", "arguments":"", "input":""}
+            }));
+            history.observe(&json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"id":"item-1","type":if custom {"custom_tool_call"} else {"function_call"},
+                        "call_id":"call-1","name":"run", "arguments":"{\"cmd\":\"pwd\"}",
+                        "input":"{\"cmd\":\"pwd\"}"}
+            }));
+            history.observe(&json!({
+                "type":"response.completed",
+                "response":{"id":"resp-streamed","status":"completed","output":[]}
+            }));
+            let mut next = json!({
+                "previous_response_id":"resp-streamed",
+                "input":[result(custom, "call-1")]
+            });
+            history.prepare(key, &mut next);
+            history.restore(key, &mut next).unwrap();
+            let input = next["input"].as_array().unwrap();
+            assert_eq!(input.len(), 3, "{next}");
+            assert_eq!(input[1]["call_id"], "call-1");
+            assert_eq!(input[1][payload_field], "{\"cmd\":\"pwd\"}");
+        }
+    }
+
+    #[test]
+    fn streamed_call_already_in_the_terminal_output_is_not_duplicated() {
+        let mut history = NativeResponsesHistory::default();
+        let key = [1; 32];
+        history.prepare(key, &mut json!({"input":"task"}));
+        history.observe(&json!({
+            "type":"response.output_item.done",
+            "output_index":0,
+            "item":{"id":"item-streamed","type":"function_call","call_id":"call-1","name":"run","arguments":"{}"}
+        }));
+        // The terminal event carries the same call under a renumbered item id.
+        history.observe(&completed(
+            "resp-both",
+            vec![json!({
+                "id":"item-terminal","type":"function_call","call_id":"call-1","name":"run","arguments":"{}"
+            })],
+        ));
+        let mut next =
+            json!({"previous_response_id":"resp-both","input":[result(false, "call-1")]});
+        history.prepare(key, &mut next);
+        history.restore(key, &mut next).unwrap();
+        assert_eq!(
+            next["input"],
+            json!([
+                {"role":"user","content":"task"},
+                {"id":"item-terminal","type":"function_call","call_id":"call-1","name":"run","arguments":"{}"},
+                result(false, "call-1")
+            ])
+        );
+    }
+
+    #[test]
+    fn streamed_call_without_payload_is_never_replayed() {
+        let mut history = NativeResponsesHistory::default();
+        let key = [1; 32];
+        history.prepare(key, &mut json!({"input":"task"}));
+        // No arguments event arrives, so the call cannot be reconstructed and
+        // must not be replayed half-formed.
+        history.observe(&json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"id":"item-1","type":"function_call","call_id":"call-1","name":"run","arguments":""}
+        }));
+        history.observe(&json!({
+            "type":"response.completed",
+            "response":{"id":"resp-hollow","status":"completed","output":[]}
+        }));
+        let mut next =
+            json!({"previous_response_id":"resp-hollow","input":[result(false, "call-1")]});
+        history.prepare(key, &mut next);
+        let error = history.restore(key, &mut next).unwrap_err().to_string();
+        assert!(error.contains("工具结果缺少对应的完整调用历史"), "{error}");
     }
 
     #[test]

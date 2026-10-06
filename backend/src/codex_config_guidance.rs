@@ -25,7 +25,7 @@ const CONSERVATIVE_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+const ROLE_RESTRICTED_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 主动识别可独立推进的检索、实现和核验任务；存在明确分工或上下文隔离收益时，尽早使用子代理，无需用户逐次要求。先做确定边界所需的少量检查，再派发独立任务，不必等主代理完成同一调查后再分工。单步即可完成、步骤无法分离或委派没有实际收益的任务由主代理直接处理；不按文件数量或预计工具调用次数决定是否委派。
 
@@ -50,8 +50,34 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
 "#;
 
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+主动识别可独立推进的检索、实现和核验任务；存在明确分工或上下文隔离收益时，尽早使用子代理，无需用户逐次要求。先做确定边界所需的少量检查，再派发独立任务，不必等主代理完成同一调查后再分工。单步即可完成、步骤无法分离或委派没有实际收益的任务由主代理直接处理；不按文件数量或预计工具调用次数决定是否委派。
+
+最多同时运行 2 个子代理。各角色均可能写入，同一工作区采用互斥调度；并发限制只约束同时运行数量，不限制后续派发次数。
+
+### 派发
+
+- 按当前客户端提供的工具接口调用 `agents.spawn_agent`；原生接口直接调用，客户端明确提供工具目录和专用转发入口时，使用该入口及目录中的准确名称和参数。不要把专用转发入口当作 JavaScript 聚合执行器，也不要因缺少同名直接接口就忽略目录中可用的工具。按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
+- `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
+- 修改关键代码或文档时，可先派发独立的调查或核验；写入任务明确文件归属，避免重复调查或同时修改同一处。角色只区分任务分工与模型，不限制工具类别；均获得 `command.execute`、`files.read`、`workspace.write` 和 `visual.inspect`。实际权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
+
+### 返回与验收
+
+- 每个子代理只执行一轮且不得继续派生。返回首行使用 `status: completed | partial | blocked`，正文只保留影响决策的结论、最多 5 条带 `file:line`/符号/链接的证据和明确 gaps；多代理证据冲突时比较出处。
+- 子代理结果是候选产物，不是验收结论。所有代理结算后，由根代理结合用户要求、变更差异和必要的确定性检查统一验收；Codey 不再创建逐任务机械验收债或强制验收命令。
+
+### 生命周期
+
+- 先派发不超过当前并发上限的独立任务，再进入 wait/list。任一 attempt 终态或被成功中断并 fence 后，检查剩余并发额度；存在空余槽位时立即使用新 `task_name` 补位，否则继续等待。所有计划任务均已派发后，继续等待剩余活动 attempt 结算。活动 attempt 期间只使用必要的 `agents.*` 协作工具，普通本地工作和 Stop 仍受生命周期门禁限制。
+- `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍是非终态，除非根代理成功中断并永久放弃该 attempt。
+- 成功的 `agents.interrupt_agent` 会永久 fence 该 attempt；不要再等待或追派。重复 task ID 时只做一次无筛选 `agents.list_agents` 对账：原代理存在则等待或消费结果，不存在则由根代理接管。只有任务范围实质改变时才用全新 task ID 最多重派一次。
+- 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
+"#;
+
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    ROLE_RESTRICTED_SUBAGENT_GUIDANCE,
     legacy::DIRECT_SUBAGENT_GUIDANCE,
     CONSERVATIVE_SUBAGENT_GUIDANCE,
     legacy::DELEGATION_V2_GUIDANCE,
@@ -114,16 +140,16 @@ delegate them early when parallel work, context isolation, or specialized eviden
 Do not finish the same broad investigation in the root before delegating it. Keep one-step or inseparable \
 sequential work with the root; file counts and tool-call estimates are not delegation cutoffs. When delegating, strongly \
 prefer an enabled Codey role that fits the task and explicitly set `agent_type`: `codey_quick_scan` for \
-focused read-only lookups; `codey_deep_research` for broad read-only code, log, and document research; \
-`codey_visual_analysis` for read-only visual inspection; `codey_worker` for bounded non-visual \
+focused lookups; `codey_deep_research` for broad code, log, and document research; \
+`codey_visual_analysis` for visual inspection; `codey_worker` for bounded non-visual \
 implementation; and `codey_visual_worker` for implementation requiring visual verification. Prefer these \
 over generic `default`, `explorer`, or `worker` when both fit; avoid omitting `agent_type` out of habit. \
 This is a preference, not a restriction: an explicit user choice, unavailable or unsuitable Codey roles, \
-or a clear task-specific advantage can justify another available role. Respect existing role permissions \
-and runtime availability. There is no fixed spawn \
-budget: up to three concurrent agents are allowed only when all are verified read-only, otherwise the \
-limit is two. `CODEY_SUBAGENT_CONCURRENCY_LIMIT` means wait for a slot, not failure; when any child settles, \
-recompute the role-aware limit and fill a slot from the remaining planned independent work when allowed. If an active child \
+or a clear task-specific advantage can justify another available role. Roles select task specialization \
+and models, with the same tool capabilities subject to native permissions and runtime availability. There is no fixed spawn \
+budget: the concurrency limit is two, and agents sharing a workspace are scheduled serially because every \
+role can write. `CODEY_SUBAGENT_CONCURRENCY_LIMIT` means wait for a slot, not failure; when any child settles, \
+check remaining capacity and fill a slot from the remaining planned independent work when allowed. If an active child \
 cannot decrypt its task body, use `agents.send_message` exactly once to restate the complete task; do not \
 interrupt or respawn it. If that fails, take over. After all attempts settle, validate their combined result \
 before continuing or finishing. If every spawn fails, take over. On `CODEY_SUBAGENT_DUPLICATE_TASK_ID`, call \
@@ -166,7 +192,7 @@ developer_instructions = """
 image_generation = false
 "#####;
 
-pub(crate) const QUICK_SCAN_AGENT_CONFIG: &str = r#####"name = "codey_quick_scan"
+const READ_ONLY_QUICK_SCAN_AGENT_CONFIG: &str = r#####"name = "codey_quick_scan"
 
 description = "Read-only fast lookup for exact locations, repetitive checks, and low-risk factual retrieval."
 sandbox_mode = "read-only"
@@ -182,7 +208,7 @@ developer_instructions = """
 image_generation = false
 "#####;
 
-pub(crate) const DEEP_RESEARCH_AGENT_CONFIG: &str = r#####"name = "codey_deep_research"
+const READ_ONLY_DEEP_RESEARCH_AGENT_CONFIG: &str = r#####"name = "codey_deep_research"
 
 description = "Read-only broad research across code, logs, and documents for synthesis and architecture exploration."
 sandbox_mode = "read-only"
@@ -198,13 +224,61 @@ developer_instructions = """
 image_generation = false
 "#####;
 
-pub(crate) const VISUAL_ANALYSIS_AGENT_CONFIG: &str = r#####"name = "codey_visual_analysis"
+const READ_ONLY_VISUAL_ANALYSIS_AGENT_CONFIG: &str = r#####"name = "codey_visual_analysis"
 
 description = "Read-only visual analysis for screenshots, pages, GUI states, PDFs, and independent evidence review."
 sandbox_mode = "read-only"
 
 developer_instructions = """
 你是视觉分析子代理。负责截图、页面、GUI、PDF 和渲染结果的只读观察，也可承担需要视觉证据的复杂探索与独立核验；不修改文件，不做最终方案取舍，也不派生其他子代理。
+先读取或捕获必要视觉证据，再报告可见事实、位置关系、状态差异和可复核出处；推断必须单独标注。不要仅凭文件名或代码猜测视觉结果。
+你的输出直接供主代理决策，保持精炼、具体、可核验。
+首行写 `status: completed | partial | blocked`；只返回会影响决策的可见事实、最多 5 条关键证据和明确 gaps。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const QUICK_SCAN_AGENT_CONFIG: &str = r#####"name = "codey_quick_scan"
+
+description = "Fast lookup for exact locations, repetitive checks, and low-risk factual retrieval."
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+你是快速定位子代理。优先处理范围明确、低风险的定位与事实检索，不做方案取舍，也不派生其他子代理。按本次任务授权使用所需工具，包括命令、读写和视觉工具；实际操作受 Codex 原生权限约束。
+优先返回最短可核验证据：确切路径、`file:line`、符号名、匹配数量和必要的关键原文。任务超出小范围快速检索时，明确说明应改派深度检索或视觉分析角色。
+你的回复直接供主代理使用：区分事实与推断，不寒暄、不复述过程。
+首行写 `status: completed | partial | blocked`；最多保留 5 条会影响决策的关键证据，并明确未覆盖范围。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const DEEP_RESEARCH_AGENT_CONFIG: &str = r#####"name = "codey_deep_research"
+
+description = "Broad research across code, logs, and documents for synthesis and architecture exploration."
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+你是深度检索子代理。负责跨文件、跨目录的代码、日志和文档检索、归纳与架构探索，不做最终方案取舍，也不派生其他子代理。按本次任务授权使用所需工具，包括命令、读写和视觉工具；实际操作受 Codex 原生权限约束。
+覆盖任务给定范围，返回符号关系、关键路径、`file:line` 和必要原文。把已确认事实、推断、缺口与矛盾分开，保留足够证据供主代理抽查。
+你的输出直接供主代理使用，结构紧凑、信息密集。
+首行写 `status: completed | partial | blocked`；只返回会影响决策的结论、最多 5 条关键证据和明确 gaps。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const VISUAL_ANALYSIS_AGENT_CONFIG: &str = r#####"name = "codey_visual_analysis"
+
+description = "Visual analysis for screenshots, pages, GUI states, PDFs, and independent evidence review."
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+你是视觉分析子代理。负责截图、页面、GUI、PDF 和渲染结果的观察，以及需要视觉证据的探索与独立核验，不做最终方案取舍，也不派生其他子代理。按本次任务授权使用所需工具，包括命令、读写和视觉工具；实际操作受 Codex 原生权限约束。
 先读取或捕获必要视觉证据，再报告可见事实、位置关系、状态差异和可复核出处；推断必须单独标注。不要仅凭文件名或代码猜测视觉结果。
 你的输出直接供主代理决策，保持精炼、具体、可核验。
 首行写 `status: completed | partial | blocked`；只返回会影响决策的可见事实、最多 5 条关键证据和明确 gaps。
@@ -273,6 +347,17 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
         "default" => Some(DEFAULT_AGENT_CONFIG),
         _ => None,
     }
+}
+
+pub(crate) fn subagent_source_config_versions(role: &str) -> Option<[&'static str; 2]> {
+    let current = subagent_source_config(role)?;
+    let previous = match role {
+        "codey_quick_scan" => READ_ONLY_QUICK_SCAN_AGENT_CONFIG,
+        "codey_deep_research" => READ_ONLY_DEEP_RESEARCH_AGENT_CONFIG,
+        "codey_visual_analysis" => READ_ONLY_VISUAL_ANALYSIS_AGENT_CONFIG,
+        _ => current,
+    };
+    Some([current, previous])
 }
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled as direct \
@@ -654,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_agent_mode_hint_uses_role_aware_concurrency_without_spawn_budgets() {
+    fn multi_agent_mode_hint_uses_uniform_concurrency_without_spawn_budgets() {
         for role in [
             "codey_quick_scan",
             "codey_deep_research",
@@ -668,10 +753,10 @@ mod tests {
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("a preference, not a restriction"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("another available role"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("There is no fixed spawn budget"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("up to three concurrent agents"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("limit is two"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("concurrency limit is two"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("every role can write"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`CODEY_SUBAGENT_CONCURRENCY_LIMIT`"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("recompute the role-aware limit"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("check remaining capacity"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("cannot decrypt its task body"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`agents.send_message` exactly once"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("do not interrupt or respawn it"));
@@ -691,9 +776,9 @@ mod tests {
         );
         assert!(SUBAGENT_GUIDANCE.contains("按当前客户端提供的工具接口调用 `agents.spawn_agent`"));
         assert!(SUBAGENT_GUIDANCE.contains("唯一任务胶囊"));
-        assert!(SUBAGENT_GUIDANCE.contains("纯只读工作最多同时运行 3 个子代理"));
         assert!(SUBAGENT_GUIDANCE.contains("最多同时运行 2 个"));
-        assert!(SUBAGENT_GUIDANCE.contains("按下一个计划任务的角色重新计算并发上限"));
+        assert!(SUBAGENT_GUIDANCE.contains("检查剩余并发额度"));
+        assert!(SUBAGENT_GUIDANCE.contains("角色只区分任务分工与模型，不限制工具类别"));
         assert!(SUBAGENT_GUIDANCE.contains("普通本地工作和 Stop 仍受生命周期门禁限制"));
         assert!(SUBAGENT_GUIDANCE.contains("status: completed | partial | blocked"));
         assert!(SUBAGENT_GUIDANCE.contains("多代理证据冲突时比较出处"));
@@ -712,23 +797,14 @@ mod tests {
 
     #[test]
     fn every_task_role_has_a_named_editable_source_template() {
-        for (role, writable) in [
-            ("codey_quick_scan", false),
-            ("codey_deep_research", false),
-            ("codey_visual_analysis", false),
-            ("codey_worker", true),
-            ("codey_visual_worker", true),
-            ("default", true),
-        ] {
+        for role in crate::config::SUBAGENT_ROLE_IDS {
             let source = subagent_source_config(role).unwrap();
             assert!(source.contains(&format!("name = \"{role}\"")));
             assert!(source.contains("description = \""));
-            let expected = if writable {
-                "sandbox_mode = \"workspace-write\""
-            } else {
-                "sandbox_mode = \"read-only\""
-            };
-            assert!(source.contains(expected), "{role}");
+            assert!(
+                source.contains("sandbox_mode = \"workspace-write\""),
+                "{role}"
+            );
         }
     }
 

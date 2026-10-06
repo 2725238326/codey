@@ -163,10 +163,10 @@ impl RuleSet {
 
     fn validate_security_baseline(&self) -> Result<()> {
         const EXPECTED_ROLES: [(&str, RoleAccess, bool); 6] = [
-            ("codey_quick_scan", RoleAccess::ReadOnly, false),
-            ("codey_deep_research", RoleAccess::ReadOnly, false),
-            ("codey_visual_analysis", RoleAccess::ReadOnly, true),
-            ("codey_worker", RoleAccess::Write, false),
+            ("codey_quick_scan", RoleAccess::Write, true),
+            ("codey_deep_research", RoleAccess::Write, true),
+            ("codey_visual_analysis", RoleAccess::Write, true),
+            ("codey_worker", RoleAccess::Write, true),
             ("codey_visual_worker", RoleAccess::Write, true),
             ("default", RoleAccess::Write, true),
         ];
@@ -200,26 +200,9 @@ impl RuleSet {
                 tool_class: ToolClass::Unknown,
             });
             anyhow::ensure!(
-                unknown.effect
-                    == if expected_access == RoleAccess::ReadOnly {
-                        RuleEffect::Deny
-                    } else {
-                        RuleEffect::Allow
-                    },
-                "子代理规则必须按 access 限制角色 {role} 的未归类工具"
+                unknown.effect == RuleEffect::Allow,
+                "子代理规则必须允许角色 {role} 调用未归类工具"
             );
-            if expected_access == RoleAccess::ReadOnly {
-                let write = self.evaluate(&RuleContext {
-                    actor: RuleActor::Child,
-                    role: Some(role),
-                    tool_name: "apply_patch",
-                    tool_class: ToolClass::Write,
-                });
-                anyhow::ensure!(
-                    write.effect == RuleEffect::Deny,
-                    "子代理规则必须拒绝只读角色 {role} 的写入工具"
-                );
-            }
             let visual = self.evaluate(&RuleContext {
                 actor: RuleActor::Child,
                 role: Some(role),
@@ -637,7 +620,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_rules_are_valid_and_deny_unknown_child_tools() {
+    fn embedded_rules_share_tools_and_keep_orchestration_boundaries() {
         let rules = embedded();
         rules.validate().unwrap();
         let decision = rules.evaluate(&RuleContext {
@@ -646,14 +629,10 @@ mod tests {
             tool_name: "mcp__mystery__mutate",
             tool_class: ToolClass::Unknown,
         });
-        assert_eq!(decision.effect, RuleEffect::Deny);
-        assert_eq!(decision.rule_id, "deny-unknown-child-tool");
+        assert_eq!(decision.effect, RuleEffect::Allow);
+        assert_eq!(decision.rule_id, "allow-role-capabilities");
 
-        for (role, rule_id) in [
-            ("codey_worker", "allow-worker-capabilities"),
-            ("codey_visual_worker", "allow-worker-capabilities"),
-            ("default", "allow-default-capabilities"),
-        ] {
+        for role in crate::config::SUBAGENT_ROLE_IDS {
             let decision = rules.evaluate(&RuleContext {
                 actor: RuleActor::Child,
                 role: Some(role),
@@ -661,7 +640,7 @@ mod tests {
                 tool_class: classify_tool("mcp_idea_apply_patch"),
             });
             assert_eq!(decision.effect, RuleEffect::Allow, "{role}");
-            assert_eq!(decision.rule_id, rule_id, "{role}");
+            assert_eq!(decision.rule_id, "allow-role-capabilities", "{role}");
             assert_eq!(
                 rules
                     .evaluate(&RuleContext {
@@ -806,7 +785,7 @@ mod tests {
                         tool_class: classify_tool(tool),
                     })
                     .effect,
-                RuleEffect::Deny,
+                RuleEffect::Allow,
                 "{tool}"
             );
             assert_eq!(
@@ -882,17 +861,17 @@ mod tests {
         let mutations: [fn(&mut RuleSet); 3] = [
             |rules: &mut RuleSet| rules.fallback = RuleEffect::Allow,
             |rules: &mut RuleSet| {
-                rules.roles.get_mut("codey_quick_scan").unwrap().access = RoleAccess::Write;
+                rules.roles.get_mut("codey_quick_scan").unwrap().access = RoleAccess::ReadOnly;
             },
             |rules: &mut RuleSet| {
                 rules.rules.push(RuleDefinition {
-                    id: "allow-specific-unknown-tool".into(),
+                    id: "allow-nested-spawn".into(),
                     priority: 9_999,
                     effect: RuleEffect::Allow,
                     actors: vec![RuleActor::Child],
                     roles: vec!["codey_quick_scan".into()],
-                    tools: vec!["mcp__unsafe__escape".into()],
-                    tool_classes: vec![ToolClass::Unknown],
+                    tools: vec!["spawn_agent".into()],
+                    tool_classes: vec![ToolClass::Spawn],
                     explanation: "test-only permissive mutation".into(),
                 });
             },
@@ -913,7 +892,7 @@ mod tests {
             assert_eq!(loaded.rules.fallback, RuleEffect::Deny);
             assert_eq!(
                 loaded.rules.roles["codey_quick_scan"].access,
-                RoleAccess::ReadOnly
+                RoleAccess::Write
             );
             assert!(loaded.warning.is_some());
         }
@@ -997,7 +976,7 @@ mod tests {
                         tool_class: classify_tool(tool),
                     })
                     .effect,
-                RuleEffect::Deny,
+                RuleEffect::Allow,
                 "{tool}"
             );
         }

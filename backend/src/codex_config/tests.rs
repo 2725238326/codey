@@ -957,7 +957,7 @@ fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inpu
 }
 
 #[test]
-fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled() {
+fn runtime_guidance_keeps_analysis_roles_available_for_authorized_writes() {
     let mut configured = crate::config::default_subagent_roles();
     configured
         .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
@@ -979,9 +979,14 @@ fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled(
 
     let instructions = runtime_root_instructions_for_roles("BASE", &runtime_roles);
     assert!(instructions.contains("BASE"));
-    assert!(instructions.contains(NO_WRITABLE_SUBAGENT_GUIDANCE));
-    assert!(instructions.contains("所有创建、修改"));
-    assert!(instructions.contains("由主代理直接完成"));
+    assert_eq!(instructions, "BASE");
+    assert_eq!(
+        runtime_root_instructions_for_roles(
+            &format!("BASE\n\n{NO_WRITABLE_SUBAGENT_GUIDANCE}"),
+            &runtime_roles
+        ),
+        "BASE"
+    );
 
     let writable_roles = runtime_subagent_roles(
         Some(&crate::config::default_subagent_roles()),
@@ -1111,7 +1116,7 @@ enabled = true
 }
 
 #[test]
-fn runtime_read_only_agents_are_explicitly_told_not_to_call_write_tools() {
+fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     let constraints_dir = temp.path().join("codex-constraints");
     let roles = crate::config::default_subagent_roles();
@@ -1132,8 +1137,9 @@ fn runtime_read_only_agents_are_explicitly_told_not_to_call_write_tools() {
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_QUICK_SCAN)
         .unwrap();
     let quick_scan = String::from_utf8(quick_scan.contents.clone()).unwrap();
-    assert!(quick_scan.contains(READ_ONLY_AGENT_WRITE_GUARD));
-    assert!(quick_scan.contains("不要调用 `replace`、`apply_patch`"));
+    assert!(!quick_scan.contains(READ_ONLY_AGENT_WRITE_GUARD));
+    assert!(quick_scan.contains("sandbox_mode = \"workspace-write\""));
+    assert!(quick_scan.contains("按本次任务授权使用所需工具"));
 
     let worker = plans
         .iter()
@@ -1149,6 +1155,42 @@ fn runtime_read_only_agents_are_explicitly_told_not_to_call_write_tools() {
     let default_agent = String::from_utf8(default_agent.contents.clone()).unwrap();
     assert!(!default_agent.contains(READ_ONLY_AGENT_WRITE_GUARD));
     assert!(default_agent.contains("sandbox_mode = \"workspace-write\""));
+}
+
+#[test]
+fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources() {
+    for role in [
+        "codey_quick_scan",
+        "codey_deep_research",
+        "codey_visual_analysis",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let constraints_dir = temp.path().join("codex-constraints");
+        let source_path = constraints_dir
+            .join(CODEY_SUBAGENT_SOURCES_DIR)
+            .join(format!("{role}.toml"));
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let [current, previous] = subagent_source_config_versions(role).unwrap();
+        fs::write(&source_path, previous).unwrap();
+        let roles = crate::config::default_subagent_roles();
+        let plans = plan_runtime_agent_files(&constraints_dir, &roles, None).unwrap();
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), previous);
+        let plan = plans
+            .iter()
+            .find(|plan| plan.registration.role == role)
+            .unwrap();
+        let rendered = parse_document(std::str::from_utf8(&plan.contents).unwrap()).unwrap();
+        assert_eq!(rendered["sandbox_mode"].as_str(), Some("workspace-write"));
+        assert_eq!(
+            rendered["description"].as_str(),
+            parse_document(current).unwrap()["description"].as_str()
+        );
+
+        let customized = format!("{previous}\n# User customization\n");
+        fs::write(&source_path, &customized).unwrap();
+        plan_runtime_agent_files(&constraints_dir, &roles, None).unwrap();
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), customized);
+    }
 }
 
 #[test]
@@ -2639,7 +2681,7 @@ default_subagent_reasoning_effort = "low"
 #[test]
 fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
     let result = patch_config_with_fastctx_mode(
-        "[agents]\nmax_concurrent_threads_per_session = 2\n",
+        "[agents]\nmax_concurrent_threads_per_session = 1\n",
         RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
@@ -2656,7 +2698,7 @@ fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
 
     assert_eq!(
         document["agents"]["max_concurrent_threads_per_session"].as_integer(),
-        Some(2)
+        Some(1)
     );
 }
 

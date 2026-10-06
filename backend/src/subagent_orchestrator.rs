@@ -32,8 +32,7 @@ const LEDGER_SCHEMA_VERSION: u32 = 15;
 const MIN_LEDGER_SCHEMA_VERSION: u32 = LEDGER_SCHEMA_VERSION;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
-const READ_ONLY_CONCURRENCY_LIMIT: usize = 3;
-const WRITE_OR_MIXED_CONCURRENCY_LIMIT: usize = 2;
+const CONCURRENCY_LIMIT: usize = 2;
 const MAX_RESERVATIONS_PER_LEDGER: usize = 1_024;
 const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
 const LEDGER_CAPACITY_ERROR_CODE: &str = "CODEY_SUBAGENT_LEDGER_CAPACITY";
@@ -730,39 +729,19 @@ fn is_canonical_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn concurrency_denial(
-    ledger: &SessionLedger,
-    prepared: &PreparedContract,
-    active_agents: usize,
-) -> Option<String> {
+fn concurrency_denial(ledger: &SessionLedger, active_agents: usize) -> Option<String> {
     let tracked_active = ledger
         .reservations
         .values()
         .filter(|reservation| reservation.state.is_active() && !reservation.spawn_failed)
         .collect::<Vec<_>>();
     let tracked_active_count = tracked_active.len();
-    let has_untracked_active = active_agents > tracked_active_count;
-    let has_active_write = has_untracked_active
-        || tracked_active
-            .iter()
-            .any(|reservation| reservation.write_capable);
-    let candidate_is_read_only = prepared.policy.access == RoleAccess::ReadOnly;
-    let limit = if candidate_is_read_only && !has_active_write {
-        READ_ONLY_CONCURRENCY_LIMIT
-    } else {
-        WRITE_OR_MIXED_CONCURRENCY_LIMIT
-    };
     let observed_active = active_agents.max(tracked_active_count);
-    if observed_active < limit {
+    if observed_active < CONCURRENCY_LIMIT {
         return None;
     }
-    let mode = if limit == READ_ONLY_CONCURRENCY_LIMIT {
-        "已确认的纯只读批次"
-    } else {
-        "包含写入型或身份未确认代理的批次"
-    };
     Some(format!(
-        "{CONCURRENCY_LIMIT_ERROR_CODE}: Codey 子代理并发门禁：{mode}当前已有 {observed_active} 个活动代理，达到并发上限 {limit}。请先等待任一活动代理进入终态后再派发；该限制只约束同时运行数量，不限制后续批次或累计派发次数。"
+        "{CONCURRENCY_LIMIT_ERROR_CODE}: Codey 子代理并发门禁：当前已有 {observed_active} 个活动代理，达到并发上限 {CONCURRENCY_LIMIT}。请先等待任一活动代理进入终态后再派发；该限制只约束同时运行数量，不限制后续批次或累计派发次数。"
     ))
 }
 
@@ -856,7 +835,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
     {
         return Ok(Some(conflict));
     }
-    if let Some(reason) = concurrency_denial(&ledger, &prepared, active_agents) {
+    if let Some(reason) = concurrency_denial(&ledger, active_agents) {
         return Ok(Some(reason));
     }
 
@@ -2354,7 +2333,7 @@ pub(crate) fn authorize_child_tool_with_context(
             )),
             Some(_) => None,
         },
-        ToolClass::Write => match bound_reservation {
+        ToolClass::Write | ToolClass::Unknown => match bound_reservation {
             None => Some(format!(
                 "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 能力/资源门禁：当前 child 未绑定有效 attempt，禁止执行写入工具。不要重试写入或等待门禁自行恢复；请立即把该错误码返回主代理，由主代理使用全新的 task_name 重新派生或直接接管。"
             )),
@@ -2707,55 +2686,28 @@ mod tests {
     }
 
     #[test]
-    fn native_capsule_assigns_role_capabilities() {
+    fn native_capsule_assigns_the_same_capabilities_to_every_role() {
         let temp = tempdir().unwrap();
         let rules = rules::load(temp.path()).rules;
-        let readonly = prepare_task_capsule(
-            Some(&spawn_input("read_task", "codey_quick_scan")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(readonly.capabilities, ["files.read"]);
-
-        let visual = prepare_task_capsule(
-            Some(&spawn_input("visual_task", "codey_visual_analysis")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(visual.capabilities, ["files.read", "visual.inspect"]);
-
-        let writer = prepare_task_capsule(
-            Some(&spawn_input("write_task", "codey_worker")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(
-            writer.capabilities,
-            ["command.execute", "files.read", "workspace.write"]
-        );
-
-        let visual_writer = prepare_task_capsule(
-            Some(&spawn_input("visual_write_task", "codey_visual_worker")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(
-            visual_writer.capabilities,
-            [
-                "command.execute",
-                "files.read",
-                "workspace.write",
-                "visual.inspect"
-            ]
-        );
+        for role in crate::config::SUBAGENT_ROLE_IDS {
+            let task =
+                prepare_task_capsule(Some(&spawn_input("task", role)), Some("/repo"), &rules)
+                    .unwrap();
+            assert_eq!(
+                task.capabilities,
+                [
+                    "command.execute",
+                    "files.read",
+                    "workspace.write",
+                    "visual.inspect"
+                ],
+                "{role}"
+            );
+        }
     }
 
     #[test]
-    fn visual_tools_require_a_bound_visual_role() {
+    fn analysis_roles_can_use_tools_and_still_require_an_active_attempt() {
         let temp = tempdir().unwrap();
         let root = temp.path();
         admit_and_bind(
@@ -2799,26 +2751,57 @@ mod tests {
             "plain_reader",
             "codey_quick_scan",
             "scan-agent",
-            "/repo",
+            "/scan-repo",
             0,
             30,
         );
-        let denied = authorize_child_tool_with_context(
-            root,
-            "runtime-a",
-            "scan-session",
-            ChildToolContext {
+        for tool_name in [
+            "mcp__cua_repl__js",
+            "apply_patch",
+            "exec_command",
+            "mcp__custom__tool",
+        ] {
+            let context = || ChildToolContext {
                 agent_id: "scan-agent",
                 agent_type: Some("codey_quick_scan"),
                 transcript_path: None,
-                tool_name: "mcp__cua_repl__js",
+                tool_name,
                 tool_input: None,
-            },
-            40,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denied.contains("visual.inspect"));
+            };
+            assert_eq!(
+                authorize_child_tool_with_context(root, "runtime-a", "scan-session", context(), 40)
+                    .unwrap(),
+                None,
+                "{tool_name}"
+            );
+        }
+        subagent_stopped(root, "runtime-a", "scan-session", "scan-agent", 41).unwrap();
+        for tool_name in [
+            "mcp__cua_repl__js",
+            "apply_patch",
+            "exec_command",
+            "mcp__custom__tool",
+        ] {
+            assert!(
+                authorize_child_tool_with_context(
+                    root,
+                    "runtime-a",
+                    "scan-session",
+                    ChildToolContext {
+                        agent_id: "scan-agent",
+                        agent_type: Some("codey_quick_scan"),
+                        transcript_path: None,
+                        tool_name,
+                        tool_input: None,
+                    },
+                    42,
+                )
+                .unwrap()
+                .unwrap()
+                .contains(UNBOUND_ATTEMPT_ERROR_CODE),
+                "{tool_name}"
+            );
+        }
     }
 
     #[test]
@@ -2843,14 +2826,14 @@ mod tests {
     }
 
     #[test]
-    fn writer_uses_a_workspace_wide_conflict_lock() {
+    fn analysis_roles_use_a_workspace_wide_conflict_lock() {
         let temp = tempdir().unwrap();
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
                 "runtime-a",
                 "session-b",
-                Some(&spawn_input("writer_a", "codey_worker")),
+                Some(&spawn_input("writer_a", "codey_quick_scan")),
                 Some("/repo"),
                 0,
                 10,
@@ -2862,7 +2845,7 @@ mod tests {
             temp.path(),
             "runtime-a",
             "session-a",
-            Some(&spawn_input("writer_b", "codey_worker")),
+            Some(&spawn_input("writer_b", "codey_deep_research")),
             Some("/repo"),
             1,
             11,
@@ -2927,16 +2910,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_read_agent_releases_a_concurrency_slot_immediately() {
+    fn terminal_analysis_agent_releases_a_concurrency_slot_immediately() {
         let temp = tempdir().unwrap();
         let session = "read-refill";
-        for (index, (task, agent)) in [
-            ("read_a", "agent-a"),
-            ("read_b", "agent-b"),
-            ("read_c", "agent-c"),
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, (task, agent)) in [("read_a", "agent-a"), ("read_b", "agent-b")]
+            .into_iter()
+            .enumerate()
         {
             admit_and_bind(
                 temp.path(),
@@ -2944,7 +2923,7 @@ mod tests {
                 task,
                 "codey_quick_scan",
                 agent,
-                "/repo",
+                &format!("/repo-{index}"),
                 index,
                 10 + index as u64 * 10,
             );
@@ -2956,13 +2935,13 @@ mod tests {
             "runtime-a",
             session,
             Some(&refill),
-            Some("/repo"),
-            3,
+            Some("/repo-new"),
+            2,
             40,
         )
         .unwrap()
         .unwrap();
-        assert!(denial.contains("并发上限 3"));
+        assert!(denial.contains("并发上限 2"));
 
         subagent_stopped(temp.path(), "runtime-a", session, "agent-a", 41).unwrap();
         assert_eq!(
@@ -2971,8 +2950,8 @@ mod tests {
                 "runtime-a",
                 session,
                 Some(&refill),
-                Some("/repo"),
-                2,
+                Some("/repo-new"),
+                1,
                 42,
             )
             .unwrap(),
@@ -3011,7 +2990,7 @@ mod tests {
             "runtime-a",
             session,
             Some(&read_refill),
-            Some("/read-repo"),
+            Some("/refill-repo"),
             2,
             30,
         )
@@ -3026,7 +3005,7 @@ mod tests {
                 "runtime-a",
                 session,
                 Some(&read_refill),
-                Some("/read-repo"),
+                Some("/refill-repo"),
                 1,
                 32,
             )
