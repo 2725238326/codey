@@ -99,6 +99,14 @@ async function ownedRelease(build) {
   return release ? validateRelease(release, build) : null;
 }
 
+export async function updateReleaseNotes(release, build, notes) {
+  validateRelease(release, build);
+  const updated = await github(`releases/${release.id}`, "PATCH", { tag_name: build.tag, target_commitish: build.source_sha, body: `${notes || "更新日志待管理员补充。"}\n\n${marker(build)}` });
+  validateRelease(updated, { ...build, release_id: release.id });
+  if (updated.draft !== release.draft) throw new Error("GitHub Release 草稿状态意外变更");
+  return updated;
+}
+
 function r2Configuration() {
   for (const key of ["CLOUDFLARE_R2_BUCKET", "CLOUDFLARE_R2_PUBLIC_BASE_URL", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"]) if (!process.env[key]) throw new Error(`缺少 ${key}，不能完成发布`);
   if (!/^[a-zA-Z0-9.-]+$/.test(process.env.CLOUDFLARE_R2_BUCKET) || new URL(process.env.CLOUDFLARE_R2_PUBLIC_BASE_URL).protocol !== "https:") throw new Error("R2 配置无效");
@@ -221,7 +229,7 @@ async function publish() {
     await uploadGithubAsset(release, path);
     await putObject(`releases/${build.tag}/${basename(path)}`, path);
   }
-  await github(`releases/${release.id}`, "PATCH", { body: `${notes.notes || "更新日志待管理员补充。"}\n\n${marker(build)}` });
+  await updateReleaseNotes(release, build, notes.notes);
   await putObject(`releases/${build.tag}/latest.json`, manifestPath, true);
   await callback("events", { status: "succeeded", notes_status: notes.notes_status });
 }
@@ -242,7 +250,7 @@ async function syncNotes() {
   if (manifest.build_id !== build.id || manifest.source_sha !== build.source_sha || manifest.version !== build.version || manifest.tag !== build.tag) throw new Error("R2 构建清单归属不一致");
   manifest.release_notes = notes.notes;
   manifest.notes_status = notes.notes_status;
-  await github(`releases/${release.id}`, "PATCH", { body: `${notes.notes}\n\n${marker(build)}` });
+  await updateReleaseNotes(release, build, notes.notes);
   await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
   await putObject(`releases/${build.tag}/latest.json`, path, true);
   await callback("events", { status: "succeeded", notes_status: notes.notes_status });

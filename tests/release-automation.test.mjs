@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertSameAssets, callback, identity, main, signature, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
+import { assertSameAssets, callback, identity, main, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
 
 const environment = {
   RELEASE_BUILD_ID: "build_test-123", RELEASE_ATTEMPT: "2", GITHUB_RUN_ID: "456", RELEASE_ACTION: "build",
@@ -147,6 +147,26 @@ async function sandboxBuild(action, handler) {
     await rm(directory, { recursive: true, force: true });
   }
 }
+
+test("updating draft notes preserves the tag, commit and ownership and rejects a changed response", async () => {
+  await sandboxBuild("build", async () => {
+    const release = { id: 10, tag_name: build.tag, draft: true, body: `<!-- codey-build:${build.id} -->` };
+    let changed = false;
+    globalThis.fetch = async (url, options) => {
+      assert.equal(url, "https://api.github.com/repos/owner/codey/releases/10");
+      assert.equal(options.method, "PATCH");
+      const body = JSON.parse(options.body);
+      assert.equal(body.target_commitish, build.source_sha);
+      return Response.json({ ...release, ...body, tag_name: changed ? "untagged-test" : body.tag_name || "untagged-test" });
+    };
+    const updated = await updateReleaseNotes(release, build, "- 修复发布流程");
+    assert.equal(updated.tag_name, build.tag);
+    assert.equal(updated.draft, true);
+    assert.match(updated.body, /修复发布流程/);
+    changed = true;
+    await assert.rejects(updateReleaseNotes(release, build, "- 修复发布流程"), /占用/);
+  });
+});
 
 test("claim accepts a platform-selected version different from valid consistent source manifests", async () => {
   for (const action of ["build", "notes", "delete"]) await sandboxBuild(action, async () => {
