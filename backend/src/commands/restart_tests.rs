@@ -356,9 +356,9 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][0],
         json!({
             "model": "source-provider/gpt-5.6-sol",
-            "display_name": "[默认] gpt-5.6-sol",
+            "display_name": "[默认配置] gpt-5.6-sol",
             "route_name": "默认配置",
-            "route_prefix": "默认",
+            "route_prefix": "默认配置",
             "provider_id": "codey_router",
             "source_model": "gpt-5.6-sol",
             "official_account": false,
@@ -373,9 +373,9 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][5],
         json!({
             "model": "source-provider/provider-fast-coder",
-            "display_name": "[默认] provider-fast-coder",
+            "display_name": "[默认配置] provider-fast-coder",
             "route_name": "默认配置",
-            "route_prefix": "默认",
+            "route_prefix": "默认配置",
             "provider_id": "codey_router",
             "source_model": "provider-fast-coder",
             "official_account": false,
