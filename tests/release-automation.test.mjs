@@ -229,7 +229,8 @@ test("delete cleans the owned Release before tag and asks backend to clean R2 la
       }
       if (path.endsWith("/git/ref/tags/v1.2.3")) return hasTag ? Response.json({ object: { type: "tag", sha: "tag-sha" } }) : new Response(null, { status: 404 });
       if (path.endsWith("/git/tags/tag-sha")) return Response.json({ object: { type: "commit", sha: build.source_sha }, message: `<!-- codey-build:${build.id} -->` });
-      if (path.endsWith("/releases/tags/v1.2.3")) return hasRelease ? Response.json({ id: 10, tag_name: build.tag, body: `<!-- codey-build:${build.id} -->` }) : new Response(null, { status: 404 });
+      if (path.endsWith("/releases/tags/v1.2.3")) return new Response(null, { status: 404 });
+      if (path === "/repos/owner/codey/releases") return Response.json(hasRelease ? [{ id: 10, draft: true, tag_name: build.tag, body: `<!-- codey-build:${build.id} -->` }] : []);
       if (path === "/repos/owner/codey") return Response.json({ id: 1 });
       assert.fail(`unexpected request ${url}`);
     };

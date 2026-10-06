@@ -95,7 +95,18 @@ export function validateRelease(release, build) {
 }
 
 async function ownedRelease(build) {
-  const release = await github(`releases/tags/${encodeURIComponent(build.tag)}`, "GET", undefined, true);
+  let release = await github(`releases/tags/${encodeURIComponent(build.tag)}`, "GET", undefined, true);
+  if (!release) {
+    for (let page = 1; page <= 20; page += 1) {
+      const releases = await github(`releases?per_page=100&page=${page}`);
+      for (const candidate of releases.filter(item => item.tag_name === build.tag)) {
+        if (release) throw new Error("同一 tag 存在多个 GitHub Release，不能自动操作");
+        release = candidate;
+      }
+      if (releases.length < 100) break;
+      if (page === 20) throw new Error("发布历史过长，无法完整核实 GitHub 草稿");
+    }
+  }
   return release ? validateRelease(release, build) : null;
 }
 
